@@ -13,7 +13,9 @@ write('logo.svg',glyph())
 write('logo-white.svg',glyph('#FFFFFF'))
 write('app-icon.svg',icon(),1024,1024)
 write('app-icon-light.svg',icon(True),1024,1024)
-write('menu-template.svg','<g fill="#000000"><path d="M2 2H10V7H7V16H2Z"/><path d="M16 16H9V11H12V2H16Z"/></g>',18,18)
+# Derive both halves from one pixel-aligned path to preserve 180-degree symmetry.
+menu_half = 'M2 2H10V7H7V16H2Z'
+write('menu-template.svg',f'<g fill="#000000"><path d="{menu_half}"/><path d="{menu_half}" transform="rotate(180 9 9)"/></g>',18,18)
 write('wordmark.svg',f'<g transform="translate(4 4) scale(1.1)">{glyph()}</g><text x="114" y="70" font-family="Helvetica Neue,Arial,sans-serif" font-size="68" font-weight="500" letter-spacing="-2" fill="{black}">Panelet</text>',405,100)
 board='<rect width="1200" height="650" fill="#F7F7F5"/>'
 board+='<text x="64" y="61" font-family="Helvetica Neue,Arial,sans-serif" font-size="16" letter-spacing="2" fill="#777">PANELET / INTERLOCK</text>'
