@@ -1,0 +1,11 @@
+build/
+DerivedData/
+.DS_Store
+xcuserdata/
+*.xcuserstate
+
+# Local design explorations and delivery archives
+branding/shangxiajian/
+branding/panelet-monochrome/
+branding/*.zip
+__pycache__/

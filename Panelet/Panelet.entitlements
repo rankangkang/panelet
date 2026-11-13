@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<!--
+  App Sandbox 必须保持关闭。
+  CGVirtualDisplay 是私有 API，沙盒里创建虚拟显示器会失败。
+  屏幕录制和辅助功能走系统隐私权限（TCC），不靠 entitlement。
+  不要在 Signing & Capabilities 里加上 App Sandbox。
+-->
+<dict>
+</dict>
+</plist>
