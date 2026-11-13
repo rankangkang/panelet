@@ -26,7 +26,7 @@ struct RecoveryJournal: Codable {
 
     private static var url: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("dev.cmkk.vertical-split-demo/recovery.json")
+            .appendingPathComponent("dev.cmkk.panelet/recovery.json")
     }
 
     static func load() throws -> RecoveryJournal? {

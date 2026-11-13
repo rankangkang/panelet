@@ -49,6 +49,8 @@ struct PhysicalScreen {
 
     var isPortrait: Bool { bounds.height > bounds.width }
 
+    var splitLayout: SplitLayout { SplitLayout(size: bounds.size) }
+
     var menuTitle: String {
         let kind = isBuiltin ? "内建" : "外接"
         return "\(name)  \(kind)  \(Int(bounds.width.rounded()))×\(Int(bounds.height.rounded()))"
@@ -91,12 +93,7 @@ enum DisplayScanner {
                 "缩放\(screen.scale)×  \(screen.refreshRate)Hz"
             )
         }
-        let portraits = screens.filter(\.isPortrait)
-        if portraits.isEmpty {
-            print("没有竖屏。把一块显示器在“系统设置 → 显示器”里旋转 90° 或 270° 后再运行。")
-        } else {
-            print("可拆分的竖屏：\(portraits.map(\.name).joined(separator: "、"))")
-        }
+        print("可拆分的显示器：\(screens.map(\.name).joined(separator: "、"))")
     }
 
     static func activeDisplayIDs() -> [CGDirectDisplayID] {
@@ -184,4 +181,23 @@ func stableSerial(_ text: String) -> UInt32 {
         hash = (hash ^ UInt32(byte)) &* 16777619
     }
     return hash == 0 ? 1 : hash
+}
+
+/// Local coordinates use a top-left origin, matching CoreGraphics and window migration.
+struct SplitLayout {
+    let size: CGSize
+    var isPortrait: Bool { size.height > size.width }
+    var direction: String { isPortrait ? "上下" : "左右" }
+    var names: [String] { isPortrait ? ["上半屏", "下半屏"] : ["左半屏", "右半屏"] }
+    var roles: [String] { isPortrait ? ["top", "bottom"] : ["left", "right"] }
+    var regions: [CGRect] {
+        if isPortrait {
+            let first = floor(size.height / 2)
+            return [CGRect(x: 0, y: 0, width: size.width, height: first),
+                    CGRect(x: 0, y: first, width: size.width, height: size.height - first)]
+        }
+        let first = floor(size.width / 2)
+        return [CGRect(x: 0, y: 0, width: first, height: size.height),
+                CGRect(x: first, y: 0, width: size.width - first, height: size.height)]
+    }
 }

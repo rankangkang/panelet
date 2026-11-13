@@ -7,4 +7,8 @@ swiftc Panelet/QuickExitPolicy.swift tests/QuickExitPolicyTests.swift -o "$TEST_
 "$TEST_BUILD/quick-exit-tests"
 swiftc Panelet/RecoveryJournal.swift tests/RecoveryJournalTests.swift -framework AppKit -o "$TEST_BUILD/recovery-tests"
 "$TEST_BUILD/recovery-tests"
+swiftc Panelet/DisplayScanner.swift tests/SplitLayoutTests.swift -framework AppKit -o "$TEST_BUILD/layout-tests"
+"$TEST_BUILD/layout-tests"
+swiftc Panelet/QuitPolicy.swift tests/QuitPolicyTests.swift -o "$TEST_BUILD/quit-tests"
+"$TEST_BUILD/quit-tests"
 plutil -lint Panelet.xcodeproj/project.pbxproj

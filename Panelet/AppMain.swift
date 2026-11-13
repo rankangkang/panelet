@@ -12,6 +12,12 @@ enum DemoMain {
             DisplayScanner.printList()
             return
         }
+        if let identifier = Bundle.main.bundleIdentifier,
+           let existing = NSRunningApplication.runningApplications(withBundleIdentifier: identifier)
+            .first(where: { $0.processIdentifier != getpid() && !$0.isTerminated }) {
+            existing.activate()
+            return
+        }
         let controller = AppController()
         app.delegate = controller
         withExtendedLifetime(controller) { app.run() }
@@ -19,11 +25,16 @@ enum DemoMain {
 }
 
 @MainActor
-final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
+final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     private let splits = SplitSessions()
     private let quick = QuickSplitPanel()
     private var window: NSWindow!
     private var popup: NSPopUpButton!
+    private var settingsPages: [NSView] = []
+    private var settingsNavigation: [NSButton] = []
+    private let layoutPreview = SettingsLayoutPreview()
+    private var recordPermissionButton: NSButton!
+    private var accessPermissionButton: NSButton!
     private var statusLabel: NSTextField!
     private var splitButton: NSButton!
     private var joinButton: NSButton!
@@ -31,9 +42,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var accessibilityLabel: NSTextField!
     private var spacesLabel: NSTextField!
     private var logView: NSTextView!
-    private var portraits: [PhysicalScreen] = []
+    private var displays: [PhysicalScreen] = []
     private var lastScreenKey = ""
     private var closing = false
+    private var allowIncompleteExit = false
+    private var quitDeadline: Task<Void, Never>?
     private var confirming = false
     private var confirmationPanel: NSPanel?
     private var shouldRelaunch = false
@@ -47,6 +60,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private var statusItem: NSStatusItem?
     private var statusAction: NSMenuItem?
     private var statusJoin: NSMenuItem?
+    private let desktopMenu = NSMenu()
     private var pendingQuick: (displayID: CGDirectDisplayID, pair: WindowPlacement.Pair)?
     private var recentPairs: [CGDirectDisplayID: WindowPlacement.Pair] = [:]
     private var recentDisplayID: CGDirectDisplayID?
@@ -88,7 +102,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if closing { return splits.sessions.isEmpty ? .terminateNow : .terminateCancel }
+        if allowIncompleteExit { return .terminateNow }
+        if closing {
+            if splits.sessions.isEmpty { return .terminateNow }
+            offerIncompleteExit()
+            return .terminateCancel
+        }
         guard !splits.sessions.isEmpty else { return .terminateNow }
         requestQuit(relaunch: false)
         return .terminateCancel
@@ -115,10 +134,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         menu.addItem(app)
         let commands = NSMenu()
         app.submenu = commands
-        let toggle = commands.addItem(withTitle: "快捷上下分屏…", action: #selector(openQuick), keyEquivalent: "")
+        let toggle = commands.addItem(withTitle: "快捷窗口分屏…", action: #selector(openQuick), keyEquivalent: "")
         toggle.target = self
         toggleMenuItem = toggle
-        let settings = commands.addItem(withTitle: "拆分桌面与设置…", action: #selector(showAdvanced), keyEquivalent: ",")
+        let settings = commands.addItem(withTitle: "设置…", action: #selector(showAdvanced), keyEquivalent: ",")
         settings.target = self
         let join = commands.addItem(withTitle: "还原分屏…", action: #selector(chooseJoin), keyEquivalent: "")
         join.target = self
@@ -139,11 +158,14 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         item.button?.setAccessibilityLabel("Panelet")
         if image == nil { item.button?.title = "Panelet" }
         let menu = NSMenu()
-        let toggle = menu.addItem(withTitle: "快捷上下分屏…", action: #selector(openQuick), keyEquivalent: "")
+        let toggle = menu.addItem(withTitle: "快捷窗口分屏…", action: #selector(openQuick), keyEquivalent: "")
         toggle.target = self
+        let desktop = menu.addItem(withTitle: "拆分桌面", action: nil, keyEquivalent: "")
+        desktop.submenu = desktopMenu
+        menu.delegate = self
         let join = menu.addItem(withTitle: "还原分屏…", action: #selector(chooseJoin), keyEquivalent: "")
         join.target = self
-        let settings = menu.addItem(withTitle: "拆分桌面与设置…", action: #selector(showAdvanced), keyEquivalent: "")
+        let settings = menu.addItem(withTitle: "设置…", action: #selector(showAdvanced), keyEquivalent: "")
         settings.target = self
         menu.addItem(.separator())
         let quit = menu.addItem(withTitle: "退出 Panelet", action: #selector(quitClicked), keyEquivalent: "q")
@@ -156,120 +178,254 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         retry.target = self
     }
 
+    func menuWillOpen(_ menu: NSMenu) {
+        desktopMenu.removeAllItems()
+        let screens = splits.screens().sorted { $0.id < $1.id }
+        for (index, screen) in screens.enumerated() {
+            let session = splits.sessions[screen.id]
+            let action = session?.active == true ? "合并" : "\(screen.splitLayout.direction)拆分"
+            let item = desktopMenu.addItem(withTitle: "\(index + 1) · \(screen.menuTitle) · \(action)",
+                                           action: #selector(desktopMenuClicked(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = NSNumber(value: screen.id)
+            item.isEnabled = !splits.busy && !closing && !confirming &&
+                (session?.active == true || (session == nil && splitProblem == nil))
+        }
+        desktopMenu.autoenablesItems = false
+        if screens.isEmpty {
+            let item = desktopMenu.addItem(withTitle: "没有可用显示器", action: nil, keyEquivalent: "")
+            item.isEnabled = false
+        }
+    }
+
+    @objc private func desktopMenuClicked(_ sender: NSMenuItem) {
+        guard !splits.busy, !closing, !confirming,
+              let id = (sender.representedObject as? NSNumber)?.uint32Value else { return }
+        if splits.sessions[id]?.active == true { splits.join(id) }
+        else if splitProblem == nil { splits.split(id) }
+    }
+
     private func buildWindow() {
-        window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 540, height: 620),
-            styleMask: [.titled, .closable, .miniaturizable],
-            backing: .buffered,
-            defer: false
-        )
-        window.title = "Panelet · 拆分桌面与设置"
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 740, height: 560),
+                          styleMask: [.titled, .closable, .miniaturizable], backing: .buffered, defer: false)
+        window.title = "Panelet · 设置"
         window.isReleasedWhenClosed = false
         window.delegate = self
+        window.titlebarAppearsTransparent = true
+        let root = SettingsBackgroundView()
+        window.contentView = root
 
-        let title = NSTextField(labelWithString: "拆分桌面")
-        title.font = .systemFont(ofSize: 20, weight: .semibold)
-
-        let subtitle = NSTextField(wrappingLabelWithString: "长期使用上下两个独立桌面，退出应用全屏不会合并。临时组合两个窗口，请使用“快捷上下分屏”。")
-        subtitle.preferredMaxLayoutWidth = 490
-        subtitle.textColor = .secondaryLabelColor
+        let sidebar = NSVisualEffectView()
+        sidebar.material = .sidebar
+        sidebar.blendingMode = .behindWindow
+        sidebar.state = .active
+        sidebar.translatesAutoresizingMaskIntoConstraints = false
+        root.addSubview(sidebar)
+        NSLayoutConstraint.activate([
+            sidebar.leadingAnchor.constraint(equalTo: root.leadingAnchor),
+            sidebar.topAnchor.constraint(equalTo: root.topAnchor),
+            sidebar.bottomAnchor.constraint(equalTo: root.bottomAnchor),
+            sidebar.widthAnchor.constraint(equalToConstant: 184)
+        ])
+        let brand = NSImageView(image: NSImage(named: "AppIcon") ?? NSApp.applicationIconImage)
+        brand.widthAnchor.constraint(equalToConstant: 38).isActive = true
+        brand.heightAnchor.constraint(equalToConstant: 38).isActive = true
+        let brandRow = NSStackView(views: [brand, settingsText("Panelet", size: 20, weight: .semibold)])
+        brandRow.spacing = 10
+        let nav = NSStackView(views: [brandRow])
+        nav.orientation = .vertical
+        nav.alignment = .leading
+        nav.spacing = 8
+        nav.setCustomSpacing(28, after: brandRow)
+        let destinations = [("桌面分屏", "rectangle.split.2x1"), ("快捷键", "keyboard"),
+                            ("权限", "lock.shield"), ("诊断", "waveform.path.ecg")]
+        for (index, destination) in destinations.enumerated() {
+            let item = NSButton(title: "  " + destination.0, target: self, action: #selector(selectSettingsPage(_:)))
+            item.image = NSImage(systemSymbolName: destination.1, accessibilityDescription: nil)
+            item.imagePosition = .imageLeading
+            item.alignment = .left
+            item.bezelStyle = .recessed
+            item.setButtonType(.pushOnPushOff)
+            item.font = .systemFont(ofSize: 13, weight: .medium)
+            item.tag = index
+            item.widthAnchor.constraint(equalToConstant: 152).isActive = true
+            item.heightAnchor.constraint(equalToConstant: 34).isActive = true
+            item.setAccessibilityLabel(destination.0)
+            settingsNavigation.append(item)
+            nav.addArrangedSubview(item)
+        }
+        nav.translatesAutoresizingMaskIntoConstraints = false
+        sidebar.addSubview(nav)
+        let tagline = settingsText("一块屏幕，更多空间。", size: 11, secondary: true)
+        tagline.translatesAutoresizingMaskIntoConstraints = false
+        sidebar.addSubview(tagline)
+        NSLayoutConstraint.activate([
+            nav.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 16),
+            nav.topAnchor.constraint(equalTo: sidebar.topAnchor, constant: 24),
+            tagline.leadingAnchor.constraint(equalTo: sidebar.leadingAnchor, constant: 20),
+            tagline.bottomAnchor.constraint(equalTo: sidebar.bottomAnchor, constant: -22)
+        ])
 
         popup = NSPopUpButton()
         popup.target = self
         popup.action = #selector(displayChanged)
-
-        statusLabel = NSTextField(wrappingLabelWithString: "未拆分")
-        statusLabel.preferredMaxLayoutWidth = 490
-        statusLabel.font = .systemFont(ofSize: 13, weight: .medium)
-
+        popup.setAccessibilityLabel("目标显示器")
+        popup.widthAnchor.constraint(equalToConstant: 444).isActive = true
+        statusLabel = settingsText("未拆分", size: 12, secondary: true)
         splitButton = button("拆分桌面", action: #selector(splitClicked))
-        joinButton = button("还原桌面…", action: #selector(joinClicked))
-        let relaunchButton = button("重新启动", action: #selector(relaunch))
-        let quickButton = button("快捷上下分屏…", action: #selector(openQuick))
-        let buttonRow = NSStackView(views: [splitButton, joinButton, quickButton, relaunchButton])
-        buttonRow.orientation = .horizontal
-        buttonRow.spacing = 8
+        splitButton.bezelColor = .controlAccentColor
+        joinButton = button("合并桌面…", action: #selector(joinClicked))
+        let actions = NSStackView(views: [splitButton, joinButton])
+        actions.spacing = 10
+        layoutPreview.heightAnchor.constraint(equalToConstant: 150).isActive = true
+        layoutPreview.widthAnchor.constraint(equalToConstant: 444).isActive = true
+        let desktop = settingsPage("桌面分屏", subtitle: "让一块显示器，拥有两个独立的工作空间。", views: [
+            settingsCard([settingsText("目标显示器", size: 12, weight: .semibold), popup, layoutPreview, statusLabel, actions]),
+            settingsCard([settingsRow("临时组合两个窗口", detail: "选好窗口后分别全屏，退出全屏即可还原。",
+                                     control: button("快捷分屏…", action: #selector(openQuick)))])
+        ])
 
-        let shortcutRow = NSStackView(views: GlobalShortcuts.Command.allCases.map { command in
+        var shortcutRows: [NSView] = []
+        for command in GlobalShortcuts.Command.allCases {
             let recorder = button(command.defaultKey.label, action: #selector(recordShortcut(_:)))
+            recorder.font = .monospacedSystemFont(ofSize: 14, weight: .medium)
+            recorder.widthAnchor.constraint(equalToConstant: 116).isActive = true
             recorder.tag = command.rawValue
             shortcutButtons[command] = recorder
-            return labeled(command.title, recorder)
-        })
-        shortcutRow.alignment = .centerY
-        shortcutRow.spacing = 14
-        shortcutInfo.preferredMaxLayoutWidth = 490
+            shortcutRows.append(settingsRow(command.title,
+                detail: command == .toggle ? "随时呼出窗口选择面板" : "还原鼠标所在的分屏", control: recorder))
+        }
+        shortcutInfo.font = .systemFont(ofSize: 12)
         shortcutInfo.textColor = .secondaryLabelColor
-        shortcutInfo.font = .systemFont(ofSize: 11)
+        shortcutRows.append(shortcutInfo)
+        let keys = settingsPage("快捷键", subtitle: "不用离开当前工作，也能快速切换。", views: [settingsCard(shortcutRows),
+            settingsText("点击右侧快捷键，再按下新的组合键。\n使用 Control、Option 或 Command 搭配一个按键。", size: 12, secondary: true)])
 
-        screenRecordingLabel = NSTextField(labelWithString: "屏幕录制：检查中")
-        accessibilityLabel = NSTextField(labelWithString: "辅助功能：检查中")
-        let recordButton = button("授权屏幕录制", action: #selector(askScreenRecording))
-        let accessButton = button("授权辅助功能", action: #selector(askAccessibility))
-        let spacesButton = button("打开桌面设置", action: #selector(openDesktopSettings))
-
-        spacesLabel = NSTextField(wrappingLabelWithString: "")
-        spacesLabel.preferredMaxLayoutWidth = 490
-        spacesLabel.textColor = .secondaryLabelColor
+        screenRecordingLabel = settingsText("检查中", size: 12)
+        accessibilityLabel = settingsText("检查中", size: 12)
+        spacesLabel = settingsText("检查中", size: 12)
+        recordPermissionButton = button("去授权", action: #selector(askScreenRecording))
+        accessPermissionButton = button("去授权", action: #selector(askAccessibility))
+        let permissions = settingsPage("权限", subtitle: "只开启分屏所需的系统权限。", views: [
+            settingsCard([settingsRow("屏幕录制", detail: "显示分区画面和窗口预览。", control: recordPermissionButton), screenRecordingLabel]),
+            settingsCard([settingsRow("辅助功能", detail: "移动窗口，并处理分屏间的鼠标操作。", control: accessPermissionButton), accessibilityLabel]),
+            settingsCard([settingsRow("显示器使用不同的空间", detail: "让每个分区拥有独立的全屏空间。", control: button("系统设置…", action: #selector(openDesktopSettings))), spacesLabel]),
+            settingsText("更改权限后，请重新启动 Panelet。", size: 12, secondary: true),
+            button("重新启动 Panelet", action: #selector(relaunch))
+        ])
 
         logView = NSTextView()
         logView.isEditable = false
         logView.isSelectable = true
         logView.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         logView.textColor = .labelColor
-        logView.drawsBackground = false
-        logView.textContainerInset = NSSize(width: 6, height: 6)
+        logView.backgroundColor = .textBackgroundColor
+        logView.textContainerInset = NSSize(width: 12, height: 12)
         let scroll = NSScrollView()
         scroll.hasVerticalScroller = true
-        scroll.borderType = .bezelBorder
         scroll.documentView = logView
-        scroll.translatesAutoresizingMaskIntoConstraints = false
-        scroll.heightAnchor.constraint(equalToConstant: 164).isActive = true
-
-        let stack = NSStackView(views: [
-            title,
-            subtitle,
-            labeled("竖屏", popup),
-            statusLabel,
-            buttonRow,
-            shortcutRow,
-            shortcutInfo,
-            labeled("权限", screenRecordingLabel),
-            recordButton,
-            accessibilityLabel,
-            accessButton,
-            spacesLabel,
-            spacesButton,
-            NSTextField(labelWithString: "日志"),
-            scroll
+        scroll.heightAnchor.constraint(equalToConstant: 250).isActive = true
+        scroll.widthAnchor.constraint(equalToConstant: 444).isActive = true
+        logView.setAccessibilityLabel("运行日志")
+        let diagnostics = settingsPage("诊断", subtitle: "查看运行状态，在需要时恢复窗口。", views: [
+            settingsCard([settingsRow("运行日志", detail: "本次启动的显示器与分屏记录。", control: button("复制日志", action: #selector(copySettingsLog))), scroll]),
+            settingsCard([settingsRow("窗口恢复", detail: "分屏中断或窗口未归位时使用。", control: button("重试恢复…", action: #selector(retryRecovery)))])
         ])
+        settingsPages = [desktop, keys, permissions, diagnostics]
+        for page in settingsPages {
+            page.translatesAutoresizingMaskIntoConstraints = false
+            root.addSubview(page)
+            NSLayoutConstraint.activate([
+                page.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: 30),
+                page.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -30),
+                page.topAnchor.constraint(equalTo: root.topAnchor, constant: 28)
+            ])
+        }
+        selectSettingsPage(settingsNavigation[0])
+    }
+
+    private func settingsText(_ text: String, size: CGFloat = 13, weight: NSFont.Weight = .regular,
+                              secondary: Bool = false) -> NSTextField {
+        let label = NSTextField(wrappingLabelWithString: text)
+        label.font = .systemFont(ofSize: size, weight: weight)
+        label.textColor = secondary ? .secondaryLabelColor : .labelColor
+        label.preferredMaxLayoutWidth = 470
+        return label
+    }
+
+    private func settingsPage(_ title: String, subtitle: String, views: [NSView]) -> NSStackView {
+        let heading = settingsText(title, size: 25, weight: .bold)
+        let detail = settingsText(subtitle, size: 13, secondary: true)
+        let stack = NSStackView(views: [heading, detail] + views)
         stack.orientation = .vertical
         stack.alignment = .leading
-        stack.spacing = 8
-        stack.edgeInsets = NSEdgeInsets(top: 18, left: 18, bottom: 18, right: 18)
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        scroll.widthAnchor.constraint(equalToConstant: 490).isActive = true
-        popup.widthAnchor.constraint(greaterThanOrEqualToConstant: 360).isActive = true
+        stack.spacing = 16
+        stack.setCustomSpacing(6, after: heading)
+        stack.setCustomSpacing(24, after: detail)
+        for view in views where view is NSBox { view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true }
+        return stack
+    }
 
-        let container = NSView()
-        container.addSubview(stack)
+    private func settingsCard(_ views: [NSView]) -> NSBox {
+        let box = NSBox()
+        box.boxType = .custom
+        box.titlePosition = .noTitle
+        box.cornerRadius = 12
+        box.borderWidth = 1
+        box.borderColor = .separatorColor
+        box.fillColor = .controlBackgroundColor
+        box.contentViewMargins = .zero
+        let stack = NSStackView(views: views)
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 12
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        let content = NSView()
+        box.contentView = content
+        content.addSubview(stack)
         NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: container.topAnchor),
-            stack.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            stack.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            stack.bottomAnchor.constraint(equalTo: container.bottomAnchor)
+            stack.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 18),
+            stack.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -18),
+            stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
+            stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16)
         ])
-        window.contentView = container
+        return box
+    }
+
+    private func settingsRow(_ title: String, detail: String, control: NSView) -> NSStackView {
+        let labels = NSStackView(views: [settingsText(title, weight: .semibold), settingsText(detail, size: 11, secondary: true)])
+        labels.orientation = .vertical
+        labels.alignment = .leading
+        labels.spacing = 5
+        let row = NSStackView(views: [labels, NSView(), control])
+        row.alignment = .centerY
+        row.spacing = 12
+        row.widthAnchor.constraint(equalToConstant: 444).isActive = true
+        control.setContentCompressionResistancePriority(.required, for: .horizontal)
+        return row
+    }
+
+    @objc private func selectSettingsPage(_ sender: NSButton) {
+        stopRecordingShortcut()
+        for (index, page) in settingsPages.enumerated() { page.isHidden = index != sender.tag }
+        for (index, item) in settingsNavigation.enumerated() {
+            let selected = index == sender.tag
+            item.state = selected ? .on : .off
+            item.showsBorderOnlyWhileMouseInside = !selected
+            item.contentTintColor = selected ? .controlAccentColor : .labelColor
+        }
+    }
+
+    @objc private func copySettingsLog() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(logView.string, forType: .string)
     }
 
     private func logStartup() {
-        DemoLog.shared.line("Demo 启动。下面是当前的物理显示器：")
+        DemoLog.shared.line("Panelet 已启动。当前显示器：")
         for screen in DisplayScanner.physicalScreens() {
             let orientation = screen.isPortrait ? "竖屏" : "横屏"
             DemoLog.shared.line("\(screen.menuTitle)  \(orientation)  id=\(screen.id)")
-        }
-        if DisplayScanner.portraitScreens().isEmpty {
-            DemoLog.shared.line("没有竖屏。到“系统设置 → 显示器”把一块屏幕旋转 90° 或 270°。")
         }
         if !Permissions.separateSpacesEnabled {
             DemoLog.shared.line("“显示器使用不同的空间”是关闭的。打开后，两个半屏才会各自拥有菜单栏、全屏空间和调度中心。")
@@ -290,32 +446,34 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
                 }
             }
         }
-        screenRecordingLabel.stringValue = Permissions.screenRecording ? "屏幕录制：已授权" : "屏幕录制：未授权"
-        accessibilityLabel.stringValue = Permissions.accessibility ? "辅助功能：已授权" : "辅助功能：未授权"
+        screenRecordingLabel.stringValue = Permissions.screenRecording ? "✓ 已授权" : "未授权 · 请前往系统设置开启"
+        accessibilityLabel.stringValue = Permissions.accessibility ? "✓ 已授权" : "未授权 · 请前往系统设置开启"
         if Permissions.separateSpacesEnabled {
-            spacesLabel.stringValue = "显示器使用不同的空间：已打开"
+            spacesLabel.stringValue = "✓ 已打开"
         } else {
-            spacesLabel.stringValue = "显示器使用不同的空间：关闭。打开后请重新登录。"
+            spacesLabel.stringValue = "未打开 · 开启后需要重新登录 macOS"
         }
+        recordPermissionButton.title = Permissions.screenRecording ? "管理权限…" : "去授权…"
+        accessPermissionButton.title = Permissions.accessibility ? "管理权限…" : "去授权…"
         applySessionState()
     }
 
     private func reloadPopup(_ screens: [PhysicalScreen]) {
         let previous = selectedDisplayID()
-        portraits = screens.filter(\.isPortrait)
+        displays = screens
         popup.removeAllItems()
-        if portraits.isEmpty {
-            popup.addItem(withTitle: "没有竖屏显示器")
+        if displays.isEmpty {
+            popup.addItem(withTitle: "没有可用显示器")
             return
         }
-        for screen in portraits {
+        for screen in displays {
             let session = splits.sessions[screen.id]
             let mode = session?.hasQuick == true ? "快捷全屏" : "桌面拆分"
             let label = session?.active == true ? "\(screen.menuTitle) · \(mode)" : screen.menuTitle
             popup.addItem(withTitle: label)
             popup.lastItem?.representedObject = NSNumber(value: screen.id)
         }
-        if let previous, let index = portraits.firstIndex(where: { $0.id == previous }) {
+        if let previous, let index = displays.firstIndex(where: { $0.id == previous }) {
             popup.selectItem(at: index)
         }
     }
@@ -323,6 +481,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     private func applySessionState() {
         let id = selectedDisplayID()
         let session = id.flatMap { splits.sessions[$0] }
+        layoutPreview.screen = displays.first { $0.id == id }
+        splitButton.title = layoutPreview.screen.map { "\($0.splitLayout.direction)拆分桌面" } ?? "拆分桌面"
         let problem = splitProblem
         if let transition = splits.transition {
             statusLabel.stringValue = "\(transition.name) · \(transition.status)"
@@ -333,7 +493,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         splitButton.isEnabled = id != nil && problem == nil && available && session == nil
         popup.isEnabled = id != nil && available
         joinButton.isEnabled = available && session?.active == true
-        let action = "快捷上下分屏…"
+        let action = "快捷窗口分屏…"
         statusAction?.title = shortcuts.isRegistered(.toggle) ? "\(action)  \(shortcuts.key(for: .toggle).label)" : action
         statusAction?.isEnabled = available
         statusJoin?.isEnabled = available && !splits.active.isEmpty
@@ -363,7 +523,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         let pointer = CGEvent(source: nil)?.location
         let pointedScreen = pointer.flatMap { point in screens.first { $0.bounds.contains(point) } }
         let host = splits.hostScreen(at: pointer)
-        let available = screens.filter { $0.isPortrait && (splits.sessions[$0.id] == nil || splits.sessions[$0.id]?.canStartQuick == true) }
+        let available = screens.filter { (splits.sessions[$0.id] == nil || splits.sessions[$0.id]?.canStartQuick == true) }
         let preferred = [pointedScreen?.id, recentDisplayID, selectedDisplayID()].compactMap { $0 }
             .first { id in available.contains { $0.id == id } }
         if let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != getpid() {
@@ -430,7 +590,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             }
         }
         if !splits.busy { refresh() }
-        if closing && !splits.busy { finishQuit() }
+        if closing && !splits.busy && !confirming { finishQuit() }
     }
 
     private var shortcutInstructions: String {
@@ -523,21 +683,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         return button
     }
 
-    private func labeled(_ title: String, _ control: NSView) -> NSView {
-        let label = NSTextField(labelWithString: title)
-        label.font = .systemFont(ofSize: 13, weight: .semibold)
-        let row = NSStackView(views: [label, control])
-        row.orientation = .horizontal
-        row.alignment = .centerY
-        row.spacing = 8
-        return row
-    }
-
     @objc private func displayChanged() { applySessionState() }
 
     @objc private func splitClicked() {
         guard !confirming, !closing, let id = selectedDisplayID() else {
-            DemoLog.shared.line("先接上或旋转出一块竖屏。")
+            DemoLog.shared.line("先接上一块显示器。")
             return
         }
         splits.split(id)
@@ -574,13 +724,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         let sessions = splits.active.sorted { $0.targetID < $1.targetID }
         let alert = NSAlert()
-        alert.messageText = sessions.count == 1 ? "还原 \(sessions[0].name)？" : "还原哪块竖屏？"
-        alert.informativeText = endQuick ? "结束快捷组合并还原窗口；进入前已有的桌面拆分会保留。普通桌面拆分会合并。" : "还原所选竖屏，结束其快捷组合并迁回窗口。"
+        alert.messageText = sessions.count == 1 ? "还原 \(sessions[0].name)？" : "还原哪块显示器？"
+        alert.informativeText = endQuick ? "结束快捷组合并还原窗口；进入前已有的桌面拆分会保留。普通桌面拆分会合并。" : "还原所选显示器，结束其快捷组合并迁回窗口。"
         let selection = NSPopUpButton()
         if sessions.count > 1 {
             selection.addItems(withTitles: sessions.map(\.name))
             selection.selectItem(at: sessions.firstIndex(where: { $0.targetID == preferred }) ?? 0)
-            selection.setAccessibilityLabel("要合并的竖屏")
+            selection.setAccessibilityLabel("要合并的显示器")
             selection.sizeToFit()
             alert.accessoryView = selection
         }
@@ -596,7 +746,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
     }
 
     private func presentConfirmation(_ alert: NSAlert, action: String, preserving previous: NSRunningApplication? = nil,
-                                     confirmed: @escaping () -> Void) {
+                                     cancelled: (() -> Void)? = nil, confirmed: @escaping () -> Void) {
         guard !confirming else { return }
         confirming = true
         applySessionState()
@@ -631,14 +781,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
             self.confirming = false
             self.applySessionState()
             if response == .alertSecondButtonReturn { confirmed() }
-            else if NSApp.isActive { previous?.activate() }
+            else {
+                cancelled?()
+                if NSApp.isActive { previous?.activate() }
+            }
         }
     }
 
     @objc private func quitClicked() { requestQuit(relaunch: false) }
 
     private func requestQuit(relaunch: Bool) {
-        guard !closing, !confirming else { return }
+        guard !confirming else { return }
+        if closing { offerIncompleteExit(); return }
         if splits.sessions.isEmpty {
             shouldRelaunch = relaunch
             NSApp.terminate(nil)
@@ -646,27 +800,58 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
         }
         let alert = NSAlert()
         alert.messageText = relaunch ? "合并分屏并重新启动？" : "合并分屏并退出？"
-        alert.informativeText = "App 会先还原各块竖屏及其窗口。"
+        alert.informativeText = "App 会先还原各块显示器及其窗口。"
         presentConfirmation(alert, action: relaunch ? "合并并重新启动" : "合并并退出") { [weak self] in
             guard let self else { return }
             self.closing = true
             self.shouldRelaunch = relaunch
             self.quick.hide()
+            self.quitDeadline?.cancel()
+            self.quitDeadline = Task { [weak self] in
+                do { try await Task.sleep(for: .seconds(15)) } catch { return }
+                guard let self, self.closing else { return }
+                self.finishQuit(timedOut: true)
+            }
             self.splits.cancelPreparation()
             self.finishQuit()
         }
     }
 
-    private func finishQuit() {
-        guard !splits.busy else { return }
-        if splits.sessions.values.contains(where: \.needsRecovery) {
-            closing = false
-            shouldRelaunch = false
-            showAdvanced()
+    private func finishQuit(timedOut: Bool = false) {
+        guard closing, !confirming else { return }
+        switch QuitPolicy.action(hasSessions: !splits.sessions.isEmpty, busy: splits.busy,
+                                 needsRecovery: splits.sessions.values.contains(where: \.needsRecovery), timedOut: timedOut) {
+        case .wait:
             return
+        case .offerExit:
+            offerIncompleteExit()
+        case .restore:
+            if let session = splits.active.first { splits.join(session.targetID) }
+            else { offerIncompleteExit() }
+        case .terminate:
+            quitDeadline?.cancel()
+            NSApp.terminate(nil)
         }
-        if let session = splits.active.first { splits.join(session.targetID) }
-        else { NSApp.terminate(nil) }
+    }
+
+    private func offerIncompleteExit() {
+        guard closing, !confirming else { return }
+        quitDeadline?.cancel()
+        let alert = NSAlert()
+        alert.messageText = "窗口还没有完全恢复"
+        alert.informativeText = "仍然退出会结束分屏，部分窗口的位置或全屏状态可能暂时改变。恢复记录会保留，下次启动时继续尝试恢复。也可以取消退出，稍后重试。"
+        let action = shouldRelaunch ? "仍然重新启动" : "仍然退出"
+        presentConfirmation(alert, action: action, cancelled: { [weak self] in
+            self?.closing = false
+            self?.shouldRelaunch = false
+            self?.applySessionState()
+        }) { [weak self] in
+            guard let self else { return }
+            // Do not discard sessions or clear the recovery journal on this path.
+            self.splits.saveBeforeIncompleteExit()
+            self.allowIncompleteExit = true
+            NSApp.terminate(nil)
+        }
     }
 
     @objc private func retryRecovery() {
@@ -695,5 +880,46 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate {
 
     @objc private func relaunch() {
         requestQuit(relaunch: true)
+    }
+}
+
+@MainActor
+private final class SettingsLayoutPreview: NSView {
+    var screen: PhysicalScreen? { didSet { needsDisplay = true } }
+
+    override func draw(_ dirtyRect: NSRect) {
+        super.draw(dirtyRect)
+        guard let screen else { return }
+        let portrait = screen.isPortrait
+        let size = portrait ? CGSize(width: 68, height: 112) : CGSize(width: 196, height: 112)
+        let frame = CGRect(x: bounds.midX - size.width / 2, y: 28, width: size.width, height: size.height)
+        NSColor.separatorColor.setStroke()
+        let outline = NSBezierPath(roundedRect: frame.insetBy(dx: -5, dy: -5), xRadius: 9, yRadius: 9)
+        outline.lineWidth = 2
+        outline.stroke()
+        for (index, region) in screen.splitLayout.regions.enumerated() {
+            let rect = CGRect(x: frame.minX + region.minX / screen.bounds.width * size.width,
+                              y: frame.maxY - region.maxY / screen.bounds.height * size.height,
+                              width: region.width / screen.bounds.width * size.width,
+                              height: region.height / screen.bounds.height * size.height).insetBy(dx: 2, dy: 2)
+            NSColor.controlAccentColor.withAlphaComponent(index == 0 ? 0.22 : 0.12).setFill()
+            NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5).fill()
+            let text = screen.splitLayout.names[index] as NSString
+            let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: NSColor.labelColor]
+            let textSize = text.size(withAttributes: attrs)
+            text.draw(at: CGPoint(x: rect.midX - textSize.width / 2, y: rect.midY - textSize.height / 2), withAttributes: attrs)
+        }
+        let caption = "\(screen.splitLayout.direction)等分 · 两个独立桌面" as NSString
+        let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor]
+        caption.draw(at: CGPoint(x: bounds.midX - caption.size(withAttributes: attrs).width / 2, y: 2), withAttributes: attrs)
+        setAccessibilityLabel("\(screen.name)，\(screen.splitLayout.direction)等分为两个独立桌面")
+    }
+}
+
+@MainActor
+private final class SettingsBackgroundView: NSView {
+    override func draw(_ dirtyRect: NSRect) {
+        NSColor.windowBackgroundColor.setFill()
+        dirtyRect.fill()
     }
 }

@@ -34,6 +34,8 @@ if [[ -z "$SIGN_IDENTITY" ]]; then
     SIGN_IDENTITY="$(awk '/^Authority=/ && !found++ { sub(/^Authority=/, ""); print }' <<< "$SIGNATURE")"
     if [[ -n "$SIGN_IDENTITY" ]]; then
       PREVIOUS_REQUIREMENT="$(sed -n 's/^designated => //p' <<< "$SIGNATURE")"
+      # One-time approved bundle ID migration; keep the existing certificate requirements.
+      PREVIOUS_REQUIREMENT="${PREVIOUS_REQUIREMENT//dev.cmkk.vertical-split-demo/dev.cmkk.panelet}"
     fi
   fi
   if [[ -z "$SIGN_IDENTITY" ]]; then
@@ -56,7 +58,7 @@ python3 - "$STAGED_APP/Contents/Info.plist" <<'PY'
 import pathlib, sys
 text = pathlib.Path("Panelet/Info.plist").read_text()
 text = text.replace("$(EXECUTABLE_NAME)", "Panelet")
-text = text.replace("$(PRODUCT_BUNDLE_IDENTIFIER)", "dev.cmkk.vertical-split-demo")
+text = text.replace("$(PRODUCT_BUNDLE_IDENTIFIER)", "dev.cmkk.panelet")
 text = text.replace("$(PRODUCT_NAME)", "Panelet")
 pathlib.Path(sys.argv[1]).write_text(text)
 PY
@@ -81,6 +83,7 @@ swiftc -O -g \
   Panelet/WindowPlacement.swift \
   Panelet/Session.swift \
   Panelet/QuickExitPolicy.swift \
+  Panelet/QuitPolicy.swift \
   Panelet/RecoveryJournal.swift \
   Panelet/WindowPreviewGrid.swift \
   Panelet/QuickSplitPanel.swift \

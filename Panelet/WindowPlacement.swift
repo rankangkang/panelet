@@ -251,7 +251,7 @@ final class WindowPlacement {
                                        original: nil, display: source, slot: nil, fullScreenDisplay: source))
             let index = windows.count - 1
             guard await Self.exitFullScreen(window), let frame = window.frame else {
-                throw DemoError("原竖屏上的「\(record.title)」暂时无法退出全屏，已取消拆分以保留原桌面。")
+                throw DemoError("原显示器上的「\(record.title)」暂时无法退出全屏，已取消拆分以保留原桌面。")
             }
             windows[index].original = frame
             try Task.checkCancellation()
@@ -307,7 +307,7 @@ final class WindowPlacement {
             guard let window = Self.resolve(saved, in: Self.liveWindows()),
                   await Self.restoreFullScreen(window, on: halves[0].virtualID) else {
                 DemoLog.shared.line("迁移全屏失败 pid=\(saved.pid) title=\(saved.id.flatMap { Self.liveWindows()[$0]?.title } ?? "未知") id=\(saved.id ?? 0) frame=\(String(describing: saved.window.frame)) target=\(halves[0].virtualBounds) full=\(String(describing: saved.window.fullScreen))")
-                throw DemoError("原来的全屏窗口未能在上半屏恢复全屏，已取消本次拆分。")
+                throw DemoError("原来的全屏窗口未能在第一个分区恢复全屏，已取消本次拆分。")
             }
             try Task.checkCancellation()
         }
@@ -585,6 +585,47 @@ final class WindowPlacement {
         return false
     }
 
+    /// Only rescue visible ordinary windows whose center is on the covered physical desktop.
+    func rescueHiddenWindows(to halves: [HalfScreen], protecting: [Identity], shouldContinue: () -> Bool) async {
+        let hidden = CGDisplayBounds(source.id)
+        let excluded = protecting + identities
+        let scan = Task.detached(priority: .utility) {
+            let records = Self.windowList([.optionOnScreenOnly, .excludeDesktopElements]).filter { record in
+                hidden.contains(CGPoint(x: record.frame.midX, y: record.frame.midY)) &&
+                    !excluded.contains { identity in identity.matches(number: record.id, element: nil) }
+            }
+            return Self.movableWindows(from: records).filter { match in
+                !match.window.isMinimized && NSRunningApplication(processIdentifier: match.info.pid)?.isHidden == false &&
+                    !excluded.contains { $0.matches(number: match.info.id, element: match.window.element) }
+            }
+        }
+        let candidates = await scan.value
+        guard !Task.isCancelled, shouldContinue(), CGDisplayBounds(source.id) == hidden else { return }
+        var moves: [(Window, CGRect)] = []
+        for match in candidates {
+            guard let current = match.window.frame, Self.near(current, match.frame),
+                  !match.window.isFullScreen, !match.window.isMinimized else { continue }
+            let local = CGPoint(x: current.midX - hidden.minX, y: current.midY - hidden.minY)
+            guard let half = halves.first(where: { $0.localRect.contains(local) }),
+                  let screen = NSScreen.screens.first(where: { $0.displayID == half.virtualID }) else { continue }
+            if !windows.contains(where: { $0.id == match.info.id && $0.pid == match.info.pid }) {
+                let original = current.offsetBy(dx: source.bounds.minX - hidden.minX, dy: source.bounds.minY - hidden.minY)
+                windows.append(SavedWindow(window: match.window, id: match.info.id, pid: match.info.pid,
+                                           original: original, display: source, slot: nil))
+            }
+            let translated = current.offsetBy(dx: half.virtualBounds.minX - hidden.minX - half.localRect.minX,
+                                               dy: half.virtualBounds.minY - hidden.minY - half.localRect.minY)
+            moves.append((match.window, Self.fit(translated, inside: cocoaRect(screen.visibleFrame))))
+        }
+        guard !moves.isEmpty else { return }
+        do { try onCheckpoint?() } catch {
+            DemoLog.shared.line("窗口补位暂缓：\(error.localizedDescription)")
+            return
+        }
+        // Keep the short AX writes on the main actor so a join cannot start between validation and placement.
+        for (window, frame) in moves { window.place(frame) }
+    }
+
     func collectRemainingWindows(on halves: [HalfScreen], reserved: [Identity]) async {
         let displayIDs = [source.id] + halves.map(\.virtualID)
         let sourceBounds = displayIDs.map { CGDisplayBounds($0) }
@@ -618,6 +659,7 @@ final class WindowPlacement {
         let bounds = halves.map(\.virtualBounds)
         guard bounds.count == 2, bounds.allSatisfy({ !$0.isEmpty }) else { return }
         let snapshot = windows
+        let offsets = halves.map(\.localRect.origin)
         let source = self.source
         let updated = await Task.detached(priority: .utility) {
             let live = Self.liveWindows()
@@ -634,9 +676,8 @@ final class WindowPlacement {
                 guard let index = bounds.firstIndex(where: { $0.contains(center) }) else { return nil }
                 var current = saved
                 let origin = source.bounds.origin
-                let offsetY = index == 0 ? 0 : bounds[0].height
-                current.original = frame.offsetBy(dx: origin.x - bounds[index].minX,
-                                                   dy: origin.y + offsetY - bounds[index].minY)
+                current.original = frame.offsetBy(dx: origin.x + offsets[index].x - bounds[index].minX,
+                                                   dy: origin.y + offsets[index].y - bounds[index].minY)
                 current.display = source
                 current.wasMinimized = window.isMinimized
                 current.wasInStageStrip = false

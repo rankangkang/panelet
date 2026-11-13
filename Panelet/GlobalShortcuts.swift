@@ -6,7 +6,7 @@ final class GlobalShortcuts {
     enum Command: Int, CaseIterable {
         case toggle, join
 
-        var title: String { self == .toggle ? "快捷上下分屏" : "还原分屏" }
+        var title: String { self == .toggle ? "快捷窗口分屏" : "还原分屏" }
         var defaultKey: Key {
             Key(code: UInt32(self == .toggle ? kVK_ANSI_S : kVK_ANSI_J),
                 modifiers: UInt32(controlKey | shiftKey), equivalent: self == .toggle ? "s" : "j")

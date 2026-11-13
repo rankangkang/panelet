@@ -6,7 +6,7 @@ import IOKit
 import os
 import ScreenCaptureKit
 
-/// One half of a portrait display: a virtual display, plus a borderless window
+/// One region of a physical display: a virtual display, plus a borderless window
 /// that paints that display onto the matching physical region.
 @MainActor
 final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
@@ -29,6 +29,8 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
     private nonisolated let pendingFrame = OSAllocatedUnfairLock<Frame?>(uncheckedState: nil)
     private var display: CGVirtualDisplay?
     private var window: NSWindow?
+    private var numberView: NSView?
+    private var numberTask: Task<Void, Never>?
     private var stream: SCStream?
     private var displayedStream: ObjectIdentifier?
     private var tornDown = false
@@ -169,7 +171,7 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         let frame = cocoaRect(physicalRect)
         if mirror.frame != frame { mirror.setFrame(frame, display: true) }
         guard mirror.screen?.displayID == physicalID, mirror.frame == frame else {
-            throw DemoError("\(name) 的画面窗口无法定位到竖屏。")
+            throw DemoError("\(name) 的画面窗口无法定位到显示器。")
         }
     }
 
@@ -218,7 +220,38 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         throw DemoError("重新连接后没有收到画面。")
     }
 
+    func showNumber(_ number: String) {
+        numberTask?.cancel()
+        numberView?.removeFromSuperview()
+        guard let content = window?.contentView else { return }
+        let badge = NSTextField(labelWithString: "\(number)\n\(name)")
+        badge.alignment = .center
+        let text = NSMutableAttributedString(string: "\(number)\n", attributes: [.font: NSFont.systemFont(ofSize: 72, weight: .bold)])
+        text.append(NSAttributedString(string: name, attributes: [.font: NSFont.systemFont(ofSize: 16, weight: .medium)]))
+        badge.attributedStringValue = text
+        badge.textColor = .white
+        badge.wantsLayer = true
+        badge.layer?.backgroundColor = NSColor.black.withAlphaComponent(0.72).cgColor
+        badge.layer?.cornerRadius = 18
+        badge.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(badge)
+        NSLayoutConstraint.activate([
+            badge.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            badge.centerYAnchor.constraint(equalTo: content.centerYAnchor),
+            badge.widthAnchor.constraint(lessThanOrEqualTo: content.widthAnchor, multiplier: 0.9)
+        ])
+        numberView = badge
+        numberTask = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(3)) } catch { return }
+            self?.numberView?.removeFromSuperview()
+            self?.numberView = nil
+        }
+    }
+
     func hideWindow() {
+        numberTask?.cancel()
+        numberView?.removeFromSuperview()
+        numberView = nil
         window?.orderOut(nil)
         window = nil
     }

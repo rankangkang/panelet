@@ -28,6 +28,7 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
     private let picker = NSStackView()
     private let footer = NSStackView()
 
+    private var screens: [PhysicalScreen] = []
     private var choices: [WindowPlacement.Choice] = []
     private var results: [WindowPlacement.Choice] = []
     private var selected: [WindowPlacement.Choice?] = [nil, nil]
@@ -47,7 +48,7 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
     override init() {
         super.init()
         let width = Self.width
-        panel.title = "Panelet · 快捷上下分屏"
+        panel.title = "Panelet · 快捷窗口分屏"
         panel.delegate = self
         panel.isReleasedWhenClosed = false
         panel.isFloatingPanel = true
@@ -63,7 +64,7 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         join.target = self
         join.action = #selector(joinClicked)
         join.bezelStyle = .rounded
-        let header = NSStackView(views: [NSTextField(labelWithString: "把窗口拖到上半屏或下半屏"), NSView(), join, advanced])
+        let header = NSStackView(views: [NSTextField(labelWithString: "把窗口拖到目标分区"), NSView(), join, advanced])
         header.alignment = .centerY
 
         displayMap.heightAnchor.constraint(equalToConstant: 154).isActive = true
@@ -171,17 +172,18 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
     func updateDisplays(_ screens: [PhysicalScreen], selectedID: CGDirectDisplayID? = nil,
                         activePairs: [CGDirectDisplayID: [WindowPlacement.Choice]]? = nil,
                         excluded: [WindowPlacement.Identity]? = nil) {
+        self.screens = screens
         if let activePairs { self.activePairs = activePairs }
         if let excluded { self.excluded = excluded }
-        let hadPortrait = selectedDisplayID != nil
+        let hadDisplay = selectedDisplayID != nil
         let preferred = selectedID ?? selectedDisplayID
-        let portraits = screens.filter { $0.isPortrait && self.activePairs[$0.id]?.isEmpty != false }
-        let next = portraits.first(where: { $0.id == preferred })?.id ?? portraits.first?.id
+        let available = screens.filter { self.activePairs[$0.id]?.isEmpty != false }
+        let next = available.first(where: { $0.id == preferred })?.id ?? available.first?.id
         if next != selectedDisplayID { useDisplay(next) }
         displayMap.updateDisplays(screens)
         displayMap.isHidden = screens.isEmpty
         guard isVisible else { return }
-        if !hadPortrait && selectedDisplayID != nil && blocker == nil {
+        if !hadDisplay && selectedDisplayID != nil && blocker == nil {
             loadChoices()
             panel.makeFirstResponder(search)
         } else { updateResults() }
@@ -253,10 +255,10 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
 
     private func updateControls() {
         let unavailable = blocker ?? (selectedDisplayID == nil
-            ? (activePairs.isEmpty ? "接入或旋转一块竖屏后即可拆分。" : "所有竖屏均在快捷分屏中，请先还原一个组合。") : nil)
+            ? (activePairs.isEmpty ? "接入一块显示器后即可拆分。" : "所有显示器均在快捷分屏中，请先还原一个组合。") : nil)
         picker.isHidden = unavailable != nil
         footer.isHidden = unavailable != nil && !busy
-        advanced.title = blocker == nil ? "拆分桌面与设置…" : "打开设置…"
+        advanced.title = blocker == nil ? "设置…" : "打开设置…"
         join.isHidden = activePairs.isEmpty
         join.isEnabled = !busy
         search.isEnabled = !busy
@@ -269,7 +271,9 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         }
         displayMap.updateSelection(displayID: selectedDisplayID, slot: slot, names: names,
                                    titles: selected.map { $0?.title }, activePairs: activePairs, enabled: !busy && unavailable == nil)
-        search.placeholderString = slot == 0 ? "搜索上半屏窗口" : "搜索下半屏窗口"
+        let layout = screens.first { $0.id == selectedDisplayID }?.splitLayout
+        let direction = layout?.direction ?? "两区"
+        search.placeholderString = "搜索\(layout?.names[slot] ?? "分区")窗口"
         let empty = choiceTask != nil ? "正在查找打开的窗口…" :
             (results.isEmpty && !search.stringValue.isEmpty ? "没有匹配的窗口。" :
                 (choices.lazy.filter(isAvailable).prefix(2).count < 2 ? "打开至少两个可选窗口后即可拆分。" : nil))
@@ -277,8 +281,8 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         message.stringValue = status ?? ""
         message.isHidden = status == nil
         hint.stringValue = busy ? (canCancel ? "Esc 取消" : "")
-            : (pair != nil && grid.highlightedIndex == nil ? "↵ 上下全屏   Esc 关闭" : "↑↓ 选择   ↵ 确认   Esc 关闭")
-        primary.title = busy ? "取消" : "上下全屏"
+            : (pair != nil && grid.highlightedIndex == nil ? "↵ \(direction)全屏   Esc 关闭" : "↑↓ 选择   ↵ 确认   Esc 关闭")
+        primary.title = busy ? "取消" : "\(direction)全屏"
         primary.isEnabled = busy ? canCancel : (pair != nil && unavailable == nil)
         panel.contentView?.layoutSubtreeIfNeeded()
         let height = ceil(content.fittingSize.height)
@@ -429,7 +433,6 @@ private final class DisplayArrangementView: NSView {
         let screen: PhysicalScreen
         let view: NSView
         let halves: [NSButton]
-        let caption: NSTextField?
     }
 
     struct DropTarget: Equatable {
@@ -459,30 +462,17 @@ private final class DisplayArrangementView: NSView {
             card.wantsLayer = true
             card.layer?.cornerRadius = 7
             card.layer?.masksToBounds = true
-            let halves: [NSButton]
-            let caption: NSTextField?
-            if screen.isPortrait {
-                halves = (0..<2).map { _ in
-                    let button = NSButton(title: "", target: self, action: #selector(halfClicked))
-                    button.isBordered = false
-                    button.wantsLayer = true
-                    button.cell?.usesSingleLineMode = false
-                    button.cell?.lineBreakMode = .byTruncatingTail
-                    card.addSubview(button)
-                    return button
-                }
-                caption = nil
-            } else {
-                halves = []
-                let label = NSTextField(labelWithString: "")
-                label.maximumNumberOfLines = 2
-                label.lineBreakMode = .byTruncatingTail
-                label.toolTip = screen.menuTitle
-                card.addSubview(label)
-                caption = label
+            let halves: [NSButton] = (0..<2).map { _ in
+                let button = NSButton(title: "", target: self, action: #selector(halfClicked))
+                button.isBordered = false
+                button.wantsLayer = true
+                button.cell?.usesSingleLineMode = false
+                button.cell?.lineBreakMode = .byTruncatingTail
+                card.addSubview(button)
+                return button
             }
             addSubview(card)
-            return Tile(screen: screen, view: card, halves: halves, caption: caption)
+            return Tile(screen: screen, view: card, halves: halves)
         }
         needsLayout = true
         updateAppearance()
@@ -514,17 +504,12 @@ private final class DisplayArrangementView: NSView {
                                width: screen.width * scale, height: screen.height * scale)
             tile.view.frame = frame.insetBy(dx: min(3, frame.width / 10), dy: min(3, frame.height / 10))
             let size = tile.view.bounds.size
-            let halfHeight = size.height / 2
-            let seam = min(0.5, halfHeight / 10)
             for (index, button) in tile.halves.enumerated() {
-                button.frame = CGRect(x: 0, y: index == 0 ? halfHeight + seam : 0,
-                                      width: size.width, height: halfHeight - seam)
-            }
-            if let caption = tile.caption {
-                let padding = min(4, size.width / 8)
-                let width = size.width - 2 * padding
-                let height = min(caption.sizeThatFits(NSSize(width: width, height: size.height)).height, size.height)
-                caption.frame = CGRect(x: padding, y: (size.height - height) / 2, width: width, height: height)
+                let region = tile.screen.splitLayout.regions[index]
+                let sx = size.width / screen.width
+                let sy = size.height / screen.height
+                button.frame = CGRect(x: region.minX * sx, y: size.height - region.maxY * sy,
+                                      width: region.width * sx, height: region.height * sy).insetBy(dx: 0.5, dy: 0.5)
             }
         }
     }
@@ -545,14 +530,10 @@ private final class DisplayArrangementView: NSView {
                 let occupied = active?.isEmpty == false
                 tile.view.layer?.borderWidth = isTarget ? 2 : 1
                 tile.view.layer?.borderColor = (isTarget ? accent : .separatorColor).cgColor
-                let background = tile.screen.isPortrait ? .separatorColor : NSColor.labelColor.withAlphaComponent(0.08)
-                tile.view.layer?.backgroundColor = background.cgColor
-                if let caption = tile.caption {
-                    let position = tile.screen.id == CGMainDisplayID() ? "主屏" : "横屏"
-                    caption.attributedStringValue = Self.caption(position, detail: tile.screen.name)
-                }
+                tile.view.layer?.backgroundColor = NSColor.separatorColor.cgColor
                 for (slot, button) in tile.halves.enumerated() {
-                    let position = slot == 0 ? "上半屏" : "下半屏"
+                    let number = tiles.map(\.screen.id).sorted().firstIndex(of: tile.screen.id).map { $0 + 1 } ?? 1
+                    let position = "\(number).\(slot + 1) \(tile.screen.splitLayout.names[slot])"
                     let highlighted = isTarget && selectedSlot == slot
                     let receivingDrop = dropTarget == DropTarget(displayID: tile.screen.id, slot: slot)
                     let assigned = active.flatMap { $0.indices.contains(slot) ? $0[slot] : nil }
