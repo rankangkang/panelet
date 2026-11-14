@@ -79,11 +79,14 @@ final class SplitSessions {
     func recoverPreviousSession() async {
         guard sessions.isEmpty, !recovering else { return }
         recovering = true
-        defer { recovering = false }
+        defer {
+            recovering = false
+            if let recoveryProblem { DemoLog.shared.line(recoveryProblem) }
+        }
         do {
             guard let journal = try RecoveryJournal.load() else { recoveryProblem = nil; return }
             guard Permissions.splitProblem == nil else {
-                recoveryProblem = "上次分屏未正常结束。请完成授权，再点“重试恢复窗口…”。"
+                recoveryProblem = L("上次分屏未正常结束。请完成授权，再点“重试恢复窗口…”。")
                 return
             }
             let physical = DisplayScanner.physicalScreens()
@@ -98,25 +101,24 @@ final class SplitSessions {
                 try await Session.setOrigins(layout)
                 try await Task.sleep(for: .milliseconds(500))
                 guard layout.allSatisfy({ CGDisplayBounds($0.key) == $0.value }) else {
-                    throw DemoError("系统尚未恢复原显示器排列，请重试。")
+                    throw DemoError(L("系统尚未恢复原显示器排列，请重试。"))
                 }
             }
             guard await WindowPlacement.recoverWindows(journal.windows) else {
-                recoveryProblem = "上次分屏的部分窗口尚未恢复，请点“重试恢复窗口…”。"
+                recoveryProblem = L("上次分屏的部分窗口尚未恢复，请点“重试恢复窗口…”。")
                 return
             }
             try RecoveryJournal.clear()
             recoveryProblem = nil
-            DemoLog.shared.line("已恢复上次异常退出的显示器排列和可用的组合窗口。")
+            DemoLog.shared.line(L("已恢复上次异常退出的显示器排列和可用的组合窗口。"))
         } catch {
-            recoveryProblem = "恢复上次分屏失败：\(error.localizedDescription)"
+            recoveryProblem = L("恢复上次分屏失败：%@", String(describing: error.localizedDescription))
         }
-        if let recoveryProblem { DemoLog.shared.line(recoveryProblem) }
     }
 
     func saveBeforeIncompleteExit() {
         do { try checkpointRecovery() }
-        catch { DemoLog.shared.line("无法更新退出恢复记录，将保留此前记录：\(error.localizedDescription)") }
+        catch { DemoLog.shared.line(L("无法更新退出恢复记录，将保留此前记录：%@", String(describing: error.localizedDescription))) }
     }
 
     fileprivate func checkpointRecovery() throws {
@@ -148,6 +150,7 @@ final class SplitSessions {
                   let logical = logicalBounds(for: screen.id) else { return screen }
             var result = screen
             result.bounds = logical
+            result.configuration = session.configuration
             return result
         }
     }
@@ -162,7 +165,8 @@ final class SplitSessions {
         let parked = parkedIDs.union(standby.values.flatMap { $0.map(\.virtualID) })
         let usable = NSScreen.screens.filter { screen in screen.displayID.map { !parked.contains($0) } ?? false }
         return usable.first { screen in point.map { cocoaRect(screen.frame).contains($0) } ?? false }
-            ?? usable.first { $0.displayID == CGMainDisplayID() } ?? usable.first
+            ?? usable.first { $0.displayID == CGMainDisplayID() }
+            ?? usable.max { $0.visibleFrame.width * $0.visibleFrame.height < $1.visibleFrame.width * $1.visibleFrame.height }
     }
 
     func splitDisplay(at point: CGPoint) -> CGDirectDisplayID? {
@@ -171,6 +175,10 @@ final class SplitSessions {
 
     func split(_ id: CGDirectDisplayID, pair: WindowPlacement.Pair? = nil) {
         guard !busy, recoveryProblem == nil, !sessions.values.contains(where: \.needsRecovery) else { return }
+        if let problem = EnvironmentCheck.inspect().problem {
+            DemoLog.shared.line(problem)
+            return
+        }
         if let existing = sessions[id] {
             guard let pair, existing.canStartQuick else { return }
             transition = existing
@@ -232,7 +240,7 @@ final class SplitSessions {
             return
         }
         guard router?.isEnabled == true else {
-            fail(first, error: DemoError("鼠标事件监听已停止。"))
+            fail(first, error: DemoError(L("鼠标事件监听已停止。")))
             return
         }
         let current = Dictionary(uniqueKeysWithValues: DisplayScanner.activeDisplayIDs().map { ($0, CGDisplayBounds($0)) })
@@ -257,7 +265,7 @@ final class SplitSessions {
         }
         if current != routedLayout {
             do { try updateRoutes() }
-            catch { DemoLog.shared.line("正在等待显示器排列稳定。\(error.localizedDescription)") }
+            catch { DemoLog.shared.line(L("正在等待显示器排列稳定。%@", String(describing: error.localizedDescription))) }
         }
     }
 
@@ -287,14 +295,14 @@ final class SplitSessions {
                     while self.changingDisplays || !self.monitoringAllowed { try await Task.sleep(for: .milliseconds(100)) }
                     guard session.active, self.sessions[session.targetID] === session else { return }
                     try await half.recoverCapture()
-                    DemoLog.shared.line("\(half.name) 已恢复画面采集（\(interruptedAt.duration(to: .now).formatted(.units(allowed: [.seconds, .milliseconds], width: .abbreviated)))）。")
+                    DemoLog.shared.line(L("%@ 已恢复画面采集（%@）。", String(describing: half.name), String(describing: interruptedAt.duration(to: .now).formatted(.units(allowed: [.seconds, .milliseconds], width: .abbreviated)))))
                     return
                 } catch {
                     if Task.isCancelled { return }
                     lastError = error
                 }
             }
-            self.fail(session, error: DemoError("\(half.name) 未能恢复画面采集。\(lastError.localizedDescription)"))
+            self.fail(session, error: DemoError(L("%@ 未能恢复画面采集。%@", String(describing: half.name), String(describing: lastError.localizedDescription))))
         }
     }
 
@@ -313,7 +321,7 @@ final class SplitSessions {
             originalScreens.removeAll()
         }
         do { try checkpointRecovery() }
-        catch { DemoLog.shared.line("无法更新恢复记录：\(error.localizedDescription)") }
+        catch { DemoLog.shared.line(L("无法更新恢复记录：%@", String(describing: error.localizedDescription))) }
         onChange?(session)
         if !busy, monitoringAllowed, let id = failedSessions.keys.first, let error = failedSessions.removeValue(forKey: id),
            let affected = sessions[id] { fail(affected, error: error) }
@@ -462,7 +470,7 @@ final class SplitSessions {
         let input = router ?? MouseRouter()
         input.update(parked: parking + hidden, screens: layout.filter { !parked.contains($0.key) }.map(\.value))
         if router == nil {
-            guard input.start() else { throw DemoError("鼠标事件监听启动失败。请检查辅助功能权限并重新启动。") }
+            guard input.start() else { throw DemoError(L("鼠标事件监听启动失败。请检查辅助功能权限并重新启动。")) }
             router = input
         }
         routedLayout = layout
@@ -474,7 +482,7 @@ final class SplitSessions {
 final class Session {
     private enum Phase { case idle, preparing, split, joining }
 
-    private(set) var status = "未拆分"
+    private(set) var status = L("未拆分")
     private let screen: PhysicalScreen
     enum Mode { case desktop, quick }
     let mode: Mode
@@ -488,7 +496,9 @@ final class Session {
     var canStartQuick: Bool { active && mode == .desktop && !hasQuick && !needsRecovery }
     private unowned let coordinator: SplitSessions
     var targetID: CGDirectDisplayID { screen.id }
-    var name: String { screen.name }
+    var name: String { screen.displayName }
+    var configuration: DisplayConfiguration { screen.configuration }
+    var captureStatistics: [String] { halves.map(\.statistics) }
     private(set) var failed = false
     private(set) var needsRecovery = false
     var idle: Bool { phase == .idle }
@@ -505,17 +515,21 @@ final class Session {
     fileprivate func releaseWindows(_ identities: [WindowPlacement.Identity]) { placement?.release(identities) }
     func layoutProblem(in layout: [CGDirectDisplayID: CGRect]) -> String? {
         guard let physical = layout[targetID], physical.size == expectedLayout[targetID]?.size else {
-            return "物理显示器已断开或分辨率发生变化。"
+            return L("物理显示器已断开或分辨率发生变化。")
         }
         for half in halves {
             guard let bounds = layout[half.virtualID], bounds == expectedLayout[half.virtualID] else {
-                return "\(half.name) 的桌面位置或点尺寸发生变化。"
+                return L("%@ 的桌面位置或点尺寸发生变化。", String(describing: half.name))
             }
-            if half.hasUnexpectedMode { return "\(half.name) 的像素尺寸发生变化。" }
+            if half.hasUnexpectedMode { return L("%@ 的像素尺寸发生变化。", String(describing: half.name)) }
         }
         return nil
     }
 
+    private var operationStarted: TimeInterval?
+    private var operationName = ""
+    private var operationIsRecovery = false
+    private var cancelledByUser = false
     private var phase = Phase.idle
     fileprivate private(set) var halves: [HalfScreen] = []
     private var placement: WindowPlacement?
@@ -536,6 +550,7 @@ final class Session {
     fileprivate func split(displays: [PhysicalScreen], reserved: [WindowPlacement.Identity]) {
         guard phase == .idle else { return }
         failed = false
+        cancelledByUser = false
         if let problem = Permissions.splitProblem {
             DemoLog.shared.line(problem)
             publish(problem, phase: .idle)
@@ -543,7 +558,7 @@ final class Session {
         }
 
         guard CGDisplayIsInMirrorSet(targetID) == 0 else {
-            publish("请先把目标显示器设为扩展显示器。", phase: .idle)
+            publish(L("请先把目标显示器设为扩展显示器。"), phase: .idle)
             return
         }
 
@@ -554,12 +569,12 @@ final class Session {
             publish(error.localizedDescription, phase: .idle)
             return
         }
-        publish("正在准备分屏…", phase: .preparing)
+        publish(L("正在准备分屏…"), phase: .preparing)
 
         deadline = Task { [weak self] in
             do {
                 try await Task.sleep(for: .seconds(45))
-                if let self { self.coordinator.fail(self, error: DemoError("准备分屏超时。")) }
+                if let self { self.coordinator.fail(self, error: DemoError(L("准备分屏超时。"))) }
             } catch {}
         }
         setup = Task {
@@ -579,8 +594,8 @@ final class Session {
                         ordinary.append((other, await placement.ordinaryWindows(on: upper)))
                     }
                 }
-                publish("正在创建\(screen.splitLayout.direction)两个虚拟显示器…", phase: .preparing)
-                DemoLog.shared.line("拆分 \(screen.menuTitle)，已记录 \(placement?.count ?? 0) 个可迁移窗口的位置和尺寸。")
+                publish(L("正在创建%@两个虚拟显示器…", String(describing: screen.splitLayout.direction)), phase: .preparing)
+                DemoLog.shared.line(L("拆分 %@，已记录 %@ 个可迁移窗口的位置和尺寸。", String(describing: screen.menuTitle), String(describing: placement?.count ?? 0)))
                 try await prepare()
                 try Task.checkCancellation()
                 let owned = managedWindows
@@ -594,10 +609,10 @@ final class Session {
                 deadline = nil
                 setup = nil
                 if pair != nil { exitPolicy.arm() }
-                let status = pair == nil ? "已拆分，\(screen.splitLayout.direction)半屏可各自全屏" : "已拆分，\(screen.splitLayout.direction)半屏已分别全屏"
+                let status = pair == nil ? L("已拆分，%@半屏可各自全屏", String(describing: screen.splitLayout.direction)) : L("已拆分，%@半屏已分别全屏", String(describing: screen.splitLayout.direction))
                 publish(status, phase: .split)
                 showRegionNumbers()
-                DemoLog.shared.line("\(name) 的两个半屏已就绪。")
+                DemoLog.shared.line(L("%@ 的两个半屏已就绪。", String(describing: name)))
             } catch {
                 if !Task.isCancelled { coordinator.fail(self, error: error) }
             }
@@ -648,6 +663,7 @@ final class Session {
     fileprivate func startQuick(_ pair: WindowPlacement.Pair, displays: [PhysicalScreen], reserved: [WindowPlacement.Identity]) {
         guard canStartQuick else { return }
         failed = false
+        cancelledByUser = false
         do {
             quickPlacement = try WindowPlacement(source: screen, displays: displays, pair: pair,
                                                  reserved: reserved, selectedOnly: true)
@@ -658,13 +674,13 @@ final class Session {
             return
         }
         self.pair = pair
-        publish("正在准备快捷\(screen.splitLayout.direction)分屏…", phase: .preparing)
+        publish(L("正在准备快捷%@分屏…", String(describing: screen.splitLayout.direction)), phase: .preparing)
         deadline = Task { [weak self] in
             do {
                 try await Task.sleep(for: .seconds(20))
                 guard let self, self.preparing else { return }
                 self.failed = true
-                self.finish(status: "快捷分屏超时，已还原窗口", quickOnly: true)
+                self.finish(status: L("快捷分屏超时，已还原窗口"), quickOnly: true)
             } catch {}
         }
         setup = Task {
@@ -680,24 +696,24 @@ final class Session {
                 deadline = nil
                 setup = nil
                 exitPolicy.arm()
-                publish("快捷\(screen.splitLayout.direction)分屏中 · 退出任一全屏即还原", phase: .split)
+                publish(L("快捷%@分屏中 · 退出任一全屏即还原", String(describing: screen.splitLayout.direction)), phase: .split)
                 showRegionNumbers()
             } catch {
                 if !Task.isCancelled {
                     failed = true
-                    finish(status: "快捷分屏失败，已还原窗口。\(error.localizedDescription)", quickOnly: true)
+                    finish(status: L("快捷分屏失败，已还原窗口。%@", String(describing: error.localizedDescription)), quickOnly: true)
                 }
             }
         }
     }
 
     fileprivate func endQuick() {
-        if mode == .desktop { finish(status: "已结束快捷分屏，保留桌面拆分", quickOnly: true) }
-        else { finish(status: "已结束快捷分屏并还原", joining: true) }
+        if mode == .desktop { finish(status: L("已结束快捷分屏，保留桌面拆分"), quickOnly: true) }
+        else { finish(status: L("已结束快捷分屏并还原"), joining: true) }
     }
 
     fileprivate func join() {
-        finish(status: "已合并", joining: true)
+        finish(status: L("已合并"), joining: true)
     }
 
     private func placeOrdinaryWindows(protecting: [WindowPlacement.Identity], only: Set<CGWindowID>? = nil) async {
@@ -705,7 +721,10 @@ final class Session {
     }
 
     fileprivate func cancelPreparation() {
-        if preparing { finish(status: "已取消分屏", quickOnly: mode == .desktop && quickPlacement != nil) }
+        if preparing {
+            cancelledByUser = true
+            finish(status: L("已取消分屏"), quickOnly: mode == .desktop && quickPlacement != nil)
+        }
     }
 
     private func prepare() async throws {
@@ -714,7 +733,7 @@ final class Session {
         halves = coordinator.takeStandby(for: targetID)
         touchedLayout = !halves.isEmpty
         let splitLayout = screen.splitLayout
-        if !halves.isEmpty && halves.map(\.localRect) != splitLayout.regions {
+        if !halves.isEmpty && (halves.map(\.localRect) != splitLayout.regions || !halves.allSatisfy { $0.matchesConfiguration(screen) }) {
             for half in halves { half.teardown() }
             halves.removeAll()
         }
@@ -722,7 +741,7 @@ final class Session {
             for index in 0..<2 {
                 try Task.checkCancellation()
                 touchedLayout = true
-                halves.append(try HalfScreen.make(name: "\(screen.name) · \(splitLayout.names[index])",
+                halves.append(try HalfScreen.make(name: "\(screen.displayName) · \(splitLayout.names[index])",
                                                   screen: screen, localRect: splitLayout.regions[index], role: splitLayout.roles[index]))
             }
         }
@@ -730,14 +749,14 @@ final class Session {
             half.onFailure = { [weak self, weak half] error in
                 guard let self, let half else { return }
                 self.coordinator.recoverCapture(half, in: self,
-                    error: DemoError("\(half.name) 的画面采集已停止。\(error.localizedDescription)"))
+                    error: DemoError(L("%@ 的画面采集已停止。%@", String(describing: half.name), String(describing: error.localizedDescription))))
             }
         }
         let activeHalves = halves
         let displayIDs = activeHalves.map(\.virtualID)
         async let captureDisplays = HalfScreen.waitForDisplays(ids: displayIDs)
 
-        try await Self.wait(steps: 45, error: "虚拟显示器没有就绪。") {
+        try await Self.wait(steps: 45, error: L("虚拟显示器没有就绪。")) {
             let appKitIDs = NSScreen.screens.compactMap(\.displayID)
             return halves.allSatisfy { appKitIDs.contains($0.virtualID) }
         }
@@ -748,21 +767,21 @@ final class Session {
         coordinator.endDisplayChange()
         try coordinator.updateRoutes()
 
-        publish("正在等待\(screen.splitLayout.direction)半屏的画面…", phase: .preparing)
+        publish(L("正在等待%@半屏的画面…", String(describing: screen.splitLayout.direction)), phase: .preparing)
         let displays = try await captureDisplays
         let placement = self.placement
         async let capturing: Void = Self.startCaptures(activeHalves, displays: displays)
         if let placement {
             let moved = try await placement.migrate(to: activeHalves)
-            DemoLog.shared.line("已迁移 \(moved)/\(placement.count) 个窗口。")
+            DemoLog.shared.line(L("已迁移 %@/%@ 个窗口。", String(describing: moved), String(describing: placement.count)))
             if pair != nil {
                 try Task.checkCancellation()
-                publish("正在让\(screen.splitLayout.direction)半屏的窗口进入全屏…", phase: .preparing)
+                publish(L("正在让%@半屏的窗口进入全屏…", String(describing: screen.splitLayout.direction)), phase: .preparing)
                 fullScreenTask = Task { try await placement.enterSelectedFullScreen(on: activeHalves) }
             }
         }
         try await capturing
-        try await Self.wait(steps: 50, error: "有半屏未收到符合分辨率的画面。") {
+        try await Self.wait(steps: 50, error: L("有半屏未收到符合分辨率的画面。")) {
             halves.allSatisfy(\.hasFrame)
         }
 
@@ -772,7 +791,7 @@ final class Session {
             fullScreenTask = nil
         }
         await placeOrdinaryWindows(protecting: coordinator.active.flatMap(\.managedWindows))
-        try await Self.wait(steps: 9, error: "全屏切换后显示器排列发生变化。") {
+        try await Self.wait(steps: 9, error: L("全屏切换后显示器排列发生变化。")) {
             Self.layoutMatches(layout, ignoringParked: coordinator.parkedIDs) && halves.allSatisfy(\.hasExpectedMode)
         }
         try coordinator.updateRoutes()
@@ -789,7 +808,7 @@ final class Session {
     }
 
     private func configureSplitLayout(_ layout: [CGDirectDisplayID: CGRect]) async throws {
-        let modeProblem = "显示模式切换后，半屏位置不正确。"
+        let modeProblem = L("显示模式切换后，半屏位置不正确。")
         do {
             let modes = try Dictionary(uniqueKeysWithValues: halves.filter { !$0.hasExpectedMode }.map {
                 ($0.virtualID, try $0.preferredMode())
@@ -800,10 +819,10 @@ final class Session {
             }
         } catch {
             try Task.checkCancellation()
-            DemoLog.shared.line("系统未能同时设置显示模式和位置，正在分步设置。\(error.localizedDescription)")
+            DemoLog.shared.line(L("系统未能同时设置显示模式和位置，正在分步设置。%@", String(describing: error.localizedDescription)))
             for half in halves where half.virtualBounds.size != half.pointSize { try half.selectMode() }
             try await Self.setOrigins(layout)
-            try await Self.wait(steps: 30, error: "macOS 未能按原来的显示器位置排列两个半屏。") {
+            try await Self.wait(steps: 30, error: L("macOS 未能按原来的显示器位置排列两个半屏。")) {
                 Self.layoutMatches(layout, ignoringParked: coordinator.parkedIDs)
             }
             for half in halves { try half.selectMode() }
@@ -822,8 +841,8 @@ final class Session {
     fileprivate func fail(_ error: Error) {
         guard canJoin else { return }
         failed = true
-        DemoLog.shared.line("\(name) 分屏中止。\(error.localizedDescription)")
-        finish(status: "已恢复。\(error.localizedDescription)", joining: active)
+        DemoLog.shared.line(L("%@ 分屏中止。%@", String(describing: name), String(describing: error.localizedDescription)))
+        finish(status: L("已恢复。%@", String(describing: error.localizedDescription)), joining: active)
     }
 
     private func finish(status: String, joining: Bool = false, quickOnly: Bool = false) {
@@ -846,8 +865,8 @@ final class Session {
         setup = nil
         deadline = nil
         let recoveries = quickOnly ? [] : coordinator.stopRecovering(halves)
-        publish("正在恢复显示器和窗口…", phase: .joining)
-        DemoLog.shared.line(quickOnly ? "正在结束 \(name) 的快捷组合，保留桌面拆分。" : "正在合并 \(name)。")
+        publish(L("正在恢复显示器和窗口…"), phase: .joining)
+        DemoLog.shared.line(quickOnly ? L("正在结束 %@ 的快捷组合，保留桌面拆分。", String(describing: name)) : L("正在合并 %@。", String(describing: name)))
 
         Task {
             if let rescuing { await rescuing.value }
@@ -862,7 +881,7 @@ final class Session {
                 }
                 guard await quickPlacement.leaveFullScreen(on: [], includeSelected: true) else {
                     needsRecovery = true
-                    publish("窗口尚未退出全屏，已保留拆分。请重试恢复窗口。", phase: .split)
+                    publish(L("窗口尚未退出全屏，已保留拆分。请重试恢复窗口。"), phase: .split)
                     return
                 }
                 await quickPlacement.moveToDesktops(destination: destination, ordinary: nil,
@@ -871,7 +890,7 @@ final class Session {
                 let presentation = await quickPlacement.restorePresentation(destination: destination)
                 guard restored.failed == 0, presentation.failed == 0 else {
                     needsRecovery = true
-                    publish("有窗口未能还原，已保留桌面拆分。请重试恢复窗口。", phase: .split)
+                    publish(L("已保留桌面拆分，仍有 %@ 个窗口的位置或尺寸、%@ 项状态待恢复。", String(describing: restored.failed), String(describing: presentation.failed)), phase: .split)
                     return
                 }
                 self.quickPlacement = nil
@@ -889,7 +908,7 @@ final class Session {
                 }
                 guard await placement.leaveFullScreen(on: halves, includeSelected: transition != nil || !halves.isEmpty) else {
                     needsRecovery = true
-                    publish("窗口尚未退出全屏，已保留桌面。请从菜单选择“重试恢复窗口…”。", phase: .idle)
+                    publish(L("窗口尚未退出全屏，已保留桌面。请从菜单选择“重试恢复窗口…”。"), phase: .idle)
                     return
                 }
                 if joining {
@@ -917,13 +936,13 @@ final class Session {
                     let parkedLayout = coordinator.layout()
                     do {
                         try await Self.setOrigins(parkedLayout)
-                        try await Self.wait(steps: 12, error: "系统没有移开闲置的半屏。") {
+                        try await Self.wait(steps: 12, error: L("系统没有移开闲置的半屏。")) {
                             Self.layoutMatches(parkedLayout, ignoringParked: parked)
                         }
                         retiring.removeAll()
                     } catch {
                         retiring = coordinator.takeStandby(for: targetID)
-                        DemoLog.shared.line("将直接移除闲置半屏。\(error.localizedDescription)")
+                        DemoLog.shared.line(L("将直接移除闲置半屏。%@", String(describing: error.localizedDescription)))
                     }
                 }
                 halves.removeAll()
@@ -932,12 +951,12 @@ final class Session {
                 for half in retiring.reversed() { half.teardown() }
                 DemoDisplay.createdIDs.subtract(virtualIDs)
                 do {
-                    try await Self.wait(steps: 20, error: "系统还没有移除虚拟显示器。") {
+                    try await Self.wait(steps: 20, error: L("系统还没有移除虚拟显示器。")) {
                         DisplayScanner.activeDisplayIDs().allSatisfy { !virtualIDs.contains($0) }
                     }
                     let layout = coordinator.layout()
                     if !Self.layoutMatches(layout, ignoringParked: parked) { try await Self.setOrigins(layout) }
-                    try await Self.wait(steps: 15, error: "macOS 调整了部分显示器的位置。") {
+                    try await Self.wait(steps: 15, error: L("macOS 调整了部分显示器的位置。")) {
                         Self.layoutMatches(layout, ignoringParked: parked)
                     }
                     coordinator.endDisplayChange()
@@ -952,7 +971,7 @@ final class Session {
                     }
                 } catch {
                     needsRecovery = true
-                    finalStatus = "恢复显示器排列时遇到问题。\(error.localizedDescription)"
+                    finalStatus = L("恢复显示器排列时遇到问题。%@", String(describing: error.localizedDescription))
                     DemoLog.shared.line(finalStatus)
                 }
             }
@@ -970,16 +989,16 @@ final class Session {
                     failed = failed - result.retry.count + retried.failed
                 }
                 let presentation = await placement.restorePresentation(destination: destination)
-                DemoLog.shared.line("已还原 \(restored) 个窗口的位置和尺寸。")
+                DemoLog.shared.line(L("已还原 %@ 个窗口的位置和尺寸。", String(describing: restored)))
                 if presentation.minimizedToStage > 0 {
-                    let detail = "台前调度将 \(presentation.minimizedToStage) 个原先在程序坞的窗口收进了侧栏。"
+                    let detail = L("台前调度将 %@ 个原先在程序坞的窗口收进了侧栏。", String(describing: presentation.minimizedToStage))
                     DemoLog.shared.line(detail)
                     finalStatus += " \(detail)"
                 }
                 if failed > 0 || presentation.failed > 0 {
                     needsRecovery = true
-                    DemoLog.shared.line("有 \(failed) 个窗口的位置或尺寸、\(presentation.failed) 项窗口状态未能完全还原。")
-                    finalStatus += " 有窗口未能完全还原。"
+                    DemoLog.shared.line(L("有 %@ 个窗口的位置或尺寸、%@ 项窗口状态未能完全还原。", String(describing: failed), String(describing: presentation.failed)))
+                    finalStatus += L(" 已恢复显示器，仍有 %@ 个窗口的位置或尺寸、%@ 项状态待恢复。", String(describing: failed), String(describing: presentation.failed))
                 }
             }
             if !needsRecovery { placement = nil }
@@ -1006,25 +1025,25 @@ final class Session {
         var configuration: CGDisplayConfigRef?
         let began = CGBeginDisplayConfiguration(&configuration)
         guard began == .success else {
-            throw DemoError("无法开始排列显示器（CGError \(began.rawValue)）。")
+            throw DemoError(L("无法开始排列显示器（CGError %@）。", String(describing: began.rawValue)))
         }
         for (id, mode) in modes {
             let result = CGConfigureDisplayWithDisplayMode(configuration, id, mode, nil)
             if result != .success {
                 CGCancelDisplayConfiguration(configuration)
-                throw DemoError("无法设置显示器 \(id) 的分辨率（CGError \(result.rawValue)）。")
+                throw DemoError(L("无法设置显示器 %@ 的分辨率（CGError %@）。", String(describing: id), String(describing: result.rawValue)))
             }
         }
         for (id, bounds) in origins {
             let result = CGConfigureDisplayOrigin(configuration, id, Int32(bounds.minX), Int32(bounds.minY))
             if result != .success {
                 CGCancelDisplayConfiguration(configuration)
-                throw DemoError("无法设置显示器 \(id) 的位置（CGError \(result.rawValue)）。")
+                throw DemoError(L("无法设置显示器 %@ 的位置（CGError %@）。", String(describing: id), String(describing: result.rawValue)))
             }
         }
         let result = CGCompleteDisplayConfiguration(configuration, .forSession)
         guard result == .success else {
-            throw DemoError("无法完成显示器排列（CGError \(result.rawValue)）。")
+            throw DemoError(L("无法完成显示器排列（CGError %@）。", String(describing: result.rawValue)))
         }
     }
 
@@ -1038,6 +1057,17 @@ final class Session {
     }
 
     private func publish(_ status: String, phase: Phase) {
+        if (phase == .preparing || phase == .joining), phase != self.phase {
+            if let started = operationStarted {
+                PerformanceLedger.shared.record(operationName, started: started, succeeded: false, cancelled: cancelledByUser && !operationIsRecovery)
+            }
+            operationStarted = ProcessInfo.processInfo.systemUptime
+            operationIsRecovery = phase == .joining
+            operationName = phase == .preparing ? L("开始分屏") : L("恢复桌面")
+        } else if phase == .split || phase == .idle, let started = operationStarted {
+            PerformanceLedger.shared.record(operationName, started: started, succeeded: !needsRecovery && (operationIsRecovery || !failed))
+            operationStarted = nil
+        }
         self.status = status
         self.phase = phase
         coordinator.changed(self)

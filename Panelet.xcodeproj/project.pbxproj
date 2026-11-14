@@ -19,9 +19,16 @@
 		A3000000000000000000000D /* QuickExitPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000D /* QuickExitPolicy.swift */; };
 		A3000000000000000000000F /* QuitPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000F /* QuitPolicy.swift */; };
 		A3000000000000000000000E /* RecoveryJournal.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2000000000000000000000E /* RecoveryJournal.swift */; };
+		A30000000000000000000010 /* EnvironmentCheck.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000010 /* EnvironmentCheck.swift */; };
+		A30000000000000000000011 /* ProductPreferences.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000011 /* ProductPreferences.swift */; };
+		A30000000000000000000014 /* PlacementGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000014 /* PlacementGeometry.swift */; };
+		A30000000000000000000012 /* Diagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000012 /* Diagnostics.swift */; };
+		A30000000000000000000013 /* Localization.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000013 /* Localization.swift */; };
 		A300000000000000000000F1 /* AppIcon.icns in Resources */ = {isa = PBXBuildFile; fileRef = A200000000000000000000F1; };
 		A300000000000000000000F2 /* MenuBarTemplate.png in Resources */ = {isa = PBXBuildFile; fileRef = A200000000000000000000F2; };
 		A300000000000000000000F3 /* MenuBarTemplate@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = A200000000000000000000F3; };
+        A300000000000000000000F4 = {isa = PBXBuildFile; fileRef = A200000000000000000000F4; };
+        A300000000000000000000F5 = {isa = PBXBuildFile; fileRef = A200000000000000000000F5; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -41,9 +48,16 @@
 		A2000000000000000000000D /* QuickExitPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickExitPolicy.swift; sourceTree = "<group>"; };
 		A2000000000000000000000F /* QuitPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuitPolicy.swift; sourceTree = "<group>"; };
 		A2000000000000000000000E /* RecoveryJournal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RecoveryJournal.swift; sourceTree = "<group>"; };
+		A20000000000000000000010 /* EnvironmentCheck.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EnvironmentCheck.swift; sourceTree = "<group>"; };
+		A20000000000000000000011 /* ProductPreferences.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProductPreferences.swift; sourceTree = "<group>"; };
+		A20000000000000000000014 /* PlacementGeometry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlacementGeometry.swift; sourceTree = "<group>"; };
+		A20000000000000000000012 /* Diagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Diagnostics.swift; sourceTree = "<group>"; };
+		A20000000000000000000013 /* Localization.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Localization.swift; sourceTree = "<group>"; };
 		A200000000000000000000F1 /* AppIcon.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = AppIcon.icns; sourceTree = "<group>"; };
 		A200000000000000000000F2 /* MenuBarTemplate.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = MenuBarTemplate.png; sourceTree = "<group>"; };
 		A200000000000000000000F3 /* MenuBarTemplate@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "MenuBarTemplate@2x.png"; sourceTree = "<group>"; };
+        A200000000000000000000F4 = {isa = PBXFileReference; lastKnownFileType = folder; path = en.lproj; sourceTree = "<group>"; };
+        A200000000000000000000F5 = {isa = PBXFileReference; lastKnownFileType = folder; path = "zh-Hans.lproj"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -88,6 +102,11 @@
 				A2000000000000000000000D /* QuickExitPolicy.swift */,
 				A2000000000000000000000F /* QuitPolicy.swift */,
 				A2000000000000000000000E /* RecoveryJournal.swift */,
+				A20000000000000000000010 /* EnvironmentCheck.swift */,
+				A20000000000000000000011 /* ProductPreferences.swift */,
+				A20000000000000000000014 /* PlacementGeometry.swift */,
+				A20000000000000000000012 /* Diagnostics.swift */,
+				A20000000000000000000013 /* Localization.swift */,
 				A20000000000000000000006 /* VirtualDisplay.h */,
 				A20000000000000000000007 /* Info.plist */,
 				A20000000000000000000008 /* Panelet.entitlements */,
@@ -98,7 +117,7 @@
 		};
         A100000000000000000000F0 /* Resources */ = {
             isa = PBXGroup;
-            children = (A200000000000000000000F1, A200000000000000000000F2, A200000000000000000000F3);
+            children = (A200000000000000000000F1, A200000000000000000000F2, A200000000000000000000F3, A200000000000000000000F4, A200000000000000000000F5);
             path = Resources;
             sourceTree = "<group>";
         };
@@ -155,7 +174,7 @@
         A100000000000000000000F1 /* Resources */ = {
             isa = PBXResourcesBuildPhase;
             buildActionMask = 2147483647;
-            files = (A300000000000000000000F1, A300000000000000000000F2, A300000000000000000000F3);
+            files = (A300000000000000000000F1, A300000000000000000000F2, A300000000000000000000F3, A300000000000000000000F4, A300000000000000000000F5);
             runOnlyForDeploymentPostprocessing = 0;
         };
 /* End PBXResourcesBuildPhase section */
@@ -177,6 +196,11 @@
 				A3000000000000000000000D /* QuickExitPolicy.swift in Sources */,
 				A3000000000000000000000F /* QuitPolicy.swift in Sources */,
 				A3000000000000000000000E /* RecoveryJournal.swift in Sources */,
+				A30000000000000000000010 /* EnvironmentCheck.swift in Sources */,
+				A30000000000000000000011 /* ProductPreferences.swift in Sources */,
+				A30000000000000000000014 /* PlacementGeometry.swift in Sources */,
+				A30000000000000000000012 /* Diagnostics.swift in Sources */,
+				A30000000000000000000013 /* Localization.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

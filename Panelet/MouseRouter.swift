@@ -75,7 +75,7 @@ final class MouseRouter {
             ready.signal()
             withExtendedLifetime(self) { CFRunLoopRun() }
         }
-        thread.name = "竖屏分屏鼠标监听"
+        thread.name = L("竖屏分屏鼠标监听")
         thread.qualityOfService = .userInteractive
         thread.start()
         ready.wait()

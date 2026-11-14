@@ -13,6 +13,7 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
     private struct Frame {
         let pixels: CVPixelBuffer
         let streamID: ObjectIdentifier
+        let receivedAt: TimeInterval
     }
 
     let name: String
@@ -25,6 +26,16 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
     private let scale: Int
 
     private let mirrorLayer = CALayer()
+    private struct Measurements { var received = 0; var replaced = 0; var presented = 0; var maxQueueDelay = 0.0 }
+    private nonisolated let measurements = OSAllocatedUnfairLock(initialState: Measurements())
+    var statistics: String {
+        let value = measurements.withLock { $0 }
+        return L("采集 %@ 帧，呈现 %@ 帧，合并待显示帧 %@；最长提交排队 %@ ms。此值不是端到端延迟或显示器实测帧率。", String(describing: value.received), String(describing: value.presented), String(describing: value.replaced), String(describing: String(format: "%.1f", value.maxQueueDelay * 1000)))
+    }
+    func matchesConfiguration(_ screen: PhysicalScreen) -> Bool {
+        scale == screen.configuration.rendering.scale(native: screen.scale)
+            && refreshRate == screen.configuration.rendering.frameRate(native: screen.refreshRate)
+    }
     private let captureQueue: DispatchQueue
     private nonisolated let pendingFrame = OSAllocatedUnfairLock<Frame?>(uncheckedState: nil)
     private var display: CGVirtualDisplay?
@@ -77,8 +88,9 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         localRect: CGRect,
         role: String
     ) throws -> HalfScreen {
+        if let problem = EnvironmentCheck.inspect().problem { throw DemoError(problem) }
         let pointSize = localRect.size
-        let refresh = screen.refreshRate > 1 ? screen.refreshRate : 60
+        let refresh = screen.configuration.rendering.frameRate(native: screen.refreshRate)
         let descriptor = CGVirtualDisplayDescriptor()
         descriptor.queue = DispatchQueue.main
         descriptor.name = name
@@ -95,10 +107,10 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         CGVirtualDisplayDescriptorApplyStandardPrimaries(descriptor)
 
         guard let display = CGVirtualDisplay(descriptor: descriptor) else {
-            throw DemoError("创建“\(name)”失败。CGVirtualDisplay 返回了空对象。确认这个程序是 .app、没有打开 App Sandbox，并且不是从裸二进制直接跑的。")
+            throw DemoError(L("系统未能创建“%@”。请在设置的“诊断”页检查环境并复制日志。", String(describing: name)))
         }
         guard display.displayID != 0 else {
-            throw DemoError("创建“\(name)”失败。虚拟显示器没有拿到 displayID。")
+            throw DemoError(L("系统未能启用“%@”。请重试；若仍失败，请复制诊断日志。", String(describing: name)))
         }
 
         let half = HalfScreen(
@@ -106,12 +118,12 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
             physicalID: screen.id,
             localRect: localRect,
             refreshRate: refresh,
-            scale: screen.scale >= 1.5 ? 2 : 1,
+            scale: screen.configuration.rendering.scale(native: screen.scale),
             display: display
         )
         try half.applyInitialMode(to: display)
         DemoDisplay.createdIDs.insert(display.displayID)
-        DemoLog.shared.line("\(name) 已创建，displayID=\(display.displayID)，点尺寸 \(Int(pointSize.width.rounded()))×\(Int(pointSize.height.rounded()))")
+        DemoLog.shared.line(L("%@ 已创建，displayID=%@，点尺寸 %@×%@", String(describing: name), String(describing: display.displayID), String(describing: Int(pointSize.width.rounded())), String(describing: Int(pointSize.height.rounded()))))
         return half
     }
 
@@ -119,7 +131,7 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         guard !hasExpectedMode else { return }
         let result = CGDisplaySetDisplayMode(virtualID, try preferredMode(), nil)
         guard result == .success, hasExpectedMode else {
-            throw DemoError("\(name) 未能切换到 \(scale)× 模式（CGError \(result.rawValue)）。")
+            throw DemoError(L("%@ 未能切换到 %@× 模式（CGError %@）。", String(describing: name), String(describing: scale), String(describing: result.rawValue)))
         }
     }
 
@@ -127,7 +139,7 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         let options = [kCGDisplayShowDuplicateLowResolutionModes as String: true] as CFDictionary
         let modes = CGDisplayCopyAllDisplayModes(virtualID, options) as? [CGDisplayMode] ?? []
         guard let match = modes.first(where: matches) else {
-            throw DemoError("\(name) 没有可用的 \(Int(pointSize.width))×\(Int(pointSize.height)) @\(scale)× 模式。")
+            throw DemoError(L("%@ 没有可用的 %@×%@ @%@× 模式。", String(describing: name), String(describing: Int(pointSize.width)), String(describing: Int(pointSize.height)), String(describing: scale)))
         }
         return match
     }
@@ -141,7 +153,7 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     func placeWindow() throws {
-        guard hasFrame else { throw DemoError("\(name) 还没有画面。") }
+        guard hasFrame else { throw DemoError(L("%@ 还没有画面。", String(describing: name))) }
         let frame = cocoaRect(physicalRect)
         let mirror = MirrorWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
         mirror.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.mainMenuWindow)) + 1)
@@ -155,7 +167,7 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         let content = NSView(frame: NSRect(origin: .zero, size: frame.size))
         content.wantsLayer = true
         mirror.contentView = content
-        guard let host = content.layer else { throw DemoError("\(name) 无法建立画面窗口。") }
+        guard let host = content.layer else { throw DemoError(L("%@ 无法建立画面窗口。", String(describing: name))) }
         mirrorLayer.frame = content.bounds
         mirrorLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
         mirrorLayer.contentsGravity = .resize
@@ -171,14 +183,14 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         let frame = cocoaRect(physicalRect)
         if mirror.frame != frame { mirror.setFrame(frame, display: true) }
         guard mirror.screen?.displayID == physicalID, mirror.frame == frame else {
-            throw DemoError("\(name) 的画面窗口无法定位到显示器。")
+            throw DemoError(L("%@ 的画面窗口无法定位到显示器。", String(describing: name)))
         }
     }
 
     func startCapture(on scDisplay: SCDisplay) async throws {
         try Task.checkCancellation()
         guard !hasUnexpectedMode, virtualBounds.size == pointSize else {
-            throw DemoError("\(name) 的显示模式在采集前发生变化。")
+            throw DemoError(L("%@ 的显示模式在采集前发生变化。", String(describing: name)))
         }
         let configuration = SCStreamConfiguration()
         configuration.width = Int(pointSize.width) * scale
@@ -186,6 +198,7 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         let modeRate = CGDisplayCopyDisplayMode(virtualID)?.refreshRate ?? 0
         let rate = modeRate > 1 ? modeRate : refreshRate
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(rate.rounded()))
+        configuration.capturesAudio = false
         configuration.showsCursor = true
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
 
@@ -202,7 +215,7 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
             try? await stream.stopCapture()
             throw CancellationError()
         }
-        guard self.stream === stream else { throw DemoError("\(name) 的采集流在启动时中断。") }
+        guard self.stream === stream else { throw DemoError(L("%@ 的采集流在启动时中断。", String(describing: name))) }
     }
 
     func recoverCapture() async throws {
@@ -217,7 +230,7 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
             if hasFrame { return }
             try await Task.sleep(for: .milliseconds(100))
         }
-        throw DemoError("重新连接后没有收到画面。")
+        throw DemoError(L("重新连接后没有收到画面。"))
     }
 
     func showNumber(_ number: String) {
@@ -283,13 +296,14 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
 
     nonisolated func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .screen, Self.isUsefulFrame(sampleBuffer), let pixels = sampleBuffer.imageBuffer else { return }
-        let frame = Frame(pixels: pixels, streamID: ObjectIdentifier(stream))
+        let frame = Frame(pixels: pixels, streamID: ObjectIdentifier(stream), receivedAt: ProcessInfo.processInfo.systemUptime)
         // Keep one pending frame, replacing it when the main thread has not displayed it yet.
         let previous = pendingFrame.withLockUnchecked { pending in
             let previous = pending
             pending = frame
             return previous
         }
+        measurements.withLock { $0.received += 1; if previous != nil { $0.replaced += 1 } }
         guard previous == nil else { return }
         DispatchQueue.main.async { [weak self] in
             self?.displayPendingFrame()
@@ -308,7 +322,11 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         let height = IOSurfaceGetHeight(surface)
         guard width == Int(pointSize.width) * scale, height == Int(pointSize.height) * scale else { return }
         if !hasFrame {
-            DemoLog.shared.line("\(name) 已收到 \(width)×\(height) 像素首帧（\(scale)×）。")
+            DemoLog.shared.line(L("%@ 已收到 %@×%@ 像素首帧（%@×）。", String(describing: name), String(describing: width), String(describing: height), String(describing: scale)))
+        }
+        measurements.withLock {
+            $0.presented += 1
+            $0.maxQueueDelay = max($0.maxQueueDelay, ProcessInfo.processInfo.systemUptime - frame.receivedAt)
         }
         withExtendedLifetime(frame.pixels) { mirrorLayer.contents = surface }
         displayedStream = frame.streamID
@@ -327,7 +345,7 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
             ]
             if display.applySettings(settings) { return }
         }
-        throw DemoError("\(name) 的分辨率被系统拒绝（\(Int(pointSize.width.rounded()))×\(Int(pointSize.height.rounded()))）。")
+        throw DemoError(L("%@ 的分辨率被系统拒绝（%@×%@）。", String(describing: name), String(describing: Int(pointSize.width.rounded())), String(describing: Int(pointSize.height.rounded()))))
     }
 
     private func matches(_ mode: CGDisplayMode) -> Bool {
@@ -350,15 +368,15 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
             } catch {
                 lastError = error
                 if (error as NSError).code == SCStreamError.userDeclined.rawValue {
-                    throw DemoError("屏幕录制权限被拒绝。到系统设置里打开本 App 后，点“重新启动”。")
+                    throw DemoError(L("屏幕录制权限被拒绝。到系统设置里打开本 App 后，点“重新启动”。"))
                 }
             }
             try await Task.sleep(nanoseconds: 200_000_000)
         }
         if let lastError {
-            throw DemoError("无法读取两个半屏的画面：\(lastError.localizedDescription)")
+            throw DemoError(L("无法读取两个半屏的画面：%@", String(describing: lastError.localizedDescription)))
         }
-        throw DemoError("系统超过 8 秒还没有提供两个半屏的画面。")
+        throw DemoError(L("系统超过 8 秒还没有提供两个半屏的画面。"))
     }
 
     nonisolated private static func isUsefulFrame(_ sampleBuffer: CMSampleBuffer) -> Bool {

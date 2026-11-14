@@ -47,7 +47,7 @@ final class WindowPreviewGrid: NSScrollView, NSCollectionViewDataSource {
         collection.dataSource = self
         collection.backgroundColors = [.clear]
         collection.register(WindowPreviewCard.self, forItemWithIdentifier: WindowPreviewCard.reuseID)
-        collection.setAccessibilityLabel("可分屏的窗口")
+        collection.setAccessibilityLabel(L("可分屏的窗口"))
         collection.setAccessibilityEnabled(true)
         documentView = collection
         drawsBackground = false

@@ -53,7 +53,7 @@ STAGING="$(mktemp -d build/.vertical-split-build.XXXXXXXX)"
 trap 'rm -rf "$STAGING"' EXIT
 STAGED_APP="$STAGING/Panelet.app"
 mkdir -p "$STAGED_APP/Contents/MacOS" "$STAGED_APP/Contents/Resources"
-cp Panelet/Resources/* "$STAGED_APP/Contents/Resources/"
+cp -R Panelet/Resources/* "$STAGED_APP/Contents/Resources/"
 python3 - "$STAGED_APP/Contents/Info.plist" <<'PY'
 import pathlib, sys
 text = pathlib.Path("Panelet/Info.plist").read_text()
@@ -78,6 +78,11 @@ swiftc -O -g \
   -framework Carbon \
   -framework QuartzCore \
   Panelet/DisplayScanner.swift \
+  Panelet/EnvironmentCheck.swift \
+  Panelet/ProductPreferences.swift \
+  Panelet/PlacementGeometry.swift \
+  Panelet/Diagnostics.swift \
+  Panelet/Localization.swift \
   Panelet/HalfScreen.swift \
   Panelet/MouseRouter.swift \
   Panelet/WindowPlacement.swift \

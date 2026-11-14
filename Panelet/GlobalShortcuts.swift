@@ -6,7 +6,7 @@ final class GlobalShortcuts {
     enum Command: Int, CaseIterable {
         case toggle, join
 
-        var title: String { self == .toggle ? "快捷窗口分屏" : "还原分屏" }
+        var title: String { self == .toggle ? L("快捷窗口分屏") : L("还原分屏") }
         var defaultKey: Key {
             Key(code: UInt32(self == .toggle ? kVK_ANSI_S : kVK_ANSI_J),
                 modifiers: UInt32(controlKey | shiftKey), equivalent: self == .toggle ? "s" : "j")
@@ -53,7 +53,7 @@ final class GlobalShortcuts {
 
         private var keyName: String {
             switch Int(code) {
-            case kVK_Space: return "空格"
+            case kVK_Space: return L("空格")
             case kVK_Return, kVK_ANSI_KeypadEnter: return "↩"
             case kVK_Tab: return "⇥"
             case kVK_Delete: return "⌫"
@@ -135,11 +135,11 @@ final class GlobalShortcuts {
 
     func set(_ key: Key, for command: Command) -> String? {
         if let other = Command.allCases.first(where: { $0 != command && key.hasSameKeys(as: self.key(for: $0)) }) {
-            return "这个组合键已用于「\(other.title)」，请按其他组合键。"
+            return L("这个组合键已用于「%@」，请按其他组合键。", String(describing: other.title))
         }
         let status = register(key, for: command)
-        if status == eventHotKeyExistsErr { return "这个组合键已被占用，请按其他组合键。" }
-        guard status == noErr else { return "无法注册 \(key.label)（\(status)），请按其他组合键。" }
+        if status == eventHotKeyExistsErr { return L("这个组合键已被占用，请按其他组合键。") }
+        guard status == noErr else { return L("无法注册 %@（%@），请按其他组合键。", String(describing: key.label), String(describing: status)) }
         if let data = try? PropertyListEncoder().encode(key) {
             UserDefaults.standard.set(data, forKey: command.defaultsKey)
         }

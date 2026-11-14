@@ -74,7 +74,7 @@ final class WindowPlacement {
         return apps.flatMap { app in
             if Task.isCancelled { return [] as [Choice] }
             let pid = app.processIdentifier
-            let name = app.localizedName ?? "窗口"
+            let name = app.localizedName ?? L("窗口")
             let hidden = app.isHidden
             let records = all[pid] ?? []
             var seen = Set<Choice.ID>()
@@ -89,7 +89,7 @@ final class WindowPlacement {
                 let record = records.first { $0.id == number }
                 let id = number.map(Choice.ID.window) ?? .accessibility(window.element)
                 guard seen.insert(id).inserted else { return nil }
-                let status = details.minimized ? "已最小化" : (details.fullScreen ? "全屏中" : (hidden ? "已隐藏" : nil))
+                let status = details.minimized ? L("已最小化") : (details.fullScreen ? L("全屏中") : (hidden ? L("已隐藏") : nil))
                 return Choice(id: id, element: window.element, pid: pid, appName: name,
                               title: details.title.isEmpty ? record?.title ?? "" : details.title,
                               frame: details.frame ?? record?.frame, status: status)
@@ -101,7 +101,7 @@ final class WindowPlacement {
                       DesktopSpaces.spaces(for: record.id)?.isEmpty != true,
                       seen.insert(id).inserted else { return nil }
                 return Choice(id: id, element: nil, pid: pid, appName: name, title: record.title,
-                              frame: record.frame, status: hidden ? "已隐藏" : nil)
+                              frame: record.frame, status: hidden ? L("已隐藏") : nil)
             }
         }
     }
@@ -123,10 +123,10 @@ final class WindowPlacement {
         self.selectedOnly = selectedOnly
         let selected = pair.map { [$0.upper, $0.lower] } ?? []
         if let pair, pair.upper.id == pair.lower.id {
-            throw DemoError("请选择两个不同的窗口。")
+            throw DemoError(L("请选择两个不同的窗口。"))
         }
         if selected.contains(where: { choice in reserved.contains { $0.matches(number: choice.windowID, element: choice.element) } }) {
-            throw DemoError("有窗口正在另一块屏幕分屏，请换一个窗口。")
+            throw DemoError(L("有窗口正在另一块屏幕分屏，请换一个窗口。"))
         }
         let visible = (selectedOnly ? [] : Self.windowList([.optionOnScreenOnly, .excludeDesktopElements])).filter { entry in
             let overlap = Self.overlap(of: entry.frame, with: source.bounds)
@@ -159,7 +159,7 @@ final class WindowPlacement {
             try Task.checkCancellation()
             let stageFrame = choice.windowID.flatMap { originalWindows[$0]?.frame }
             guard let app = NSRunningApplication(processIdentifier: choice.pid), !app.isTerminated else {
-                throw DemoError("「\(choice.appName)」已经退出，请重新选择窗口。")
+                throw DemoError(L("「%@」已经退出，请重新选择窗口。", String(describing: choice.appName)))
             }
             if app.isHidden {
                 unhiddenApps[choice.pid] = app
@@ -168,16 +168,16 @@ final class WindowPlacement {
             let window = try await Self.openWindow(choice, in: app)
             let number = choice.windowID ?? window.number
             if reserved.contains(where: { $0.matches(number: number, element: window.element) }) {
-                throw DemoError("「\(choice.name)」正在另一块屏幕分屏，请换一个窗口。")
+                throw DemoError(L("「%@」正在另一块屏幕分屏，请换一个窗口。", String(describing: choice.name)))
             }
             if windows.contains(where: { $0.slot != nil && ($0.window.element == window.element || (number != nil && $0.id == number)) }) {
-                throw DemoError("请选择两个不同的窗口。")
+                throw DemoError(L("请选择两个不同的窗口。"))
             }
             let state = window.pickerDetails
             let fullScreen = state?.fullScreen == true
             let minimized = state?.minimized == true
             guard fullScreen || minimized || window.supportsFullScreen else {
-                throw DemoError("「\(choice.name)」无法进入原生全屏，请换一个窗口。")
+                throw DemoError(L("「%@」无法进入原生全屏，请换一个窗口。", String(describing: choice.name)))
             }
             let display = originalDisplay(for: state?.frame ?? choice.frame)
             let staged = !minimized && !fullScreen && unhiddenApps[choice.pid] == nil
@@ -202,12 +202,12 @@ final class WindowPlacement {
                     return await Self.exitFullScreen(window)
                 }.value
                 guard ready else {
-                    let action = minimized ? "从程序坞恢复" : "退出原来的全屏"
-                    throw DemoError("「\(choice.name)」暂时无法\(action)。")
+                    let action = minimized ? L("从程序坞恢复") : L("退出原来的全屏")
+                    throw DemoError(L("「%@」暂时无法%@。", String(describing: choice.name), String(describing: action)))
                 }
             }
             guard !window.isMinimized, let frame = window.frame, window.positionIsSettable else {
-                throw DemoError("「\(choice.name)」暂时无法移动。请先打开该窗口再试。")
+                throw DemoError(L("「%@」暂时无法移动。请先打开该窗口再试。", String(describing: choice.name)))
             }
             if windows[index].original == nil {
                 windows[index].original = frame
@@ -242,7 +242,7 @@ final class WindowPlacement {
             }.value
             if window == nil, !record.title.isEmpty,
                !fullSpaces.isDisjoint(with: DesktopSpaces.spaces(for: record.id) ?? []) {
-                throw DemoError("无法控制原屏上的全屏窗口「\(record.title)」，已停止拆分。请先打开该窗口后重试。")
+                throw DemoError(L("无法控制原屏上的全屏窗口「%@」，已停止拆分。请先打开该窗口后重试。", String(describing: record.title)))
             }
             guard let window, window.isFullScreen,
                   !selected.contains(where: { $0.element == window.element }),
@@ -251,7 +251,7 @@ final class WindowPlacement {
                                        original: nil, display: source, slot: nil, fullScreenDisplay: source))
             let index = windows.count - 1
             guard await Self.exitFullScreen(window), let frame = window.frame else {
-                throw DemoError("原显示器上的「\(record.title)」暂时无法退出全屏，已取消拆分以保留原桌面。")
+                throw DemoError(L("原显示器上的「%@」暂时无法退出全屏，已取消拆分以保留原桌面。", String(describing: record.title)))
             }
             windows[index].original = frame
             try Task.checkCancellation()
@@ -269,7 +269,7 @@ final class WindowPlacement {
             if window.pickerDetails != nil { return window }
         }
         if let id = choice.windowID {
-            guard let record = liveWindows()[id], record.pid == choice.pid else { throw DemoError("选中的窗口已关闭，请重新选择。") }
+            guard let record = liveWindows()[id], record.pid == choice.pid else { throw DemoError(L("选中的窗口已关闭，请重新选择。")) }
             if let window = Window.find(record) { return window }
             let lookup = Task.detached(priority: .userInitiated) { Window.findUnlistedWindow(record) }
             let unlisted = await withTaskCancellationHandler {
@@ -296,7 +296,7 @@ final class WindowPlacement {
                 try await Task.sleep(for: .milliseconds(100))
             }
         }
-        throw DemoError("macOS 暂时无法控制「\(choice.name)」。请先切到这个窗口再试。")
+        throw DemoError(L("macOS 暂时无法控制「%@」。请先切到这个窗口再试。", String(describing: choice.name)))
     }
 
     func migrate(to halves: [HalfScreen]) async throws -> Int {
@@ -306,28 +306,61 @@ final class WindowPlacement {
             try Task.checkCancellation()
             guard let window = Self.resolve(saved, in: Self.liveWindows()),
                   await Self.restoreFullScreen(window, on: halves[0].virtualID) else {
-                DemoLog.shared.line("迁移全屏失败 pid=\(saved.pid) title=\(saved.id.flatMap { Self.liveWindows()[$0]?.title } ?? "未知") id=\(saved.id ?? 0) frame=\(String(describing: saved.window.frame)) target=\(halves[0].virtualBounds) full=\(String(describing: saved.window.fullScreen))")
-                throw DemoError("原来的全屏窗口未能在第一个分区恢复全屏，已取消本次拆分。")
+                DemoLog.shared.line(L("迁移全屏失败 pid=%@ title=%@ id=%@ frame=%@ target=%@ full=%@", String(describing: saved.pid), String(describing: saved.id.flatMap { Self.liveWindows()[$0]?.title } ?? L("未知")), String(describing: saved.id ?? 0), String(describing: String(describing: saved.window.frame)), String(describing: halves[0].virtualBounds), String(describing: String(describing: saved.window.fullScreen))))
+                throw DemoError(L("原来的全屏窗口未能在第一个分区恢复全屏，已取消本次拆分。"))
             }
             try Task.checkCancellation()
         }
-        for saved in windows {
+        for savedIndex in windows.indices {
+            let saved = windows[savedIndex]
             guard let index = saved.slot, let original = saved.original else { continue }
             let half = halves[index]
             guard let screen = NSScreen.screens.first(where: { $0.displayID == half.virtualID }) else {
-                throw DemoError("\(half.name) 的显示器不可用。")
+                throw DemoError(L("%@ 的显示器不可用。", String(describing: half.name)))
             }
             let usable = cocoaRect(screen.visibleFrame)
-            let window = saved.window
+            var window = saved.window
+            if let id = saved.id, let app = NSRunningApplication(processIdentifier: saved.pid) {
+                guard let info = Self.liveWindows()[id], info.pid == saved.pid else {
+                    throw DemoError(L("选中的窗口已关闭，请重新选择。"))
+                }
+                // Reconfiguration can invalidate Chromium's AX handles without closing the window.
+                // Activate the exact selected window and refresh its handle before changing geometry.
+                NSApp.yieldActivation(to: app)
+                app.activate(options: [.activateAllWindows])
+                Window.reveal(id, in: app)
+                let choice = Choice(id: .window(id), element: nil, pid: saved.pid,
+                                    appName: app.localizedName ?? L("窗口"), title: info.title, frame: info.frame, status: nil)
+                window = try await Self.openWindow(choice, in: app)
+                AXUIElementPerformAction(window.element, kAXRaiseAction as CFString)
+                windows[savedIndex].window = window
+                try await Task.sleep(for: .milliseconds(150))
+            }
             let desired = window.canResize ? usable : Self.fit(original, inside: usable)
+            if let frame = window.frame, frame.width > usable.width || frame.height > usable.height {
+                window.setSize(desired.size)
+            }
             for _ in 0..<6 {
                 try Task.checkCancellation()
                 window.place(desired)
                 if let actual = window.frame, Self.near(actual, desired) { break }
                 try await Task.sleep(for: .milliseconds(200))
             }
-            guard let actual = window.frame, usable.insetBy(dx: -2, dy: -2).contains(actual) else {
-                throw DemoError("\(half.name) 的窗口无法放入，请换一个窗口。")
+            if let actual = window.frame, !usable.insetBy(dx: -2, dy: -2).contains(actual) {
+                // Some apps reject AXSize while still supporting native full screen. Position
+                // their center on the target instead of rejecting them before the OS can size them.
+                let otherDisplays = NSScreen.screens.filter { $0.displayID != half.virtualID }.map { cocoaRect($0.frame) }
+                for _ in 0..<4 {
+                    try Task.checkCancellation()
+                    if let frame = window.frame, PlacementGeometry.belongs(frame, to: usable, otherDisplays: otherDisplays) { break }
+                    if let frame = window.frame { window.setPosition(PlacementGeometry.centeredOrigin(for: frame, in: usable)) }
+                    try await Task.sleep(for: .milliseconds(150))
+                }
+                guard let frame = window.frame, PlacementGeometry.belongs(frame, to: usable, otherDisplays: otherDisplays) else {
+                    throw DemoError(L("%@ 的窗口无法放入，请换一个窗口。", String(describing: half.name)))
+                }
+            } else if window.frame == nil {
+                throw DemoError(L("%@ 的窗口无法放入，请换一个窗口。", String(describing: half.name)))
             }
             moved += 1
         }
@@ -362,7 +395,7 @@ final class WindowPlacement {
             guard let slot = saved.slot else { return nil }
             return (saved, halves[slot])
         }
-        guard targets.count == 2 else { throw DemoError("请选择两个可全屏的窗口。") }
+        guard targets.count == 2 else { throw DemoError(L("请选择两个可全屏的窗口。")) }
         let clock = ContinuousClock()
         var parallelRequests: [FullScreenTarget] = []
         var requestDeadline: ContinuousClock.Instant?
@@ -393,7 +426,7 @@ final class WindowPlacement {
                     try Task.checkCancellation()
                     if entered { continue }
                 }
-                let error = DemoError("\(target.half.name)的窗口无法进入原生全屏，请换一个窗口。")
+                let error = DemoError(L("%@的窗口无法进入原生全屏，请换一个窗口。", String(describing: target.half.name)))
                 if let app = NSRunningApplication(processIdentifier: target.saved.pid), let id = target.saved.id {
                     Window.reveal(id, in: app)
                 }
@@ -405,7 +438,7 @@ final class WindowPlacement {
                 guard entered else { throw error }
             }
             for target in targets where !Self.isFullScreen(target.saved, on: target.half) {
-                throw DemoError("\(target.half.name)的窗口未保持全屏，请重试。")
+                throw DemoError(L("%@的窗口未保持全屏，请重试。", String(describing: target.half.name)))
             }
         } catch {
             if let requestDeadline, clock.now < requestDeadline, !parallelRequests.isEmpty {
@@ -480,7 +513,17 @@ final class WindowPlacement {
         for record in records {
             guard let app = NSRunningApplication(processIdentifier: record.pid), app.launchDate == record.launchDate,
                   let info = liveWindows()[record.number], info.pid == record.pid else { continue }
-            guard let window = Window.find(info) else { success = false; continue }
+            // Background apps may omit windows from AXWindows after launch or a Space change.
+            // Use the same bounded exact-window lookup/activation fallback as split preparation.
+            let choice = Choice(id: .window(record.number), element: nil, pid: record.pid,
+                                appName: app.localizedName ?? L("窗口"), title: info.title, frame: info.frame, status: nil)
+            let window: Window
+            do { window = try await openWindow(choice, in: app) }
+            catch {
+                success = false
+                DemoLog.shared.line(L("恢复窗口 %@ 时无法取得控制权限，请重试。", String(record.number)))
+                continue
+            }
             guard let target = NSScreen.screens.first(where: { $0.displayID.flatMap(RecoveryJournal.uuid) == record.displayUUID })
                     ?? NSScreen.screens.first else { success = false; continue }
             if app.isHidden { app.unhide() }
@@ -619,7 +662,7 @@ final class WindowPlacement {
         }
         guard !moves.isEmpty else { return }
         do { try onCheckpoint?() } catch {
-            DemoLog.shared.line("窗口补位暂缓：\(error.localizedDescription)")
+            DemoLog.shared.line(L("窗口补位暂缓：%@", String(describing: error.localizedDescription)))
             return
         }
         // Keep the short AX writes on the main actor so a join cannot start between validation and placement.
@@ -974,7 +1017,7 @@ final class WindowPlacement {
     }
 
     private struct SavedWindow: Sendable {
-        let window: Window
+        var window: Window
         let id: CGWindowID?
         let pid: pid_t
         var original: CGRect?

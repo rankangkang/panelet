@@ -46,14 +46,19 @@ struct PhysicalScreen {
     let scale: CGFloat
     let refreshRate: Double
     let isBuiltin: Bool
+    var configuration = DisplayConfiguration()
+
+    var uuid: String { CGDisplayCreateUUIDFromDisplayID(id).map { CFUUIDCreateString(nil, $0.takeRetainedValue()) as String } ?? "display-\(id)" }
 
     var isPortrait: Bool { bounds.height > bounds.width }
 
-    var splitLayout: SplitLayout { SplitLayout(size: bounds.size) }
+    var splitLayout: SplitLayout { SplitLayout(size: bounds.size, configuration: configuration) }
+
+    var displayName: String { configuration.name.isEmpty ? name : configuration.name }
 
     var menuTitle: String {
-        let kind = isBuiltin ? "内建" : "外接"
-        return "\(name)  \(kind)  \(Int(bounds.width.rounded()))×\(Int(bounds.height.rounded()))"
+        let kind = isBuiltin ? L("内建") : L("外接")
+        return "\(displayName)  \(kind)  \(Int(bounds.width.rounded()))×\(Int(bounds.height.rounded()))"
     }
 }
 
@@ -64,7 +69,7 @@ enum DisplayScanner {
             guard CGDisplayVendorNumber(id) != DemoDisplay.vendorID else { return nil }
             let bounds = CGDisplayBounds(id)
             guard bounds.width > 1, bounds.height > 1 else { return nil }
-            return PhysicalScreen(
+            var screen = PhysicalScreen(
                 id: id,
                 name: screenName(for: id),
                 bounds: bounds,
@@ -72,6 +77,8 @@ enum DisplayScanner {
                 refreshRate: refreshRate(for: id),
                 isBuiltin: CGDisplayIsBuiltin(id) != 0
             )
+            screen.configuration = ProductPreferences().display(screen.uuid)
+            return screen
         }
     }
 
@@ -82,18 +89,18 @@ enum DisplayScanner {
     static func printList() {
         let screens = physicalScreens()
         if screens.isEmpty {
-            print("没有检测到显示器")
+            print(L("没有检测到显示器"))
             return
         }
         for screen in screens {
-            let orientation = screen.isPortrait ? "竖屏" : "横屏"
+            let orientation = screen.isPortrait ? L("竖屏") : L("横屏")
             print(
                 "\(screen.menuTitle)  \(orientation)  id=\(screen.id)  " +
-                "原点(\(Int(screen.bounds.minX)),\(Int(screen.bounds.minY)))  " +
-                "缩放\(screen.scale)×  \(screen.refreshRate)Hz"
+                L("原点(%@,%@)  ", String(describing: Int(screen.bounds.minX)), String(describing: Int(screen.bounds.minY))) +
+                L("缩放%@×  %@Hz", String(describing: screen.scale), String(describing: screen.refreshRate))
             )
         }
-        print("可拆分的显示器：\(screens.map(\.name).joined(separator: "、"))")
+        print(L("可拆分的显示器：%@", String(describing: screens.map(\.name).joined(separator: "、"))))
     }
 
     static func activeDisplayIDs() -> [CGDirectDisplayID] {
@@ -106,7 +113,7 @@ enum DisplayScanner {
 
     private static func screenName(for id: CGDirectDisplayID) -> String {
         let match = NSScreen.screens.first { $0.displayID == id }
-        return match?.localizedName ?? "显示器 \(id)"
+        return match?.localizedName ?? L("显示器 %@", String(describing: id))
     }
 
     private static func backingScale(for id: CGDirectDisplayID) -> CGFloat {
@@ -134,12 +141,12 @@ enum Permissions {
 
     static var splitProblem: String? {
         if !screenRecording && !accessibility {
-            return "请先授权屏幕录制和辅助功能，再重新启动 App。"
+            return L("请先授权屏幕录制和辅助功能，再重新启动 App。")
         }
-        if !screenRecording { return "请先授权屏幕录制，再重新启动 App。" }
-        if !accessibility { return "请先授权辅助功能，再重新启动 App。" }
+        if !screenRecording { return L("请先授权屏幕录制，再重新启动 App。") }
+        if !accessibility { return L("请先授权辅助功能，再重新启动 App。") }
         if !separateSpacesEnabled {
-            return "请在「桌面与程序坞」打开「显示器使用不同的空间」，重新登录后再拆分。"
+            return L("请在「桌面与程序坞」打开「显示器使用不同的空间」，重新登录后再拆分。")
         }
         return nil
     }
@@ -186,17 +193,28 @@ func stableSerial(_ text: String) -> UInt32 {
 /// Local coordinates use a top-left origin, matching CoreGraphics and window migration.
 struct SplitLayout {
     let size: CGSize
-    var isPortrait: Bool { size.height > size.width }
-    var direction: String { isPortrait ? "上下" : "左右" }
-    var names: [String] { isPortrait ? ["上半屏", "下半屏"] : ["左半屏", "右半屏"] }
+    var configuration = DisplayConfiguration()
+    var isPortrait: Bool {
+        switch configuration.direction {
+        case .automatic: return size.height > size.width
+        case .vertical: return true
+        case .horizontal: return false
+        }
+    }
+    var smallRegionWarning: String? {
+        regions.contains { $0.width < 480 || $0.height < 320 }
+            ? L("分区较小，部分应用的最小窗口尺寸可能超出可用空间。") : nil
+    }
+    var direction: String { isPortrait ? L("上下") : L("左右") }
+    var names: [String] { isPortrait ? [L("上半屏"), L("下半屏")] : [L("左半屏"), L("右半屏")] }
     var roles: [String] { isPortrait ? ["top", "bottom"] : ["left", "right"] }
     var regions: [CGRect] {
         if isPortrait {
-            let first = floor(size.height / 2)
+            let first = floor(size.height * configuration.ratio.fraction)
             return [CGRect(x: 0, y: 0, width: size.width, height: first),
                     CGRect(x: 0, y: first, width: size.width, height: size.height - first)]
         }
-        let first = floor(size.width / 2)
+        let first = floor(size.width * configuration.ratio.fraction)
         return [CGRect(x: 0, y: 0, width: first, height: size.height),
                 CGRect(x: first, y: 0, width: size.width - first, height: size.height)]
     }
