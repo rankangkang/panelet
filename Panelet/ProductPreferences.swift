@@ -58,9 +58,13 @@ struct ProductPreferences {
     let defaults: UserDefaults
     init(defaults: UserDefaults = .standard) { self.defaults = defaults }
 
-    enum GuideStep: String { case welcome, permissions, layout, complete }
+    enum GuideStep: String { case welcome, permissions, ready, complete }
     var guideStep: GuideStep {
-        get { GuideStep(rawValue: defaults.string(forKey: "guide.step") ?? "") ?? .welcome }
+        get {
+            // Older versions used this step for a mandatory trial.
+            let value = defaults.string(forKey: "guide.step") ?? ""
+            return value == "layout" ? .ready : GuideStep(rawValue: value) ?? .welcome
+        }
         nonmutating set { defaults.set(newValue.rawValue, forKey: "guide.step") }
     }
     var guideDeferred: Bool {
@@ -77,12 +81,26 @@ struct ProductPreferences {
             guideStep = permissionsReady ? .complete : (hasExistingPreferences ? .permissions : .welcome)
         }
         if guideRestartPending {
-            guideStep = permissionsReady ? .layout : .permissions
+            guideStep = permissionsReady ? .ready : .permissions
             guideDeferred = false
             guideRestartPending = false
-        } else if !permissionsReady && (guideStep == .complete || guideStep == .layout) {
+        } else if guideStep == .permissions || guideStep == .ready {
+            guideStep = permissionsReady ? .ready : .permissions
+        } else if !permissionsReady && guideStep == .complete {
             guideStep = .permissions
         }
+    }
+
+    @discardableResult
+    func finishGuide(permissionsReady: Bool) -> Bool {
+        guard permissionsReady else {
+            guideStep = .permissions
+            return false
+        }
+        guideStep = .complete
+        guideDeferred = false
+        guideRestartPending = false
+        return true
     }
 
     func display(_ uuid: String) -> DisplayConfiguration {

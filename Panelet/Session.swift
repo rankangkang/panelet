@@ -173,7 +173,7 @@ final class SplitSessions {
         active.first { $0.halves.contains { $0.virtualBounds.contains(point) } }?.targetID
     }
 
-    func split(_ id: CGDirectDisplayID, pair: WindowPlacement.Pair? = nil) {
+    func split(_ id: CGDirectDisplayID, pair: WindowPlacement.Pair? = nil, configuration: DisplayConfiguration? = nil) {
         guard !busy, recoveryProblem == nil, !sessions.values.contains(where: \.needsRecovery) else { return }
         if let problem = EnvironmentCheck.inspect().problem {
             DemoLog.shared.line(problem)
@@ -191,7 +191,8 @@ final class SplitSessions {
         } else {
             for screen in physical where originalScreens[screen.id] == nil { originalScreens[screen.id] = screen }
         }
-        guard let screen = physical.first(where: { $0.id == id }) else { return }
+        guard var screen = physical.first(where: { $0.id == id }) else { return }
+        if let configuration { screen.configuration = configuration }
         let reserved = sessions.values.flatMap(\.managedWindows)
         let session = Session(screen: screen, pair: pair, coordinator: self)
         sessions[id] = session

@@ -47,13 +47,13 @@ To update, get the new source and choose **Quit Panelet** from the menu bar. Fol
 
 1. In **System Settings → Desktop & Dock**, turn on **Displays have separate Spaces**. If you just changed this setting, log out and back in when macOS prompts you.
 2. Open Panelet and follow **Getting Started** to grant **Screen Recording** and **Accessibility**. If Panelet is missing from a permissions list, use **+** to select `/Applications/Panelet.app`.
-3. When prompted, click **Restart and Continue**. Choose a display and layout, then click **Start Split**. You can reopen the guide from **Getting Started…** in the menu bar.
+3. Click **Restart and Continue** if prompted. Once permissions are ready, click **Finish Setup**. To try it right away, click **Try a Split…** and choose a display and layout. You can reopen the guide from **Getting Started…** in the menu bar.
 
 ## Quick start
 
 ### Split a desktop
 
-From the Panelet menu bar icon, choose **Split Desktop** and select a display. The two desktops stay active until you merge the display. To change its direction, ratio, or rendering mode, merge it first, then open **Settings… → Desktop Split**.
+From the Panelet menu bar icon, choose **Split Desktop** and select a display. The two desktops stay active until you merge the display. To change the layout, merge it first, then open **Settings… → Desktop Split** to adjust the direction and ratio and see the preview update.
 
 ### Pair two windows
 

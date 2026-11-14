@@ -9,18 +9,29 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
     var isVisible: Bool { panel.isVisible }
     var isFocused: Bool { NSApp.isActive && panel.isVisible && panel.isKeyWindow }
     var targetDisplayID: CGDirectDisplayID? { selectedDisplayID }
+    var confirmationWindow: NSWindow? { isVisible ? panel : nil }
 
-    private static let width: CGFloat = 540
+    private static let minimumContentSize = NSSize(width: 500, height: 430)
+    private static let maximumContentSize = NSSize(width: 1160, height: 900)
+    private static let horizontalInset: CGFloat = 16
+    private static let screenInset: CGFloat = 12
     private let panel = SplitPanelWindow(
-        contentRect: NSRect(x: 0, y: 0, width: width, height: 560),
-        styleMask: [.titled, .closable, .utilityWindow], backing: .buffered, defer: false
+        contentRect: NSRect(x: 0, y: 0, width: 540, height: 610),
+        styleMask: [.titled, .closable, .resizable, .utilityWindow], backing: .buffered, defer: false
     )
     private let displayMap = DisplayArrangementView()
+    private let displayName = NSTextField(labelWithString: "")
+    private let selectionTitle = NSTextField(labelWithString: "")
     private let search = NSSearchField()
-    private let grid = WindowPreviewGrid(width: width - 32)
+    private let grid = WindowPreviewGrid(frame: .zero)
+    private let resultsArea = NSView()
+    private let emptyResults = NSStackView()
+    private let emptyMessage = NSTextField(labelWithString: "")
+    private let emptyAction = NSButton()
+    private lazy var mapHeight = displayMap.heightAnchor.constraint(equalToConstant: 128)
     private let dragPreview = CardDragPreview()
     private let message = NSTextField(wrappingLabelWithString: "")
-    private let hint = NSTextField(labelWithString: "")
+    private let hint = NSTextField(wrappingLabelWithString: "")
     private let advanced = NSButton()
     private let join = NSButton()
     private let primary = NSButton()
@@ -28,12 +39,12 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
     private let favorites = NSPopUpButton()
     private let saveFavorite = NSButton(title: L("收藏…"), target: nil, action: nil)
     private let deleteFavorite = NSButton(title: L("删除收藏"), target: nil, action: nil)
-    private let favoriteRow = NSStackView()
     private let preferences = ProductPreferences()
     private var favoriteID: UUID?
     private let content = NSStackView()
     private let picker = NSStackView()
     private let footer = NSStackView()
+    private let emptySpace = NSView()
 
     private var screens: [PhysicalScreen] = []
     private var choices: [WindowPlacement.Choice] = []
@@ -48,9 +59,11 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
     private var busy = false
     private var canCancel = false
     private var sessionMessage: String?
+    private var failed = false
+    private var replacingWindow = false
     private var draggedChoice: WindowPlacement.Choice?
     private var choiceTask: Task<Void, Never>?
-    private var submitWhenReady = false
+    private var hostFrame: CGRect?
     private let workspaceNotifications = NSWorkspace.shared.notificationCenter
     private var terminationObserver: NSObjectProtocol?
 
@@ -62,58 +75,108 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
             let pid = app.processIdentifier
             Task { @MainActor [weak self] in self?.applicationTerminated(pid) }
         }
-        let width = Self.width
         panel.title = L("Panelet · 快捷窗口分屏")
         panel.delegate = self
         panel.isReleasedWhenClosed = false
         panel.isFloatingPanel = true
         panel.hidesOnDeactivate = true
         panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary, .canJoinAllApplications]
+        panel.contentMinSize = Self.minimumContentSize
+        panel.contentMaxSize = Self.maximumContentSize
         panel.onEscape = { [weak self] in self?.cancel() }
         panel.onReturn = { [weak self] in self?.confirmSelection() }
+        panel.searchField = search
 
         advanced.target = self
         advanced.action = #selector(advancedClicked)
         advanced.bezelStyle = .rounded
-        join.title = L("还原…")
         join.target = self
         join.action = #selector(joinClicked)
         join.bezelStyle = .rounded
-        let header = NSStackView(views: [NSTextField(labelWithString: L("把窗口拖到目标分区")), NSView(), join, advanced])
+        join.isHidden = true
+        displayName.font = .systemFont(ofSize: 13, weight: .semibold)
+        displayName.lineBreakMode = .byTruncatingTail
+        displayName.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let header = NSStackView(views: [displayName, NSView(), join, advanced])
+        header.distribution = .fill
         header.alignment = .centerY
+        for button in [join, advanced] {
+            button.setContentCompressionResistancePriority(.required, for: .horizontal)
+            button.setContentCompressionResistancePriority(.required, for: .vertical)
+            button.setContentHuggingPriority(.required, for: .vertical)
+        }
 
-        displayMap.heightAnchor.constraint(equalToConstant: 154).isActive = true
+        mapHeight.isActive = true
         displayMap.onSelect = { [weak self] displayID, slot in self?.select(displayID: displayID, slot: slot) }
         search.delegate = self
         search.sendsSearchStringImmediately = true
+        search.placeholderString = L("搜索应用或窗口标题")
+        search.setAccessibilityLabel(L("搜索应用或窗口标题"))
 
         grid.onChoose = { [weak self] index in self?.choose(index) }
         grid.onDrag = { [weak self] choice, point, phase in self?.drag(choice, at: point, phase: phase) }
 
+        emptyMessage.textColor = .secondaryLabelColor
+        emptyAction.bezelStyle = .rounded
+        emptyAction.target = self
+        emptyAction.action = #selector(emptyActionClicked)
+        emptyResults.orientation = .vertical
+        emptyResults.alignment = .centerX
+        emptyResults.spacing = 8
+        for view in [emptyMessage, emptyAction] { emptyResults.addArrangedSubview(view) }
+        for view in [grid, emptyResults] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            resultsArea.addSubview(view)
+        }
+        let minimumResultsHeight = resultsArea.heightAnchor.constraint(greaterThanOrEqualToConstant: 56)
+        minimumResultsHeight.priority = .defaultHigh
+        minimumResultsHeight.isActive = true
+        NSLayoutConstraint.activate([
+            grid.leadingAnchor.constraint(equalTo: resultsArea.leadingAnchor),
+            grid.trailingAnchor.constraint(equalTo: resultsArea.trailingAnchor),
+            grid.topAnchor.constraint(equalTo: resultsArea.topAnchor),
+            grid.bottomAnchor.constraint(equalTo: resultsArea.bottomAnchor),
+            emptyResults.centerXAnchor.constraint(equalTo: resultsArea.centerXAnchor),
+            emptyResults.centerYAnchor.constraint(equalTo: resultsArea.centerYAnchor),
+            emptyResults.leadingAnchor.constraint(greaterThanOrEqualTo: resultsArea.leadingAnchor, constant: 8),
+            emptyResults.trailingAnchor.constraint(lessThanOrEqualTo: resultsArea.trailingAnchor, constant: -8),
+            emptyResults.topAnchor.constraint(greaterThanOrEqualTo: resultsArea.topAnchor),
+            emptyResults.bottomAnchor.constraint(lessThanOrEqualTo: resultsArea.bottomAnchor)
+        ])
+
         favorites.target = self
         favorites.action = #selector(selectFavorite)
         favorites.setAccessibilityLabel(L("收藏组合"))
-        favorites.widthAnchor.constraint(equalToConstant: 310).isActive = true
+        favorites.widthAnchor.constraint(equalToConstant: 150).isActive = true
         deleteFavorite.target = self
         deleteFavorite.action = #selector(removeFavorite)
         deleteFavorite.bezelStyle = .rounded
         saveFavorite.target = self
         saveFavorite.action = #selector(storeFavorite)
         saveFavorite.bezelStyle = .rounded
-        favoriteRow.orientation = .horizontal
-        favoriteRow.spacing = 8
-        for view in [favorites, NSView(), deleteFavorite] { favoriteRow.addArrangedSubview(view) }
+        selectionTitle.font = .systemFont(ofSize: 13, weight: .semibold)
+        selectionTitle.lineBreakMode = .byTruncatingTail
+        selectionTitle.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let selectionRow = NSStackView(views: [selectionTitle, NSView(), favorites, deleteFavorite])
+        selectionRow.distribution = .fill
+        selectionRow.alignment = .centerY
+        selectionRow.spacing = 8
         refreshFavorites()
         picker.orientation = .vertical
+        picker.distribution = .fill
         picker.alignment = .leading
         picker.spacing = 8
-        for view in [favoriteRow, search, grid] { picker.addArrangedSubview(view) }
+        for view in [selectionRow, search, resultsArea] { picker.addArrangedSubview(view) }
 
         message.textColor = .secondaryLabelColor
-        message.preferredMaxLayoutWidth = width - 32
         hint.textColor = .secondaryLabelColor
         hint.font = .systemFont(ofSize: 11)
+        hint.maximumNumberOfLines = 2
+        hint.lineBreakMode = .byTruncatingTail
+        hint.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        hint.setContentCompressionResistancePriority(.required, for: .vertical)
         primary.bezelStyle = .rounded
+        primary.bezelColor = .controlAccentColor
         primary.target = self
         primary.action = #selector(primaryClicked)
         swap.target = self
@@ -121,17 +184,31 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         swap.bezelStyle = .rounded
         swap.setAccessibilityLabel(L("交换两个已选窗口的位置"))
         footer.orientation = .horizontal
+        footer.distribution = .fill
         footer.alignment = .centerY
+        for button in [saveFavorite, swap, primary] {
+            button.setContentCompressionResistancePriority(.required, for: .horizontal)
+            button.setContentCompressionResistancePriority(.required, for: .vertical)
+            button.setContentHuggingPriority(.required, for: .vertical)
+        }
         for view in [hint, NSView(), saveFavorite, swap, primary] { footer.addArrangedSubview(view) }
 
         content.orientation = .vertical
+        content.distribution = .fill
         content.alignment = .leading
         content.spacing = 10
-        content.edgeInsets = NSEdgeInsets(top: 14, left: 16, bottom: 14, right: 16)
+        content.edgeInsets = NSEdgeInsets(top: 14, left: Self.horizontalInset, bottom: 14, right: Self.horizontalInset)
         for view in [header, displayMap, picker, message, footer] { content.addArrangedSubview(view) }
-        for view in [header, displayMap, picker, search, grid, message, footer] {
-            view.widthAnchor.constraint(equalToConstant: width - 32).isActive = true
+        for view in [selectionRow, search, resultsArea] {
+            view.leadingAnchor.constraint(equalTo: picker.leadingAnchor).isActive = true
+            view.trailingAnchor.constraint(equalTo: picker.trailingAnchor).isActive = true
         }
+        for view in [message, search] {
+            view.setContentHuggingPriority(.required, for: .vertical)
+        }
+        // When window selection is unavailable, spare space belongs below the message.
+        emptySpace.isHidden = true
+        content.insertArrangedSubview(emptySpace, at: 4)
         content.translatesAutoresizingMaskIntoConstraints = false
         let root = NSView()
         root.addSubview(content)
@@ -143,8 +220,14 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
             content.topAnchor.constraint(equalTo: root.topAnchor),
             content.leadingAnchor.constraint(equalTo: root.leadingAnchor),
             content.trailingAnchor.constraint(equalTo: root.trailingAnchor),
+            content.bottomAnchor.constraint(equalTo: root.bottomAnchor)
         ])
+        let innerWidth = root.widthAnchor
+        for view in [header, displayMap, picker, message, footer, emptySpace] {
+            view.widthAnchor.constraint(equalTo: innerWidth, constant: -2 * Self.horizontalInset).isActive = true
+        }
         panel.contentView = root
+        updateLayoutMetrics()
     }
 
     deinit {
@@ -165,8 +248,9 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
 
     func show(screens: [PhysicalScreen], displayID: CGDirectDisplayID?, host: NSScreen?,
               activePairs: [CGDirectDisplayID: [WindowPlacement.Choice]], recentPairs: [CGDirectDisplayID: WindowPlacement.Pair],
-              excluded: [WindowPlacement.Identity], problem: String?) {
+              excluded: [WindowPlacement.Identity], problem: String?, settingsTitle: String) {
         blocker = problem
+        advanced.title = settingsTitle
         favoriteID = nil
         refreshFavorites()
         self.activePairs = activePairs
@@ -175,26 +259,60 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         sessionMessage = nil
         busy = false
         canCancel = false
+        failed = false
+        replacingWindow = false
         grid.resetPreviews()
         choices = []
         selected = [nil, nil]
         slot = 0
         search.stringValue = ""
+        useHost(host)
         updateDisplays(screens, selectedID: displayID)
         loadChoices()
-        if let host {
-            let frame = host.visibleFrame
-            panel.setFrameOrigin(NSPoint(x: frame.midX - panel.frame.width / 2,
-                                         y: frame.midY - panel.frame.height / 2))
-        } else {
-            panel.center()
-        }
+        centerOnHost()
         bringToFront()
     }
 
-    func showFailure() {
-        panel.center()
+    func showFailure(_ problem: String, host: NSScreen?) {
+        sessionMessage = problem
+        failed = true
+        replacingWindow = false
+        search.stringValue = ""
+        useHost(host)
+        retainAvailableSelection()
+        updateResults()
+        if !isFocused { centerOnHost() }
         bringToFront()
+        if blocker == nil { loadChoices(preservingSelection: true) }
+        announce(problem)
+    }
+
+    private func useHost(_ host: NSScreen?) {
+        hostFrame = host?.visibleFrame
+        updateWindowSizeLimits(for: hostFrame)
+        if let current = panel.contentView?.bounds.size {
+            let limit = panel.contentMaxSize
+            let size = NSSize(width: min(current.width, limit.width), height: min(current.height, limit.height))
+            if current != size { panel.setContentSize(size) }
+        }
+        updateLayoutMetrics()
+    }
+
+    private func updateWindowSizeLimits(for visibleFrame: CGRect?) {
+        let inset = Self.screenInset
+        let available = visibleFrame.map { panel.contentRect(forFrameRect: $0.insetBy(dx: inset, dy: inset)).size }
+            ?? Self.maximumContentSize
+        panel.contentMinSize = NSSize(width: min(Self.minimumContentSize.width, available.width),
+                                      height: min(Self.minimumContentSize.height, available.height))
+        panel.contentMaxSize = NSSize(width: min(Self.maximumContentSize.width, available.width),
+                                      height: min(Self.maximumContentSize.height, available.height))
+    }
+
+    private func centerOnHost() {
+        if let frame = hostFrame {
+            panel.setFrameOrigin(NSPoint(x: frame.midX - panel.frame.width / 2,
+                                         y: frame.midY - panel.frame.height / 2))
+        } else { panel.center() }
     }
 
     private func bringToFront() {
@@ -206,18 +324,25 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
     func hide() {
         choiceTask?.cancel()
         choiceTask = nil
-        submitWhenReady = false
         clearDrag()
         grid.setPreviewing(false)
         panel.orderOut(nil)
         grid.resetPreviews()
     }
 
-    func setProblem(_ problem: String?) {
-        guard blocker != problem else { return }
+    func setProblem(_ problem: String?, actionTitle: String) {
+        guard blocker != problem || advanced.title != actionTitle else { return }
         blocker = problem
-        if problem == nil { loadChoices() }
+        advanced.title = actionTitle
+        if problem == nil { loadChoices(preservingSelection: true) }
         else { updateResults() }
+    }
+
+    func setRestoreTitle(_ title: String?, enabled: Bool) {
+        guard join.isHidden != (title == nil) || join.title != (title ?? "") || join.isEnabled != enabled else { return }
+        join.title = title ?? ""
+        join.isHidden = title == nil
+        join.isEnabled = enabled
     }
 
     func updateDisplays(_ screens: [PhysicalScreen], selectedID: CGDirectDisplayID? = nil,
@@ -230,7 +355,14 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         let preferred = selectedID ?? selectedDisplayID
         let available = screens.filter { self.activePairs[$0.id]?.isEmpty != false }
         let next = available.first(where: { $0.id == preferred })?.id ?? available.first?.id
-        if next != selectedDisplayID { useDisplay(next) }
+        if next != selectedDisplayID {
+            useDisplay(next)
+            if !busy {
+                sessionMessage = nil
+                failed = false
+            }
+        }
+        else if !busy { retainAvailableSelection() }
         displayMap.updateDisplays(screens)
         displayMap.isHidden = screens.isEmpty
         guard isVisible else { return }
@@ -256,7 +388,7 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         return WindowPlacement.Pair(upper: upper, lower: lower)
     }
 
-    private func loadChoices() {
+    private func loadChoices(preservingSelection: Bool = false) {
         choiceTask?.cancel()
         choiceTask = nil
         if blocker == nil, selectedDisplayID != nil {
@@ -270,20 +402,20 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
                 guard let self, !Task.isCancelled else { return }
                 self.choiceTask = nil
                 self.choices = choices.filter { NSRunningApplication(processIdentifier: $0.pid)?.isTerminated == false }
-                let submit = self.submitWhenReady
-                self.useDisplay(self.selectedDisplayID)
-                if let favoriteID = self.favoriteID { self.applyFavorite(favoriteID) }
-                if submit { self.sessionMessage = nil }
+                if preservingSelection { self.retainAvailableSelection() }
+                else {
+                    self.useDisplay(self.selectedDisplayID)
+                    if let favoriteID = self.favoriteID { self.applyFavorite(favoriteID) }
+                }
                 self.updateResults()
-                if submit && self.search.stringValue.isEmpty { self.primaryClicked() }
             }
         }
         updateResults()
     }
 
     private func useDisplay(_ displayID: CGDirectDisplayID?) {
-        submitWhenReady = false
         selectedDisplayID = displayID
+        replacingWindow = false
         let recent = displayID.flatMap { recentPairs[$0] }
         selected = [recent?.upper, recent?.lower].map { previous in
             guard let previous else { return nil }
@@ -292,73 +424,145 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         slot = selected.firstIndex(where: { $0 == nil }) ?? 0
     }
 
+    private func retainAvailableSelection() {
+        selected = selected.map { previous in
+            guard let previous else { return nil }
+            return choices.first { $0.id == previous.id && $0.pid == previous.pid && isAvailable($0) }
+        }
+        if let emptySlot = selected.firstIndex(where: { $0 == nil }) { slot = emptySlot }
+    }
+
     private func isAvailable(_ choice: WindowPlacement.Choice) -> Bool {
         !excluded.contains { $0.matches(number: choice.windowID, element: choice.element) }
     }
 
+    private var query: String { search.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    private var canChooseWindow: Bool { !busy && blocker == nil && selectedDisplayID != nil && choiceTask == nil }
+
+    private var canStart: Bool { canChooseWindow && pair != nil }
+
+    private enum ReturnAction { case choose(Int), start }
+
+    private var returnAction: ReturnAction? {
+        guard canChooseWindow else { return nil }
+        if let index = grid.highlightedIndex { return .choose(index) }
+        return canStart && query.isEmpty && !replacingWindow ? .start : nil
+    }
+
     private func updateResults() {
         if draggedChoice != nil { clearDrag() }
-        let query = search.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        let query = self.query
         let otherID = selected[1 - slot]?.id
         results = choices.filter { item in
             isAvailable(item) && item.id != otherID && (query.isEmpty || item.appName.localizedStandardContains(query)
                                    || item.title.localizedStandardContains(query))
         }
-        grid.show(results, highlightFirst: pair == nil || !query.isEmpty, loading: choiceTask != nil)
+        grid.show(results, highlightFirst: pair == nil || replacingWindow || !query.isEmpty)
         updateControls()
     }
 
     private func updateControls() {
         let unavailable = blocker ?? (selectedDisplayID == nil
-            ? (activePairs.isEmpty ? L("接入一块显示器后即可拆分。") : L("所有显示器均在快捷分屏中，请先还原一个组合。")) : nil)
+            ? (activePairs.isEmpty ? L("接入一块显示器后即可拆分。") : L("所有显示器均在快捷分屏中，请先结束一个组合。")) : nil)
         picker.isHidden = unavailable != nil
+        emptySpace.isHidden = unavailable == nil
         footer.isHidden = unavailable != nil && !busy
-        advanced.title = blocker == nil ? L("设置…") : L("打开设置…")
-        join.isHidden = activePairs.isEmpty
-        join.isEnabled = !busy
         search.isEnabled = !busy
-        grid.isEnabled = !busy
+        grid.isEnabled = canChooseWindow
         updatePreviewing()
-        let names = selected.enumerated().map { index, choice in
-            choice.map { choice in
-                choice.appName == selected[1 - index]?.appName && !choice.title.isEmpty ? choice.title : choice.appName
-            }
+        let screen = screens.first { $0.id == selectedDisplayID }
+        let targetSlot = pair == nil || replacingWindow || !query.isEmpty || grid.highlightedIndex != nil ? slot : nil
+        let displayedScreen = screen ?? (screens.count == 1 ? screens.first : nil)
+        displayName.stringValue = displayedScreen?.displayName ?? L("目标显示器")
+        displayName.toolTip = displayedScreen?.menuTitle
+        displayMap.updateSelection(displayID: selectedDisplayID, slot: targetSlot, selected: selected,
+                                   activePairs: activePairs, enabled: canChooseWindow)
+        let region = screen?.splitLayout.names[slot] ?? L("分区")
+        if pair == nil {
+            let count = selected.compactMap { $0 }.count
+            selectionTitle.stringValue = L("为%@选窗 · %@/2", region, String(count))
+        } else if targetSlot != nil {
+            selectionTitle.stringValue = L("更换%@的窗口 · 2/2", region)
+        } else {
+            selectionTitle.stringValue = L("已选窗口 · 2/2")
         }
-        displayMap.updateSelection(displayID: selectedDisplayID, slot: slot, names: names,
-                                   titles: selected.map { $0?.title }, activePairs: activePairs, enabled: !busy && unavailable == nil)
-        let layout = screens.first { $0.id == selectedDisplayID }?.splitLayout
-        search.placeholderString = L("搜索%@窗口", String(describing: layout?.names[slot] ?? L("分区")))
-        let empty = choiceTask != nil ? L("正在查找打开的窗口…") :
-            (results.isEmpty && !search.stringValue.isEmpty ? L("没有匹配的窗口。") :
-                (choices.lazy.filter(isAvailable).prefix(2).count < 2 ? L("打开至少两个可选窗口后即可拆分。") : nil))
-        let status = sessionMessage ?? unavailable ?? empty
+        search.setAccessibilityHelp(selectionTitle.stringValue)
+        updateEmptyResults()
+        let status = unavailable ?? sessionMessage
         message.stringValue = status ?? ""
         message.isHidden = status == nil
-        hint.stringValue = busy ? (canCancel ? L("Esc 取消") : "")
-            : (pair != nil && grid.highlightedIndex == nil ? L("↵ 开始分屏   Esc 关闭") : L("↑↓ 选择   ↵ 确认   Esc 关闭"))
-        favorites.isEnabled = !busy
-        deleteFavorite.isEnabled = !busy && favoriteID != nil
+        updateKeyboardHint()
+        favorites.isEnabled = canChooseWindow
+        deleteFavorite.isEnabled = canChooseWindow && favoriteID != nil
+        deleteFavorite.isHidden = favoriteID == nil
         saveFavorite.isHidden = busy || pair == nil
+        saveFavorite.isEnabled = canStart
         swap.isHidden = busy || pair == nil
-        swap.isEnabled = !busy && unavailable == nil
-        primary.title = busy ? L("取消") : L("开始分屏")
-        primary.isEnabled = busy ? canCancel : (pair != nil && unavailable == nil)
-        panel.contentView?.layoutSubtreeIfNeeded()
-        let height = ceil(content.fittingSize.height)
-        if height > 0 && abs((panel.contentView?.bounds.height ?? 0) - height) > 1 {
-            let previous = panel.frame
-            panel.setContentSize(NSSize(width: Self.width, height: height))
-            if isVisible { panel.setFrameTopLeftPoint(NSPoint(x: previous.minX, y: previous.maxY)) }
+        swap.isEnabled = canChooseWindow
+        primary.title = busy ? (canCancel ? L("取消") : L("正在恢复…")) : (failed ? L("重试分屏") : L("开始分屏"))
+        primary.isEnabled = busy ? canCancel : canStart
+        primary.bezelColor = canStart ? .controlAccentColor : nil
+        updateLayoutMetrics()
+    }
+
+    private func updateLayoutMetrics() {
+        guard let size = panel.contentView?.bounds.size else { return }
+        mapHeight.constant = min(128, max(72, size.height - 340))
+        let width = max(1, size.width - 2 * Self.horizontalInset)
+        message.preferredMaxLayoutWidth = width
+        hint.preferredMaxLayoutWidth = max(120, width - 270)
+    }
+
+    private func updateEmptyResults() {
+        grid.isHidden = results.isEmpty
+        emptyResults.isHidden = !results.isEmpty
+        guard results.isEmpty else { return }
+        emptyAction.isHidden = choiceTask != nil
+        emptyAction.isEnabled = !busy
+        if choiceTask != nil {
+            emptyMessage.stringValue = L("正在查找打开的窗口…")
+        } else if !query.isEmpty {
+            emptyMessage.stringValue = L("没有匹配的窗口。")
+            emptyAction.title = L("清空搜索")
+        } else {
+            emptyMessage.stringValue = L("打开至少两个可选窗口后即可拆分。")
+            emptyAction.title = L("刷新窗口列表")
         }
     }
 
+    @objc private func emptyActionClicked() {
+        guard canChooseWindow else { return }
+        if query.isEmpty { loadChoices(preservingSelection: true) }
+        else {
+            search.stringValue = ""
+            updateResults()
+        }
+        panel.makeFirstResponder(search)
+    }
+
+    private func updateKeyboardHint() {
+        if busy { hint.stringValue = canCancel ? L("Esc 取消") : ""; return }
+        switch returnAction {
+        case .choose: hint.stringValue = L("点击或拖放   ↑↓ 移动   ↵ 选中   Esc 关闭")
+        case .start: hint.stringValue = failed ? L("↵ 重试分屏   Esc 关闭") : L("↵ 开始分屏   Esc 关闭")
+        case nil: hint.stringValue = L("Esc 关闭")
+        }
+    }
+
+    private func announce(_ message: String) {
+        guard panel.isKeyWindow else { return }
+        NSAccessibility.post(element: NSApp!, notification: .announcementRequested, userInfo: [
+            .announcement: message, .priority: NSAccessibilityPriorityLevel.medium.rawValue
+        ])
+    }
+
     func controlTextDidChange(_ notification: Notification) {
-        if submitWhenReady { sessionMessage = nil }
-        submitWhenReady = false
         if !busy { updateResults() }
     }
 
     func control(_ control: NSControl, textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+        guard !textView.hasMarkedText() else { return false }
         switch commandSelector {
         case #selector(NSResponder.cancelOperation(_:)):
             cancel()
@@ -367,7 +571,13 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
             confirmSelection()
             return true
         case #selector(NSResponder.moveUp(_:)), #selector(NSResponder.moveDown(_:)):
+            let previous = grid.highlightedIndex
             grid.moveHighlight(by: commandSelector == #selector(NSResponder.moveUp(_:)) ? -1 : 1)
+            if previous == nil && grid.highlightedIndex != nil { updateControls() }
+            if let index = grid.highlightedIndex, index != previous, results.indices.contains(index) {
+                let choice = results[index]
+                announce(choice.title.isEmpty ? choice.appName : "\(choice.appName), \(choice.title)")
+            }
             return true
         default:
             return false
@@ -375,27 +585,42 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
     }
 
     private func confirmSelection() {
-        guard !busy else { return }
-        if choiceTask != nil {
-            submitWhenReady = search.stringValue.isEmpty && selectedDisplayID.flatMap { recentPairs[$0] } != nil
-            if submitWhenReady {
-                sessionMessage = L("正在核对上次的窗口…")
-                updateControls()
-            }
-            return
+        switch returnAction {
+        case .choose(let index): choose(index)
+        case .start: primaryClicked()
+        case nil: break
         }
-        if let index = grid.highlightedIndex { choose(index) }
-        else if search.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { primaryClicked() }
     }
 
     func windowDidBecomeKey(_ notification: Notification) { updatePreviewing() }
+
+    func windowDidResize(_ notification: Notification) { updateLayoutMetrics() }
+
+    func windowDidEndLiveResize(_ notification: Notification) {
+        panel.contentView?.layoutSubtreeIfNeeded()
+        grid.revealHighlight()
+    }
+
+    func windowDidChangeScreen(_ notification: Notification) {
+        if isVisible { updateWindowSizeLimits(for: panel.screen?.visibleFrame) }
+    }
+
+    func windowWillUseStandardFrame(_ window: NSWindow, defaultFrame: NSRect) -> NSRect {
+        let inset = Self.screenInset
+        let area = window.screen?.visibleFrame.insetBy(dx: inset, dy: inset) ?? defaultFrame
+        let maximum = window.frameRect(forContentRect: CGRect(origin: .zero, size: Self.maximumContentSize)).size
+        let size = NSSize(width: min(maximum.width, area.width), height: min(maximum.height, area.height))
+        return CGRect(x: area.midX - size.width / 2, y: area.midY - size.height / 2,
+                      width: size.width, height: size.height)
+    }
+
     func windowDidResignKey(_ notification: Notification) {
         clearDrag()
         grid.setPreviewing(false)
     }
 
     private func updatePreviewing() {
-        grid.setPreviewing(panel.isKeyWindow && !picker.isHidden && !busy && !results.isEmpty)
+        grid.setPreviewing(panel.isKeyWindow && canChooseWindow && !results.isEmpty)
     }
 
     func windowShouldClose(_ sender: NSWindow) -> Bool {
@@ -404,25 +629,28 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
     }
 
     private func select(displayID: CGDirectDisplayID, slot: Int) {
-        guard !busy, activePairs[displayID]?.isEmpty != false else { return }
-        submitWhenReady = false
-        if selectedDisplayID != displayID { useDisplay(displayID) }
+        guard !busy, blocker == nil, activePairs[displayID]?.isEmpty != false else { return }
+        if selectedDisplayID != displayID {
+            useDisplay(displayID)
+            sessionMessage = nil
+            failed = false
+        }
         self.slot = slot
-        sessionMessage = nil
+        replacingWindow = pair != nil
         search.stringValue = ""
         updateResults()
         panel.makeFirstResponder(search)
     }
 
     private func choose(_ row: Int) {
-        guard !busy, results.indices.contains(row) else { return }
+        guard canChooseWindow, results.indices.contains(row) else { return }
         assign(results[row], to: slot)
     }
 
     private func drag(_ choice: WindowPlacement.Choice, at point: NSPoint, phase: WindowPreviewGrid.DragPhase) {
         switch phase {
         case .began(let image):
-            guard !busy, blocker == nil, panel.isKeyWindow else { return }
+            guard canChooseWindow, panel.isKeyWindow else { return }
             draggedChoice = choice
             dragPreview.image = image ?? NSRunningApplication(processIdentifier: choice.pid)?.icon
         case .moved:
@@ -458,14 +686,22 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
 
     private func assign(_ choice: WindowPlacement.Choice, to slot: Int) {
         let completing = selected[slot] == nil
+        let wasFailed = failed
         selected[slot] = choice
         sessionMessage = nil
+        failed = false
+        replacingWindow = false
         let next = selected.firstIndex(where: { $0 == nil })
         self.slot = next ?? slot
         search.stringValue = ""
         updateResults()
-        if next == nil && completing && preferences.automaticStart { primaryClicked() }
-        if !busy { panel.makeFirstResponder(search) }
+        if next == nil && completing && !wasFailed && preferences.automaticStart { primaryClicked() }
+        if !busy {
+            panel.makeFirstResponder(search)
+            if let region = screens.first(where: { $0.id == selectedDisplayID })?.splitLayout.names[slot] {
+                announce(L("%@已选：%@。%@", region, choice.name, selectionTitle.stringValue))
+            }
+        }
     }
 
     @objc private func swapSelection() {
@@ -473,7 +709,10 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         selected.swapAt(0, 1)
         search.stringValue = ""
         sessionMessage = nil
+        failed = false
+        replacingWindow = false
         updateResults()
+        panel.makeFirstResponder(search)
     }
 
     private func refreshFavorites() {
@@ -490,12 +729,12 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
     }
 
     @objc private func selectFavorite() {
-        guard !busy else { return }
+        guard canChooseWindow else { return }
         favoriteID = (favorites.selectedItem?.representedObject as? String).flatMap(UUID.init(uuidString:))
         guard let favoriteID else { updateControls(); return }
-        if choiceTask != nil { return }
         applyFavorite(favoriteID)
         updateResults()
+        panel.makeFirstResponder(search)
     }
 
     private func applyFavorite(_ id: UUID) {
@@ -506,6 +745,8 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
         })
         selected = indices.map { index in index.map { available[$0] } }
         slot = selected.firstIndex(where: { $0 == nil }) ?? 0
+        failed = false
+        replacingWindow = false
         search.stringValue = ""
         sessionMessage = selected.contains(where: { $0 == nil })
             ? L("部分应用未打开或有多个候选窗口，请重新选择缺少的窗口。")
@@ -569,7 +810,7 @@ final class QuickSplitPanel: NSObject, NSWindowDelegate, NSSearchFieldDelegate {
             if canCancel { onCancel?() }
             return
         }
-        guard blocker == nil, choiceTask == nil, let displayID = selectedDisplayID, activePairs[displayID]?.isEmpty != false, let pair else { return }
+        guard canStart, let displayID = selectedDisplayID, activePairs[displayID]?.isEmpty != false, let pair else { return }
         onSplit?(displayID, pair)
     }
 
@@ -600,9 +841,8 @@ private final class DisplayArrangementView: NSView {
 
     private var tiles: [Tile] = []
     private var selectedDisplayID: CGDirectDisplayID?
-    private var selectedSlot = 0
-    private var names: [String?] = []
-    private var titles: [String?] = []
+    private var selectedSlot: Int?
+    private var selected: [WindowPlacement.Choice?] = []
     private var activePairs: [CGDirectDisplayID: [WindowPlacement.Choice]] = [:]
     private var enabled = false
     private var dropTarget: DropTarget? {
@@ -633,12 +873,11 @@ private final class DisplayArrangementView: NSView {
         updateAppearance()
     }
 
-    func updateSelection(displayID: CGDirectDisplayID?, slot: Int, names: [String?], titles: [String?],
+    func updateSelection(displayID: CGDirectDisplayID?, slot: Int?, selected: [WindowPlacement.Choice?],
                          activePairs: [CGDirectDisplayID: [WindowPlacement.Choice]], enabled: Bool) {
         selectedDisplayID = displayID
         selectedSlot = slot
-        self.names = names
-        self.titles = titles
+        self.selected = selected
         self.activePairs = activePairs
         self.enabled = enabled
         if !enabled { dropTarget = nil }
@@ -679,6 +918,7 @@ private final class DisplayArrangementView: NSView {
             let accent = NSColor.controlAccentColor
             let selection = accent.blended(withFraction: 0.80, of: .controlBackgroundColor) ?? .controlBackgroundColor
             let dropFill = accent.blended(withFraction: 0.58, of: .controlBackgroundColor) ?? selection
+            let displayIDs = tiles.map(\.screen.id).sorted()
             for tile in tiles {
                 let isTarget = tile.screen.id == selectedDisplayID
                 let active = activePairs[tile.screen.id]
@@ -687,22 +927,26 @@ private final class DisplayArrangementView: NSView {
                 tile.view.layer?.borderColor = (isTarget ? accent : .separatorColor).cgColor
                 tile.view.layer?.backgroundColor = NSColor.separatorColor.cgColor
                 for (slot, button) in tile.halves.enumerated() {
-                    let number = tiles.map(\.screen.id).sorted().firstIndex(of: tile.screen.id).map { $0 + 1 } ?? 1
-                    let position = "\(number).\(slot + 1) \(tile.screen.splitLayout.names[slot])"
+                    let region = tile.screen.splitLayout.names[slot]
+                    let number = displayIDs.firstIndex(of: tile.screen.id).map { $0 + 1 } ?? 1
+                    let position = displayIDs.count == 1 ? region : "\(number) · \(region)"
                     let highlighted = isTarget && selectedSlot == slot
                     let receivingDrop = dropTarget == DropTarget(displayID: tile.screen.id, slot: slot)
-                    let assigned = active.flatMap { $0.indices.contains(slot) ? $0[slot] : nil }
-                    let detail = !occupied ? (isTarget && names.indices.contains(slot) ? names[slot] : (active == nil ? nil : L("桌面已拆分"))) : (assigned?.appName ?? L("分屏中"))
-                    let title = assigned?.title ?? (isTarget && titles.indices.contains(slot) ? titles[slot] : nil)
+                    let activeWindow = active.flatMap { $0.indices.contains(slot) ? $0[slot] : nil }
+                    let assigned = activeWindow ?? (isTarget && selected.indices.contains(slot) ? selected[slot] : nil)
+                    let detail = assigned?.name ?? (isTarget ? L("未选窗口") : (active == nil ? nil : L("桌面已拆分")))
                     button.attributedTitle = Self.caption(position, detail: detail)
                     let fill = highlighted ? selection : NSColor.controlBackgroundColor
                     button.layer?.backgroundColor = (receivingDrop ? dropFill : fill).cgColor
                     button.layer?.borderWidth = receivingDrop ? 2 : 0
                     button.layer?.borderColor = accent.cgColor
                     button.isEnabled = enabled && !occupied
-                    button.setAccessibilityLabel([tile.screen.displayName, position, detail].compactMap { $0 }.joined(separator: "，"))
-                    button.setAccessibilityHelp(!occupied ? (highlighted ? L("当前选中") : L("可选择窗口")) : L("快捷分屏中"))
-                    button.toolTip = [tile.screen.menuTitle, position, title?.isEmpty == false ? title : detail]
+                    button.setAccessibilitySelected(highlighted)
+                    button.setAccessibilityLabel([tile.screen.displayName, position, assigned?.appName,
+                                                  assigned?.title.isEmpty == false ? assigned?.title : (assigned == nil ? detail : nil)]
+                        .compactMap { $0 }.joined(separator: ", "))
+                    button.setAccessibilityHelp(occupied ? L("快捷分屏中") : highlighted ? L("当前选窗分区") : L("可选择窗口"))
+                    button.toolTip = [tile.screen.menuTitle, position, detail]
                         .compactMap { $0 }.joined(separator: " · ")
                 }
             }
@@ -757,6 +1001,11 @@ private final class CardDragPreview: NSImageView {
 private final class SplitPanelWindow: NSPanel {
     var onEscape: (() -> Void)?
     var onReturn: (() -> Void)?
+    weak var searchField: NSSearchField?
+
+    // Keep the panel available in other apps' full-screen Spaces. Its own green
+    // button just resizes the picker within the current display.
+    override func toggleFullScreen(_ sender: Any?) { zoom(sender) }
 
     override func cancelOperation(_ sender: Any?) {
         onEscape?()
@@ -764,8 +1013,8 @@ private final class SplitPanelWindow: NSPanel {
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
         let modifiers = event.modifierFlags.intersection([.command, .control, .option, .shift])
-        if modifiers.isEmpty, let key = event.charactersIgnoringModifiers, key == "\r" || key == "\u{3}" {
-            if (firstResponder as? NSTextView)?.hasMarkedText() == true { return super.performKeyEquivalent(with: event) }
+        if modifiers.isEmpty, let editor = firstResponder as? NSTextView, editor === searchField?.currentEditor(),
+           !editor.hasMarkedText(), let key = event.charactersIgnoringModifiers, key == "\r" || key == "\u{3}" {
             if !event.isARepeat { onReturn?() }
             return true
         }

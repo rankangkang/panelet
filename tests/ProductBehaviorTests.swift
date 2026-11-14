@@ -15,11 +15,13 @@ struct ProductBehaviorTests {
         preferences.guideRestartPending = true
         let relaunched = ProductPreferences(defaults: defaults)
         relaunched.prepareGuide(permissionsReady: true, hasExistingPreferences: true)
-        assert(relaunched.guideStep == .layout && !relaunched.guideDeferred && !relaunched.guideRestartPending)
+        assert(relaunched.guideStep == .ready && !relaunched.guideDeferred && !relaunched.guideRestartPending)
         relaunched.guideRestartPending = true
         relaunched.prepareGuide(permissionsReady: false, hasExistingPreferences: true)
         assert(relaunched.guideStep == .permissions, "A restart must not assume permission was granted")
-        relaunched.guideStep = .complete
+        assert(!relaunched.finishGuide(permissionsReady: false), "Missing permissions must keep setup open")
+        assert(relaunched.guideStep == .permissions)
+        assert(relaunched.finishGuide(permissionsReady: true), "Setup can finish as soon as permissions are ready")
         relaunched.prepareGuide(permissionsReady: true, hasExistingPreferences: true)
         assert(relaunched.guideStep == .complete)
         relaunched.prepareGuide(permissionsReady: false, hasExistingPreferences: true)
@@ -30,6 +32,12 @@ struct ProductBehaviorTests {
         defaults.removeObject(forKey: "guide.step")
         relaunched.prepareGuide(permissionsReady: false, hasExistingPreferences: true)
         assert(relaunched.guideStep == .permissions)
+        defaults.set("layout", forKey: "guide.step")
+        relaunched.prepareGuide(permissionsReady: true, hasExistingPreferences: true)
+        assert(relaunched.guideStep == .ready, "An unfinished guide upgrades to the optional trial")
+        defaults.set("layout", forKey: "guide.step")
+        relaunched.prepareGuide(permissionsReady: false, hasExistingPreferences: true)
+        assert(relaunched.guideStep == .permissions, "Migrating old progress must recheck permissions")
         var configuration = DisplayConfiguration()
         configuration.direction = .vertical
         configuration.ratio = .firstLarger

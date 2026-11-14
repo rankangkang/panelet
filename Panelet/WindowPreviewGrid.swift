@@ -27,46 +27,37 @@ final class WindowPreviewGrid: NSScrollView, NSCollectionViewDataSource {
 
     private let collection = NSCollectionView()
     private let clock = ContinuousClock()
-    private static let cardHeight: CGFloat = 150
-    private static let spacing: CGFloat = 8
-    private lazy var viewportHeight = heightAnchor.constraint(equalToConstant: Self.height(rows: 2))
     private var choices: [WindowPlacement.Choice] = []
     private var previews: [WindowPlacement.Choice.ID: Preview] = [:]
     private var refreshTask: Task<Void, Never>?
 
-    init(width: CGFloat) {
-        super.init(frame: NSRect(x: 0, y: 0, width: width, height: Self.height(rows: 2)))
-        let layout = NSCollectionViewFlowLayout()
-        // Keep two columns even when AppKit reserves space for a vertical scroller.
-        let gutter = NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy) + 6
-        layout.itemSize = NSSize(width: floor((width - Self.spacing - 12 - gutter) / 2), height: Self.cardHeight)
-        layout.minimumLineSpacing = Self.spacing
-        layout.minimumInteritemSpacing = Self.spacing
-        layout.sectionInset = NSEdgeInsets(top: 2, left: 2, bottom: 2, right: 10)
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        let layout = NSCollectionViewGridLayout()
+        layout.minimumLineSpacing = 8
+        layout.minimumInteritemSpacing = 8
+        layout.margins = NSEdgeInsets(top: 2, left: 2, bottom: 2, right: 6)
+        layout.minimumItemSize = NSSize(width: 208, height: 150)
+        layout.maximumItemSize = NSSize(width: 312, height: 150)
         collection.collectionViewLayout = layout
         collection.dataSource = self
         collection.backgroundColors = [.clear]
         collection.register(WindowPreviewCard.self, forItemWithIdentifier: WindowPreviewCard.reuseID)
         collection.setAccessibilityLabel(L("可分屏的窗口"))
         collection.setAccessibilityEnabled(true)
+        collection.autoresizingMask = [.width]
         documentView = collection
         drawsBackground = false
         hasVerticalScroller = true
-        autohidesScrollers = false
+        autohidesScrollers = true
         scrollerStyle = .legacy
-        viewportHeight.isActive = true
     }
 
     required init?(coder: NSCoder) { nil }
 
-    private static func height(rows: Int) -> CGFloat { CGFloat(rows) * cardHeight + CGFloat(rows - 1) * spacing + 4 }
-
-    func show(_ choices: [WindowPlacement.Choice], highlightFirst: Bool, loading: Bool) {
+    func show(_ choices: [WindowPlacement.Choice], highlightFirst: Bool) {
         self.choices = choices
         highlightedIndex = highlightFirst && !choices.isEmpty ? 0 : nil
-        isHidden = choices.isEmpty && !loading
-        viewportHeight.constant = Self.height(rows: loading || choices.count > 2 ? 2 : 1)
-        hasVerticalScroller = choices.count > 4
         collection.reloadData()
         contentView.scroll(to: .zero)
         reflectScrolledClipView(contentView)
@@ -76,11 +67,16 @@ final class WindowPreviewGrid: NSScrollView, NSCollectionViewDataSource {
         guard isEnabled, !choices.isEmpty else { return }
         let next = highlightedIndex.map { min(max(0, $0 + direction), choices.count - 1) } ?? 0
         highlightedIndex = next
-        let path = IndexPath(item: next, section: 0)
+        revealHighlight()
+        for card in visibleCards { card.button.isCurrent = card.button.tag == next }
+    }
+
+    func revealHighlight() {
+        guard let index = highlightedIndex else { return }
+        let path = IndexPath(item: index, section: 0)
         if let frame = collection.layoutAttributesForItem(at: path)?.frame, !collection.visibleRect.contains(frame) {
             collection.scrollToItems(at: [path], scrollPosition: .nearestVerticalEdge)
         }
-        for card in visibleCards { card.button.isCurrent = card.button.tag == next }
     }
 
     func setPreviewing(_ enabled: Bool) {
@@ -283,7 +279,12 @@ private final class PreviewButton: NSButton {
     private var pressPoint: NSPoint?
     private var hasStartedDrag = false
     var isCurrent = false {
-        didSet { if oldValue != isCurrent { needsDisplay = true } }
+        didSet {
+            guard oldValue != isCurrent else { return }
+            setAccessibilitySelected(isCurrent)
+            setAccessibilityHelp(isCurrent ? L("按回车选择此窗口") : nil)
+            needsDisplay = true
+        }
     }
 
     override func hitTest(_ point: NSPoint) -> NSView? { super.hitTest(point) == nil ? nil : self }

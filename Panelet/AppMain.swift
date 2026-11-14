@@ -27,7 +27,7 @@ enum DemoMain {
 }
 
 @MainActor
-final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
+final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate, NSMenuItemValidation {
     private let splits = SplitSessions()
     private var environment = EnvironmentCheck.inspect()
     private let environmentLabel = NSTextField(wrappingLabelWithString: "")
@@ -55,12 +55,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private var settingsPages: [NSView] = []
     private var settingsNavigation: [NSButton] = []
     private let layoutPreview = SettingsLayoutPreview()
+    private let layoutLock = NSTextField(wrappingLabelWithString: L("合并桌面后可更改布局"))
     private var recordPermissionButton: NSButton!
     private var accessPermissionButton: NSButton!
     private var statusLabel: NSTextField!
     private var splitButton: NSButton!
-    private var joinButton: NSButton!
-    private var endPairButton: NSButton!
+    private var restoreButton: NSButton!
+    private var mergeButton: NSButton!
+    private var retryRecoveryButton: NSButton!
+    private var restoreAllButton: NSButton!
+    private let recoveryStatus = NSTextField(wrappingLabelWithString: "")
     private var screenRecordingLabel: NSTextField!
     private var accessibilityLabel: NSTextField!
     private var spacesLabel: NSTextField!
@@ -70,7 +74,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private var closing = false
     private var allowIncompleteExit = false
     private var quitDeadline: Task<Void, Never>?
-    private var confirming = false
+    private var confirmationAlert: NSAlert?
+    private var confirming: Bool { confirmationAlert != nil }
     private var confirmationPanel: NSPanel?
     private var shouldRelaunch = false
     private let shortcuts = GlobalShortcuts()
@@ -91,23 +96,28 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private var previousApp: NSRunningApplication?
     private var guideWindow: NSWindow?
     private var guideBody: NSStackView?
+    private var guideScroll: NSScrollView?
     private var guidePrimary: NSButton?
     private var guideBack: NSButton?
     private var guideProgress: NSTextField?
     private var guideDisplayID: CGDirectDisplayID?
     private var guideDrafts: [String: DisplayConfiguration] = [:]
+    private var guideTrialConfiguration: (uuid: String, configuration: DisplayConfiguration)?
     private var guidePendingDisplayID: CGDirectDisplayID?
     private var guideMessage: String?
     private var guideSignature = ""
     private var guideRequestedPermission = false
+    private var guideShowingTrial = false
+    private var guideTrialPreview: SettingsLayoutPreview?
+    private var guideTrialWarning: NSTextField?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buildWindow()
         buildMenu()
         buildStatusItem()
-        quick.onAdvanced = { [weak self] in self?.showAdvanced() }
+        quick.onAdvanced = { [weak self] in self?.showQuickSettings() }
         quick.onCancel = { [weak self] in self?.dismissQuick() }
-        quick.onJoin = { [weak self] in self?.chooseJoin() }
+        quick.onJoin = { [weak self] in self?.chooseRestore() }
         quick.onSplit = { [weak self] id, pair in self?.splitQuick(displayID: id, pair: pair) }
         DemoLog.shared.onLine = { [weak self] line in
             self?.appendLog(line)
@@ -197,7 +207,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         restore.target = self
         let settings = commands.addItem(withTitle: L("设置…"), action: #selector(showAdvanced), keyEquivalent: ",")
         settings.target = self
-        let join = commands.addItem(withTitle: L("还原分屏…"), action: #selector(chooseJoin), keyEquivalent: "")
+        let join = commands.addItem(withTitle: L("还原分屏…"), action: #selector(chooseRestore), keyEquivalent: "")
         join.target = self
         joinMenuItem = join
         let retry = commands.addItem(withTitle: L("重试恢复窗口…"), action: #selector(retryRecovery), keyEquivalent: "")
@@ -223,7 +233,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         let desktop = menu.addItem(withTitle: L("拆分桌面"), action: nil, keyEquivalent: "")
         desktop.submenu = desktopMenu
         menu.delegate = self
-        let join = menu.addItem(withTitle: L("还原分屏…"), action: #selector(chooseJoin), keyEquivalent: "")
+        let join = menu.addItem(withTitle: L("还原分屏…"), action: #selector(chooseRestore), keyEquivalent: "")
         join.target = self
         let settings = menu.addItem(withTitle: L("设置…"), action: #selector(showAdvanced), keyEquivalent: "")
         settings.target = self
@@ -254,27 +264,37 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         desktopMenu.removeAllItems()
         let screens = splits.screens().sorted { $0.id < $1.id }
         for (index, screen) in screens.enumerated() {
-            let session = splits.sessions[screen.id]
-            let action = session?.active == true ? L("合并为整块显示器") : L("%@拆分", String(describing: screen.splitLayout.direction))
+            guard splits.sessions[screen.id] == nil else { continue }
+            let action = L("%@拆分", String(describing: screen.splitLayout.direction))
             let item = desktopMenu.addItem(withTitle: "\(index + 1) · \(screen.menuTitle) · \(action)",
                                            action: #selector(desktopMenuClicked(_:)), keyEquivalent: "")
             item.target = self
             item.representedObject = NSNumber(value: screen.id)
-            item.isEnabled = !splits.busy && !closing && !confirming &&
-                (session?.active == true || (session == nil && splitProblem == nil))
+            item.isEnabled = operationsAvailable && splitProblem == nil
         }
         desktopMenu.autoenablesItems = false
-        if screens.isEmpty {
-            let item = desktopMenu.addItem(withTitle: L("没有可用显示器"), action: nil, keyEquivalent: "")
+        if desktopMenu.items.isEmpty {
+            let title = screens.isEmpty ? L("没有可用显示器") : L("没有可拆分的显示器")
+            let item = desktopMenu.addItem(withTitle: title, action: nil, keyEquivalent: "")
             item.isEnabled = false
         }
     }
 
     @objc private func desktopMenuClicked(_ sender: NSMenuItem) {
-        guard !splits.busy, !closing, !confirming,
-              let id = (sender.representedObject as? NSNumber)?.uint32Value else { return }
-        if splits.sessions[id]?.active == true { splits.join(id) }
-        else if splitProblem == nil { splits.split(id) }
+        guard operationsAvailable, splitProblem == nil,
+              let id = (sender.representedObject as? NSNumber)?.uint32Value,
+              splits.sessions[id] == nil else { return }
+        splits.split(id)
+    }
+
+    func validateMenuItem(_ item: NSMenuItem) -> Bool {
+        switch item.action {
+        case #selector(openQuick): return operationsAvailable
+        case #selector(chooseRestore): return operationsAvailable && !splits.active.isEmpty
+        case #selector(retryRecovery): return operationsAvailable && hasPendingRecovery
+        case #selector(restoreAll): return canRestoreAll
+        default: return true
+        }
     }
 
     private func buildWindow() {
@@ -342,27 +362,21 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         popup.target = self
         popup.action = #selector(displayChanged)
         popup.setAccessibilityLabel(L("目标显示器"))
-        popup.widthAnchor.constraint(equalToConstant: 444).isActive = true
         statusLabel = settingsText(L("未拆分"), size: 12, secondary: true)
         splitButton = button(L("拆分桌面"), action: #selector(splitClicked))
         splitButton.bezelColor = .controlAccentColor
-        joinButton = button(L("合并桌面…"), action: #selector(joinClicked))
-        endPairButton = button(L("结束窗口组合，保留独立桌面"), action: #selector(endSelectedPair))
-        endPairButton.isHidden = true
-        let actions = NSStackView(views: [splitButton, joinButton])
+        restoreButton = button(L("合并桌面…"), action: #selector(restoreSelectedDisplay))
+        restoreButton.bezelColor = .controlAccentColor
+        mergeButton = button(L("合并桌面…"), action: #selector(mergeSelectedDisplay))
+        let actions = NSStackView(views: [splitButton, restoreButton, mergeButton, NSView()])
         actions.spacing = 10
-        layoutPreview.heightAnchor.constraint(equalToConstant: 130).isActive = true
-        layoutPreview.widthAnchor.constraint(equalToConstant: 444).isActive = true
-        directionPicker.addItems(withTitles: DisplayConfiguration.Direction.allCases.map(\.title))
-        ratioPicker.addItems(withTitles: DisplayConfiguration.Ratio.allCases.map(\.title))
+        let layout = layoutEditor(preview: layoutPreview, direction: directionPicker, ratio: ratioPicker)
         renderingPicker.addItems(withTitles: DisplayConfiguration.Rendering.allCases.map(\.title))
         for picker in [directionPicker, ratioPicker, renderingPicker] {
             picker.target = self
             picker.action = #selector(saveDisplayPreferences)
-            picker.widthAnchor.constraint(equalToConstant: 130).isActive = true
         }
-        directionPicker.setAccessibilityLabel(L("分屏方向"))
-        ratioPicker.setAccessibilityLabel(L("分区比例"))
+        renderingPicker.widthAnchor.constraint(equalToConstant: 130).isActive = true
         renderingPicker.setAccessibilityLabel(L("画面模式"))
         displayAlias.placeholderString = L("使用系统名称")
         displayAlias.widthAnchor.constraint(equalToConstant: 180).isActive = true
@@ -372,13 +386,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         layoutDetail.font = .systemFont(ofSize: 11)
         layoutDetail.textColor = .secondaryLabelColor
         layoutDetail.preferredMaxLayoutWidth = 408
+        layoutLock.font = .systemFont(ofSize: 11)
+        layoutLock.textColor = .secondaryLabelColor
         let desktop = settingsPage(L("桌面分屏"), subtitle: L("让一块显示器，拥有两个独立的工作空间。"), views: [
-            settingsCard([settingsText(L("目标显示器"), size: 12, weight: .semibold), popup, layoutPreview, statusLabel, actions, endPairButton]),
+            settingsCard([settingsText(L("目标显示器"), size: 12, weight: .semibold), popup, layout, layoutDetail, layoutLock, statusLabel, actions]),
             settingsCard([
-                settingsRow(L("分屏方向"), detail: L("自动跟随显示器方向"), control: directionPicker),
-                settingsRow(L("分区比例"), detail: L("合并桌面后可更改布局"), control: ratioPicker),
                 settingsRow(L("画面模式"), detail: L("清晰优先保留原生缩放；流畅优先降低分辨率"), control: renderingPicker),
-                layoutDetail,
                 settingsRow(L("显示器名称"), detail: L("仅保存在本机，按回车保存"), control: displayAlias),
                 button(L("识别显示器"), action: #selector(identifyDisplays))]),
             settingsCard([settingsRow(L("临时组合两个窗口"), detail: L("选好窗口后分别全屏，退出全屏即可还原。"),
@@ -393,7 +406,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             recorder.tag = command.rawValue
             shortcutButtons[command] = recorder
             shortcutRows.append(settingsRow(command.title,
-                detail: command == .toggle ? L("随时呼出窗口选择面板") : L("还原鼠标所在的分屏"), control: recorder))
+                detail: command == .toggle ? L("随时呼出窗口选择面板") : L("结束窗口组合，或合并鼠标所在的拆分桌面"), control: recorder))
         }
         shortcutInfo.font = .systemFont(ofSize: 12)
         shortcutInfo.textColor = .secondaryLabelColor
@@ -425,15 +438,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         scroll.hasVerticalScroller = true
         scroll.documentView = logView
         scroll.heightAnchor.constraint(equalToConstant: 150).isActive = true
-        scroll.widthAnchor.constraint(equalToConstant: 444).isActive = true
         logView.setAccessibilityLabel(L("运行日志"))
         environmentLabel.font = .systemFont(ofSize: 12)
         environmentLabel.preferredMaxLayoutWidth = 408
         environmentLabel.stringValue = environment.summary
+        retryRecoveryButton = button(L("重试恢复窗口…"), action: #selector(retryRecovery))
+        restoreAllButton = button(L("恢复所有显示器…"), action: #selector(restoreAll))
+        recoveryStatus.textColor = .secondaryLabelColor
+        recoveryStatus.font = .systemFont(ofSize: 12)
+        recoveryStatus.preferredMaxLayoutWidth = 408
         let diagnostics = settingsPage(L("诊断"), subtitle: L("查看运行状态，在需要时恢复窗口。"), views: [
             settingsCard([settingsRow(L("运行环境"), detail: L("只读检测，不会开始分屏或移动窗口。"), control: button(L("重新检测"), action: #selector(checkEnvironment))), environmentLabel]),
             settingsCard([settingsRow(L("运行日志"), detail: L("本次启动的显示器与分屏记录。"), control: button(L("预览诊断报告…"), action: #selector(copySettingsLog))), scroll]),
-            settingsCard([settingsRow(L("窗口恢复"), detail: L("分屏中断或窗口未归位时使用。"), control: button(L("重试恢复…"), action: #selector(retryRecovery))), button(L("恢复所有显示器…"), action: #selector(restoreAll))])
+            settingsCard([settingsRow(L("窗口恢复"), detail: L("分屏中断或窗口未归位时使用。"), control: retryRecoveryButton), recoveryStatus, restoreAllButton])
         ])
         launchPanel.target = self
         launchPanel.action = #selector(saveGeneralPreferences)
@@ -460,20 +477,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                           button(L("重新查看导引…"), action: #selector(restartGuide)),
                           button(L("关于 Panelet…"), action: #selector(showAbout))])
         ])
-        settingsPages = [desktop, keys, permissions, diagnostics, general].map { page in
-            let scroll = NSScrollView()
-            scroll.hasVerticalScroller = true
-            scroll.autohidesScrollers = true
-            scroll.drawsBackground = false
-            page.translatesAutoresizingMaskIntoConstraints = false
-            scroll.documentView = page
-            NSLayoutConstraint.activate([
-                page.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
-                page.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
-                page.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor)
-            ])
-            return scroll
-        }
+        settingsPages = [desktop, keys, permissions, diagnostics, general]
         for page in settingsPages {
             page.translatesAutoresizingMaskIntoConstraints = false
             root.addSubview(page)
@@ -496,17 +500,87 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         return label
     }
 
-    private func settingsPage(_ title: String, subtitle: String, views: [NSView]) -> NSStackView {
-        let heading = settingsText(title, size: 25, weight: .bold)
-        let detail = settingsText(subtitle, size: 13, secondary: true)
-        let stack = NSStackView(views: [heading, detail] + views)
+    private func sectionHeading(_ title: String, detail: String) -> NSStackView {
+        let stack = NSStackView(views: [settingsText(title, size: 25, weight: .bold),
+                                      settingsText(detail, secondary: true)])
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 6
+        return stack
+    }
+
+    private func settingsPage(_ title: String, subtitle: String, views: [NSView]) -> NSView {
+        let page = NSView()
+        let header = sectionHeading(title, detail: subtitle)
+        let stack = NSStackView(views: views)
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 16
-        stack.setCustomSpacing(6, after: heading)
-        stack.setCustomSpacing(24, after: detail)
         for view in views where view is NSBox { view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true }
-        return stack
+        let scroll = topAlignedScroll(stack)
+        for view in [header, scroll] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            page.addSubview(view)
+            NSLayoutConstraint.activate([
+                view.leadingAnchor.constraint(equalTo: page.leadingAnchor),
+                view.trailingAnchor.constraint(equalTo: page.trailingAnchor)
+            ])
+        }
+        NSLayoutConstraint.activate([
+            header.topAnchor.constraint(equalTo: page.topAnchor),
+            scroll.topAnchor.constraint(equalTo: header.bottomAnchor, constant: 24),
+            scroll.bottomAnchor.constraint(equalTo: page.bottomAnchor)
+        ])
+        return page
+    }
+
+    private func topAlignedScroll(_ body: NSView, insets: NSEdgeInsets = NSEdgeInsets(top: 0, left: 0, bottom: 12, right: 0)) -> NSScrollView {
+        let scroll = NSScrollView()
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+        let document = FlippedDocumentView()
+        document.translatesAutoresizingMaskIntoConstraints = false
+        scroll.documentView = document
+        body.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(body)
+        NSLayoutConstraint.activate([
+            document.leadingAnchor.constraint(equalTo: scroll.contentView.leadingAnchor),
+            document.topAnchor.constraint(equalTo: scroll.contentView.topAnchor),
+            document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            body.topAnchor.constraint(equalTo: document.topAnchor, constant: insets.top),
+            body.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: insets.left),
+            body.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -insets.right),
+            body.bottomAnchor.constraint(equalTo: document.bottomAnchor, constant: -insets.bottom)
+        ])
+        return scroll
+    }
+
+    private func layoutEditor(preview: SettingsLayoutPreview, direction: NSPopUpButton, ratio: NSPopUpButton) -> NSStackView {
+        let directionTitle = L("分屏方向")
+        let ratioTitle = L("分区比例")
+        direction.addItems(withTitles: DisplayConfiguration.Direction.allCases.map(\.title))
+        direction.setAccessibilityLabel(directionTitle)
+        ratio.addItems(withTitles: DisplayConfiguration.Ratio.allCases.map(\.title))
+        ratio.setAccessibilityLabel(ratioTitle)
+        let fields = NSStackView(views: [
+            settingsText(directionTitle, size: 12, weight: .semibold), direction,
+            settingsText(ratioTitle, size: 12, weight: .semibold), ratio
+        ])
+        fields.orientation = .vertical
+        fields.alignment = .leading
+        fields.spacing = 6
+        fields.setCustomSpacing(12, after: direction)
+        NSLayoutConstraint.activate([
+            fields.widthAnchor.constraint(equalToConstant: 136),
+            direction.widthAnchor.constraint(equalTo: fields.widthAnchor),
+            ratio.widthAnchor.constraint(equalTo: fields.widthAnchor),
+            preview.heightAnchor.constraint(equalToConstant: 136)
+        ])
+        let row = NSStackView(views: [fields, preview])
+        row.alignment = .centerY
+        row.spacing = 18
+        return row
     }
 
     private func settingsCard(_ views: [NSView]) -> NSBox {
@@ -532,6 +606,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16)
         ])
+        for view in views where view is NSPopUpButton || view is NSScrollView || (view as? NSStackView)?.orientation == .horizontal {
+            view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        }
         return box
     }
 
@@ -543,7 +620,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         let row = NSStackView(views: [labels, NSView(), control])
         row.alignment = .centerY
         row.spacing = 12
-        row.widthAnchor.constraint(equalToConstant: 444).isActive = true
         control.setContentCompressionResistancePriority(.required, for: .horizontal)
         return row
     }
@@ -599,7 +675,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private func refresh() {
         splits.checkActive()
         if !splits.busy {
-            if quick.isVisible { quick.setProblem(splitProblem) }
+            if quick.isVisible { quick.setProblem(splitProblem, actionTitle: quickSettingsTitle) }
             let screens = splits.screens()
             let key = screens.map { "\($0.id):\($0.bounds):\(splits.sessions[$0.id]?.active == true):\(splits.sessions[$0.id]?.hasQuick == true):\(splits.sessions[$0.id]?.needsRecovery == true)" }.joined(separator: "|")
             if key != lastScreenKey {
@@ -647,6 +723,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         let id = selectedDisplayID()
         let session = id.flatMap { splits.sessions[$0] }
         layoutPreview.screen = displays.first { $0.id == id }
+        layoutDetail.isHidden = id == nil
+        layoutLock.isHidden = session?.active != true
         if let screen = layoutPreview.screen {
             let configuration = session?.configuration ?? screen.configuration
             directionPicker.selectItem(at: DisplayConfiguration.Direction.allCases.firstIndex(of: configuration.direction) ?? 0)
@@ -657,39 +735,64 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                 aliasDisplayID = id
             }
             let sizes = screen.splitLayout.regions.map { "\(Int($0.width))×\(Int($0.height))" }.joined(separator: " / ")
-            layoutDetail.stringValue = L("分区尺寸：%@ 点。", String(describing: sizes)) + (screen.splitLayout.smallRegionWarning ?? "")
+            layoutDetail.stringValue = [L("分区尺寸：%@ 点。", sizes), screen.splitLayout.smallRegionWarning]
+                .compactMap { $0 }.joined(separator: "\n")
         }
         for control in [directionPicker, ratioPicker, renderingPicker, displayAlias] as [NSControl] {
             control.isEnabled = id != nil && session == nil && !splits.busy && !restoringAll
         }
         splitButton.title = layoutPreview.screen.map { L("%@拆分桌面", String(describing: $0.splitLayout.direction)) } ?? L("拆分桌面")
+        let hasRecovery = hasPendingRecovery
         let problem = splitProblem
         if let transition = splits.transition {
             statusLabel.stringValue = "\(transition.name) · \(transition.status)"
         } else {
             statusLabel.stringValue = session?.status ?? id.flatMap { displayMessages[$0] } ?? problem ?? L("未拆分")
         }
-        let available = !splits.busy && !closing && !confirming && !restoringAll
-        endPairButton.isHidden = session?.hasQuick != true
-        endPairButton.isEnabled = available && session?.hasQuick == true
-        endPairButton.title = session?.mode == .desktop ? L("结束窗口组合，保留独立桌面") : L("结束组合并还原桌面")
-        splitButton.isEnabled = id != nil && problem == nil && available && session == nil
-        popup.isEnabled = id != nil && available
-        joinButton.title = L("合并为整块显示器…")
-        joinButton.isEnabled = available && session?.active == true
+        let activeSession = session.flatMap { $0.active ? $0 : nil }
+        let restore = activeSession.map { RestoreAction(session: $0) }
+        splitButton.isHidden = session != nil
+        splitButton.isEnabled = id != nil && problem == nil && operationsAvailable && session == nil
+        popup.isEnabled = id != nil && operationsAvailable
+        restoreButton.isHidden = restore == nil
+        restoreButton.isEnabled = operationsAvailable && restore != nil
+        if let restore { restoreButton.title = restore.menuTitle }
+        mergeButton.isHidden = restore != .endPair
+        mergeButton.isEnabled = operationsAvailable && restore == .endPair
+        retryRecoveryButton.isEnabled = operationsAvailable && hasRecovery
+        restoreAllButton.isEnabled = canRestoreAll
+        if splits.recovering { recoveryStatus.stringValue = L("正在恢复显示器和窗口…") }
+        else if restoringAll, let transition = splits.transition { recoveryStatus.stringValue = transition.status }
+        else {
+            recoveryStatus.stringValue = splits.recoveryProblem ?? splits.sessions.values.first(where: \.needsRecovery)?.status ?? L("没有待恢复的窗口。")
+        }
+
+        let restoreActions = splits.active.map { RestoreAction(session: $0) }
+        let restoreTitle = restoreActions.first.map { first in
+            restoreActions.allSatisfy { $0 == first } ? first.menuTitle : L("还原分屏…")
+        }
         let action = L("快捷窗口分屏…")
         statusAction?.title = shortcuts.isRegistered(.toggle) ? "\(action)  \(shortcuts.key(for: .toggle).label)" : action
-        statusAction?.isEnabled = available
-        statusJoin?.isEnabled = available && !splits.active.isEmpty
-        joinMenuItem?.isEnabled = statusJoin?.isEnabled == true
+        statusAction?.isEnabled = operationsAvailable
+        for item in [statusJoin, joinMenuItem] {
+            item?.title = restoreTitle ?? L("还原分屏…")
+            item?.isEnabled = operationsAvailable && restoreTitle != nil
+        }
+        quick.setRestoreTitle(restoreTitle, enabled: operationsAvailable)
     }
 
     private var activePairs: [CGDirectDisplayID: [WindowPlacement.Choice]] {
         Dictionary(uniqueKeysWithValues: splits.active.map { ($0.targetID, $0.selectedChoices) })
     }
 
+    private var operationsAvailable: Bool { !splits.busy && !closing && !confirming && !restoringAll }
+
+    private var hasPendingRecovery: Bool { splits.recoveryProblem != nil || splits.sessions.values.contains(where: \.needsRecovery) }
+
+    private var canRestoreAll: Bool { !closing && !confirming && !restoringAll && (!splits.sessions.isEmpty || hasPendingRecovery) }
+
     private var splitProblem: String? {
-        splits.recoveryProblem ?? (splits.sessions.values.contains(where: \.needsRecovery)
+        splits.recoveryProblem ?? (hasPendingRecovery
             ? L("有分屏尚未完全恢复，请先从菜单选择“重试恢复窗口…”。") : environment.problem ?? Permissions.splitProblem)
     }
 
@@ -702,7 +805,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     private func showQuick() {
-        guard !splits.busy, !closing, !confirming else { return }
+        guard operationsAvailable else { return }
         if Permissions.splitProblem != nil {
             preferences.guideStep = .permissions
             showGuide(resume: true)
@@ -721,7 +824,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         }
         window.orderOut(nil)
         quick.show(screens: screens, displayID: preferred, host: host,
-                   activePairs: activePairs, recentPairs: recentPairs, excluded: managedWindows, problem: splitProblem)
+                   activePairs: activePairs, recentPairs: recentPairs, excluded: managedWindows,
+                   problem: splitProblem, settingsTitle: quickSettingsTitle)
     }
 
     private func dismissQuick() {
@@ -742,6 +846,19 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     @objc private func openQuick() { showQuick() }
 
+    private var quickSettingsTitle: String {
+        if hasPendingRecovery { return L("查看恢复…") }
+        if environment.problem != nil { return L("查看诊断…") }
+        if Permissions.splitProblem != nil { return L("检查权限…") }
+        return L("设置…")
+    }
+
+    private func showQuickSettings() {
+        showAdvanced()
+        if hasPendingRecovery || environment.problem != nil { selectSettingsPage(settingsNavigation[3]) }
+        else if Permissions.splitProblem != nil { selectSettingsPage(settingsNavigation[2]) }
+    }
+
     @objc private func showAdvanced() {
         guard !confirming else { return }
         guideWindow?.orderOut(nil)
@@ -759,27 +876,41 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     private func splitQuick(displayID: CGDirectDisplayID, pair: WindowPlacement.Pair) {
-        guard !splits.busy, splitProblem == nil, !confirming, !closing, (splits.sessions[displayID] == nil || splits.sessions[displayID]?.canStartQuick == true) else { return }
+        guard operationsAvailable, splitProblem == nil, (splits.sessions[displayID] == nil || splits.sessions[displayID]?.canStartQuick == true) else { return }
         pendingQuick = (displayID, pair)
         splits.split(displayID, pair: pair)
+        if pendingQuick != nil && !splits.busy {
+            pendingQuick = nil
+            checkEnvironment()
+            quick.showFailure(L("未能开始分屏，请检查运行环境或重新选择显示器。"), host: splits.hostScreen(at: nil))
+        }
     }
 
     private func sessionChanged(_ session: Session) {
         let wasGuideRequest = guidePendingDisplayID == session.targetID
-        if wasGuideRequest {
-            if session.active && !session.failed && !session.needsRecovery {
+        if wasGuideRequest && (session.idle || session.active) {
+            let succeeded = session.active && !session.failed && !session.needsRecovery
+            if succeeded {
+                if let draft = guideTrialConfiguration {
+                    preferences.save(draft.configuration, for: draft.uuid)
+                    guideDrafts[draft.uuid] = nil
+                    lastScreenKey = ""
+                }
                 guidePendingDisplayID = nil
-                preferences.guideStep = .complete
                 guideMessage = nil
-                renderGuide()
-            } else if session.failed || session.idle {
+                guideShowingTrial = false
+                preferences.finishGuide(permissionsReady: Permissions.splitProblem == nil)
+            } else {
                 guidePendingDisplayID = nil
                 guideMessage = session.status
-                renderGuide()
             }
+            guideTrialConfiguration = nil
+            renderGuide()
         }
         if session.idle || session.active { displayMessages[session.targetID] = session.status }
         applySessionState()
+        let wasQuickRequest = pendingQuick?.displayID == session.targetID
+        var quickFailed = false
         if let request = pendingQuick, request.displayID == session.targetID {
             if session.active && session.hasQuick && !session.failed && !session.needsRecovery {
                 recentPairs[request.displayID] = request.pair
@@ -791,12 +922,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                 quick.setSessionState(busy: !session.idle && !session.active, canCancel: session.preparing, message: session.status)
                 if session.idle || session.active {
                     pendingQuick = nil
-                    if session.failed && !quick.isVisible && !window.isVisible && !closing { quick.showFailure() }
+                    quickFailed = session.failed || session.needsRecovery
                 }
             }
         }
         if !splits.busy { refresh() }
-        if session.failed && pendingQuick == nil && !wasGuideRequest && !closing && !restoringAll { showAdvanced() }
+        if quickFailed && operationsAvailable && !window.isVisible {
+            quick.updateDisplays(splits.screens(), activePairs: activePairs, excluded: managedWindows)
+            quick.setProblem(splitProblem, actionTitle: quickSettingsTitle)
+            quick.showFailure(session.status, host: splits.hostScreen(at: nil))
+        } else if session.failed && pendingQuick == nil && !wasQuickRequest && !wasGuideRequest && operationsAvailable {
+            showAdvanced()
+        }
         if restoringAll && !splits.busy { continueRestoringAll() }
         if closing && !splits.busy && !confirming { finishQuit() }
     }
@@ -893,85 +1030,112 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     @objc private func displayChanged() { applySessionState() }
 
-    @objc private func endSelectedPair() {
-        guard let id = selectedDisplayID(), splits.sessions[id]?.hasQuick == true,
-              !confirming, !closing, !restoringAll else { return }
-        splits.endQuick(id)
-    }
-
     @objc private func splitClicked() {
-        guard !confirming, !closing, let id = selectedDisplayID() else {
-            DemoLog.shared.line(L("先接上一块显示器。"))
-            return
-        }
+        guard operationsAvailable, splitProblem == nil, let id = selectedDisplayID(), splits.sessions[id] == nil else { return }
         splits.split(id)
     }
 
-    @objc private func joinClicked() {
-        guard let id = selectedDisplayID(), splits.sessions[id]?.active == true else { return }
-        requestJoin(preferred: id)
+    @objc private func restoreSelectedDisplay() {
+        guard let id = selectedDisplayID(), let session = splits.sessions[id], session.active else { return }
+        requestRestore([session])
+    }
+
+    @objc private func mergeSelectedDisplay() {
+        guard let id = selectedDisplayID(), let session = splits.sessions[id], session.active else { return }
+        requestRestore([session], mergeDesktop: true)
     }
 
     private func restoreShortcut() {
-        guard !closing, !confirming, !splits.busy else { return }
+        guard operationsAvailable else { return }
         let pointer = CGEvent(source: nil)?.location
         let pointed = pointer.flatMap { splits.splitDisplay(at: $0) }
         let target = pointed.flatMap { splits.sessions[$0] } ?? (splits.active.count == 1 ? splits.active.first : nil)
-        if let target {
-            quick.hide()
-            if target.hasQuick { splits.endQuick(target.targetID) }
-            else { splits.join(target.targetID) }
-        } else { chooseJoin() }
+        if let target { restore(target.targetID, action: RestoreAction(session: target)) }
+        else { chooseRestore() }
     }
 
-    @objc private func chooseJoin() {
+    @objc private func chooseRestore() {
         let pointer = CGEvent(source: nil)?.location
-        requestJoin(preferred: pointer.flatMap { splits.splitDisplay(at: $0) }, endQuick: true)
+        let preferred = (quick.isVisible ? quick.targetDisplayID : nil) ?? pointer.flatMap { splits.splitDisplay(at: $0) }
+        requestRestore(splits.active.sorted { $0.targetID < $1.targetID }, preferredID: preferred)
     }
 
-    private func requestJoin(preferred: CGDirectDisplayID?, endQuick: Bool = false) {
-        guard !closing, !confirming, !splits.busy, !splits.active.isEmpty else { return }
+    private func requestRestore(_ sessions: [Session], preferredID: CGDirectDisplayID? = nil, mergeDesktop: Bool = false) {
+        guard operationsAvailable, !sessions.isEmpty else { return }
         let front = NSWorkspace.shared.frontmostApplication
         let previous = front?.processIdentifier == getpid() ? previousApp : front
         let focusedDisplay = previous.flatMap(WindowPlacement.focusedWindowFrame).flatMap { frame in
             splits.splitDisplay(at: CGPoint(x: frame.midX, y: frame.midY))
         }
-        let sessions = splits.active.sorted { $0.targetID < $1.targetID }
+        let actions = sessions.map { RestoreAction(session: $0, mergeDesktop: mergeDesktop) }
+        let initialIndex = sessions.firstIndex(where: { $0.targetID == preferredID }) ?? 0
+        let initialAction = actions[initialIndex]
         let alert = NSAlert()
-        alert.messageText = sessions.count == 1 ? L("还原 %@？", String(describing: sessions[0].name)) : L("还原哪块显示器？")
-        alert.informativeText = endQuick ? L("结束快捷组合并还原窗口；进入前已有的桌面拆分会保留。普通桌面拆分会合并。") : L("还原所选显示器，结束其快捷组合并迁回窗口。")
-        let selection = NSPopUpButton()
+        alert.messageText = sessions.count == 1 ? initialAction.prompt(for: sessions[0].name) : L("还原哪块显示器？")
+        alert.informativeText = initialAction.detail
+        let selection = RestoreDisplayPicker()
         if sessions.count > 1 {
-            selection.addItems(withTitles: sessions.map(\.name))
-            selection.selectItem(at: sessions.firstIndex(where: { $0.targetID == preferred }) ?? 0)
-            selection.setAccessibilityLabel(L("要合并的显示器"))
+            let displayIDs = splits.screens().map(\.id).sorted()
+            selection.addItems(withTitles: sessions.map { session in
+                guard let index = displayIDs.firstIndex(of: session.targetID) else { return session.name }
+                return "\(index + 1) · \(session.name)"
+            })
+            selection.selectItem(at: initialIndex)
+            selection.setAccessibilityLabel(L("要还原的显示器"))
+            selection.target = selection
+            selection.action = #selector(RestoreDisplayPicker.selectionChanged)
             selection.sizeToFit()
             alert.accessoryView = selection
         }
-        presentConfirmation(alert, action: L("确认还原"), preserving: previous) { [weak self] in
-            guard let self else { return }
+        presentConfirmation(alert, action: initialAction.title, destructive: false, preserving: previous, configureAction: { alert, confirm in
+            selection.onSelect = { [weak alert, weak confirm] index in
+                guard actions.indices.contains(index), let alert, let confirm else { return }
+                alert.informativeText = actions[index].detail
+                confirm.title = actions[index].title
+                alert.layout()
+            }
+        }) { [weak self] in
+            guard let self, self.operationsAvailable else { return }
             let index = sessions.count == 1 ? 0 : selection.indexOfSelectedItem
             guard sessions.indices.contains(index) else { return }
-            self.quick.hide()
-            if let focusedDisplay, focusedDisplay != sessions[index].targetID, NSApp.isActive { previous?.activate() }
-            if endQuick && sessions[index].hasQuick { self.splits.endQuick(sessions[index].targetID) }
-            else { self.splits.join(sessions[index].targetID) }
+            let target = sessions[index]
+            let action = actions[index]
+            guard let current = self.splits.sessions[target.targetID], current.active else { return }
+            let currentAction = RestoreAction(session: current, mergeDesktop: mergeDesktop)
+            guard current === target, currentAction == action else {
+                self.requestRestore([current], mergeDesktop: mergeDesktop)
+                return
+            }
+            if let focusedDisplay, focusedDisplay != target.targetID, NSApp.isActive { previous?.activate() }
+            self.restore(target.targetID, action: action)
         }
     }
 
-    private func presentConfirmation(_ alert: NSAlert, action: String, preserving previous: NSRunningApplication? = nil,
+    private func restore(_ id: CGDirectDisplayID, action: RestoreAction) {
+        quick.hide()
+        switch action {
+        case .mergeDesktop, .endPairAndRestore: splits.join(id)
+        case .endPair: splits.endQuick(id)
+        }
+    }
+
+    private func presentConfirmation(_ alert: NSAlert, action: String, destructive: Bool = true,
+                                     preserving previous: NSRunningApplication? = nil, configureAction: ((NSAlert, NSButton) -> Void)? = nil,
                                      cancelled: (() -> Void)? = nil, confirmed: @escaping () -> Void) {
         guard !confirming else { return }
-        confirming = true
+        confirmationAlert = alert
         applySessionState()
         alert.addButton(withTitle: L("取消")).keyEquivalent = "\u{1b}"
         let confirm = alert.addButton(withTitle: action)
-        confirm.hasDestructiveAction = true
+        confirm.hasDestructiveAction = destructive
         confirm.keyEquivalent = ""
+        configureAction?(alert, confirm)
 
         let host: NSWindow
         if window.isVisible && window.isKeyWindow {
             host = window
+        } else if let panel = quick.confirmationWindow {
+            host = panel
         } else {
             let panel = NSPanel(contentRect: CGRect(x: 0, y: 0, width: 380, height: 70), styleMask: [.titled, .utilityWindow],
                                 backing: .buffered, defer: false)
@@ -990,14 +1154,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         }
         alert.beginSheetModal(for: host) { [weak self] response in
             guard let self else { return }
+            let hadTemporaryHost = self.confirmationPanel != nil
             self.confirmationPanel?.orderOut(nil)
             self.confirmationPanel = nil
-            self.confirming = false
+            self.confirmationAlert = nil
             self.applySessionState()
             if response == .alertSecondButtonReturn { confirmed() }
             else {
                 cancelled?()
-                if NSApp.isActive { previous?.activate() }
+                if hadTemporaryHost && NSApp.isActive { previous?.activate() }
             }
         }
     }
@@ -1069,11 +1234,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 
     @objc private func retryRecovery() {
+        guard operationsAvailable else { return }
         if splits.recoveryProblem != nil {
             Task { await splits.recoverPreviousSession(); refresh() }
             return
         }
-        guard !splits.busy, let session = splits.sessions.values.first(where: \.needsRecovery) else { return }
+        guard let session = splits.sessions.values.first(where: \.needsRecovery) else { return }
         if session.mode == .desktop && session.hasQuick { splits.endQuick(session.targetID) }
         else { splits.join(session.targetID) }
     }
@@ -1097,16 +1263,78 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     }
 }
 
+private extension RestoreAction {
+    @MainActor init(session: Session, mergeDesktop: Bool = false) {
+        self.init(hasPair: session.hasQuick, wasDesktop: session.mode == .desktop, mergeDesktop: mergeDesktop)
+    }
+}
+
+extension RestoreAction {
+    var title: String {
+        switch self {
+        case .mergeDesktop: return L("合并桌面")
+        case .endPair: return L("结束组合，保留桌面")
+        case .endPairAndRestore: return L("结束组合并恢复整屏")
+        }
+    }
+
+    var menuTitle: String { "\(title)…" }
+
+    func prompt(for display: String) -> String {
+        switch self {
+        case .mergeDesktop: return L("合并 %@ 的桌面？", display)
+        case .endPair: return L("结束 %@ 的窗口组合？", display)
+        case .endPairAndRestore: return L("将 %@ 恢复为整屏？", display)
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .mergeDesktop(endsPair: false): return L("两个独立桌面将合并为一块显示器，Panelet 会尝试迁回窗口。")
+        case .mergeDesktop(endsPair: true): return L("Panelet 会结束窗口组合，合并两个桌面，并尝试迁回窗口。")
+        case .endPair: return L("Panelet 会结束全屏组合并尝试还原窗口。两个独立桌面会保留。")
+        case .endPairAndRestore: return L("Panelet 会结束全屏组合，将显示器恢复为整屏，并尝试还原窗口。")
+        }
+    }
+}
+
+@MainActor
+private final class RestoreDisplayPicker: NSPopUpButton {
+    var onSelect: ((Int) -> Void)?
+    @objc func selectionChanged() { onSelect?(indexOfSelectedItem) }
+}
+
+@MainActor
+private final class FlippedDocumentView: NSView {
+    override var isFlipped: Bool { true }
+}
+
 @MainActor
 private final class SettingsLayoutPreview: NSView {
-    var screen: PhysicalScreen? { didSet { needsDisplay = true } }
+    var screen: PhysicalScreen? {
+        didSet {
+            let label = screen.map { screen in
+                L("%@，%@ %@，两个独立桌面", screen.displayName, screen.splitLayout.direction, screen.configuration.ratio.title)
+            }
+            setAccessibilityElement(screen != nil)
+            setAccessibilityRole(.image)
+            setAccessibilityLabel(label)
+            needsDisplay = true
+        }
+    }
 
     override func draw(_ dirtyRect: NSRect) {
         super.draw(dirtyRect)
-        guard let screen else { return }
-        let portrait = screen.isPortrait
-        let size = portrait ? CGSize(width: 68, height: 112) : CGSize(width: 196, height: 112)
-        let frame = CGRect(x: bounds.midX - size.width / 2, y: 28, width: size.width, height: size.height)
+        guard let screen, screen.bounds.width > 0, screen.bounds.height > 0 else { return }
+        let captionArea: CGFloat = 22
+        let availableWidth = min(bounds.width - 16, 232)
+        let availableHeight = bounds.height - captionArea - 16
+        guard availableWidth > 0, availableHeight > 0 else { return }
+        let scale = min(availableWidth / screen.bounds.width, availableHeight / screen.bounds.height)
+        let size = CGSize(width: screen.bounds.width * scale, height: screen.bounds.height * scale)
+        let frame = CGRect(x: bounds.midX - size.width / 2,
+                           y: bounds.minY + captionArea + (bounds.height - captionArea - size.height) / 2,
+                           width: size.width, height: size.height)
         NSColor.separatorColor.setStroke()
         let outline = NSBezierPath(roundedRect: frame.insetBy(dx: -5, dy: -5), xRadius: 9, yRadius: 9)
         outline.lineWidth = 2
@@ -1118,15 +1346,24 @@ private final class SettingsLayoutPreview: NSView {
                               height: region.height / screen.bounds.height * size.height).insetBy(dx: 2, dy: 2)
             NSColor.controlAccentColor.withAlphaComponent(index == 0 ? 0.22 : 0.12).setFill()
             NSBezierPath(roundedRect: rect, xRadius: 5, yRadius: 5).fill()
-            let text = screen.splitLayout.names[index] as NSString
-            let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11, weight: .medium), .foregroundColor: NSColor.labelColor]
-            let textSize = text.size(withAttributes: attrs)
-            text.draw(at: CGPoint(x: rect.midX - textSize.width / 2, y: rect.midY - textSize.height / 2), withAttributes: attrs)
+            if rect.width >= 10, rect.height >= 14 {
+                drawLabel(screen.splitLayout.names[index], in: rect.insetBy(dx: 2, dy: 0), color: .labelColor)
+            }
         }
-        let caption = L("%@ %@ · 两个独立桌面", String(describing: screen.splitLayout.direction), String(describing: screen.configuration.ratio.title)) as NSString
-        let attrs: [NSAttributedString.Key: Any] = [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.secondaryLabelColor]
-        caption.draw(at: CGPoint(x: bounds.midX - caption.size(withAttributes: attrs).width / 2, y: 2), withAttributes: attrs)
-        setAccessibilityLabel(L("%@，%@ %@，两个独立桌面", String(describing: screen.name), String(describing: screen.splitLayout.direction), String(describing: screen.configuration.ratio.title)))
+        let caption = L("%@ %@ · 两个独立桌面", screen.splitLayout.direction, screen.configuration.ratio.title)
+        drawLabel(caption, in: CGRect(x: bounds.minX, y: bounds.minY, width: bounds.width, height: captionArea), color: .secondaryLabelColor)
+    }
+
+    private func drawLabel(_ title: String, in rect: CGRect, color: NSColor) {
+        let style = NSMutableParagraphStyle()
+        style.alignment = .center
+        style.lineBreakMode = .byTruncatingTail
+        let font = NSFont.systemFont(ofSize: 11)
+        let attributes: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color, .paragraphStyle: style]
+        let title = title as NSString
+        let height = ceil(title.size(withAttributes: attributes).height)
+        title.draw(in: CGRect(x: rect.minX, y: rect.midY - height / 2, width: rect.width, height: height),
+                   withAttributes: attributes)
     }
 }
 
@@ -1194,16 +1431,11 @@ private extension AppController {
     @objc func openLoginSettings() { SMAppService.openSystemSettingsLoginItems() }
 
     @objc func restoreAll() {
-        guard !closing, !confirming, !restoringAll else { return }
-        guard !splits.sessions.isEmpty || splits.recoveryProblem != nil else {
-            DemoLog.shared.line(L("没有需要恢复的分屏。"))
-            showAdvanced()
-            return
-        }
+        guard canRestoreAll else { return }
         let alert = NSAlert()
         alert.messageText = L("恢复所有显示器？")
         alert.informativeText = L("结束所有窗口组合，将独立桌面合并为整块显示器，并尝试恢复窗口。应用会继续运行。")
-        presentConfirmation(alert, action: L("恢复所有显示器")) { [weak self] in
+        presentConfirmation(alert, action: L("恢复所有显示器"), destructive: false) { [weak self] in
             guard let self else { return }
             self.quick.hide()
             self.restoringAll = true
@@ -1320,16 +1552,20 @@ private extension AppController {
     @objc func restartGuide() { showGuide(resume: false) }
 
     func showGuide(resume: Bool) {
-        guard !closing, !confirming, !splits.busy else { return }
+        guard operationsAvailable else { return }
         quick.hide()
         window.orderOut(nil)
         if !resume {
             preferences.guideStep = .welcome
             guideMessage = nil
+            guideDisplayID = nil
+            guideDrafts.removeAll()
         }
+        guideShowingTrial = false
         preferences.guideDeferred = false
+        guideSignature = ""
         if guideWindow == nil {
-            let panel = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 552, height: 570),
+            let panel = NSWindow(contentRect: CGRect(x: 0, y: 0, width: 552, height: 438),
                                  styleMask: [.titled, .closable], backing: .buffered, defer: false)
             panel.title = L("Panelet · 使用导引")
             panel.isReleasedWhenClosed = false
@@ -1341,9 +1577,10 @@ private extension AppController {
             let body = NSStackView()
             body.orientation = .vertical
             body.alignment = .leading
-            body.spacing = 18
-            body.translatesAutoresizingMaskIntoConstraints = false
-            root.addSubview(body)
+            body.spacing = 16
+            let scroll = topAlignedScroll(body, insets: NSEdgeInsets(top: 0, left: 10, bottom: 18, right: 10))
+            scroll.translatesAutoresizingMaskIntoConstraints = false
+            root.addSubview(scroll)
             let back = button(L("稍后设置"), action: #selector(guideBackClicked))
             let primary = button(L("开始设置"), action: #selector(guideNextClicked))
             primary.bezelColor = .controlAccentColor
@@ -1360,10 +1597,10 @@ private extension AppController {
             root.addSubview(line)
             NSLayoutConstraint.activate([
                 progress.centerXAnchor.constraint(equalTo: root.centerXAnchor),
-                body.topAnchor.constraint(equalTo: root.topAnchor, constant: 30),
-                body.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 36),
-                body.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -36),
-                body.bottomAnchor.constraint(lessThanOrEqualTo: line.topAnchor, constant: -18),
+                scroll.topAnchor.constraint(equalTo: root.topAnchor, constant: 24),
+                scroll.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 22),
+                scroll.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -22),
+                scroll.bottomAnchor.constraint(equalTo: line.topAnchor),
                 footer.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 24),
                 footer.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -24),
                 footer.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -18),
@@ -1372,13 +1609,18 @@ private extension AppController {
                 line.bottomAnchor.constraint(equalTo: footer.topAnchor, constant: -16)
             ])
             guideBody = body
+            guideScroll = scroll
             guidePrimary = primary
             guideBack = back
             guideProgress = progress
             guideWindow = panel
         }
         renderGuide()
-        guideWindow?.center()
+        if let screen = splits.hostScreen(at: nil), let guideWindow {
+            let visible = screen.visibleFrame
+            let size = guideWindow.frame.size
+            guideWindow.setFrameOrigin(NSPoint(x: visible.midX - size.width / 2, y: visible.midY - size.height / 2))
+        } else { guideWindow?.center() }
         NSApp.activate(ignoringOtherApps: true)
         guideWindow?.makeKeyAndOrderFront(nil)
     }
@@ -1393,43 +1635,47 @@ private extension AppController {
         }
     }
 
-    func guideHeading(_ title: String, detail: String) -> NSStackView {
-        let stack = NSStackView(views: [settingsText(title, size: 25, weight: .bold),
-                                      settingsText(detail, secondary: true)])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 8
-        return stack
-    }
-
     func renderGuide() {
         guard let body = guideBody, let primary = guidePrimary, let back = guideBack else { return }
+        if preferences.guideStep == .ready && Permissions.splitProblem != nil && guidePendingDisplayID == nil {
+            preferences.guideStep = .permissions
+            guideShowingTrial = false
+        }
         for view in body.arrangedSubviews { body.removeArrangedSubview(view); view.removeFromSuperview() }
+        guideTrialPreview = nil
+        guideTrialWarning = nil
         let step = preferences.guideStep
-        let available = !splits.busy && !closing && !confirming && !restoringAll
+        let available = operationsAvailable
         back.isEnabled = available
         primary.isEnabled = available
+        primary.keyEquivalent = "\r"
         back.title = step == .welcome ? L("稍后设置") : L("上一步")
-        let screens = splits.screens()
         switch step {
         case .welcome:
-            guideProgress?.stringValue = "1 / 3"
+            guideProgress?.stringValue = "1 / 2"
             let icon = NSImageView(image: NSImage(named: "AppIcon") ?? NSApp.applicationIconImage)
             icon.widthAnchor.constraint(equalToConstant: 48).isActive = true
             icon.heightAnchor.constraint(equalToConstant: 48).isActive = true
+            icon.setAccessibilityElement(false)
             body.addArrangedSubview(icon)
-            body.addArrangedSubview(guideHeading(L("一块屏幕，多个专注空间"), detail: L("把显示器拆成独立分区，让工作与参考各就各位。")))
+            body.addArrangedSubview(sectionHeading(L("一块屏幕，多个专注空间"), detail: L("把显示器拆成独立分区，让工作与参考各就各位。")))
             let preview = SettingsLayoutPreview()
             var config = DisplayConfiguration()
             config.direction = .horizontal
             preview.screen = PhysicalScreen(id: 0, name: "Panelet", bounds: CGRect(x: 0, y: 0, width: 1920, height: 1080), scale: 1, refreshRate: 60, isBuiltin: false, configuration: config)
             preview.heightAnchor.constraint(equalToConstant: 150).isActive = true
             body.addArrangedSubview(preview)
-            body.addArrangedSubview(settingsText(L("简单设置后，开始你的第一次分屏。"), size: 12, secondary: true))
             primary.title = L("开始设置")
-        case .permissions:
-            guideProgress?.stringValue = "2 / 3"
-            body.addArrangedSubview(guideHeading(L("让 Panelet 帮你安排桌面"), detail: L("分屏需要以下权限，点击后前往系统设置开启。")))
+        case .permissions, .ready:
+            if guideShowingTrial {
+                renderGuideTrial(in: body, primary: primary, available: available)
+                break
+            }
+            guideProgress?.stringValue = "2 / 2"
+            let permissionsReady = Permissions.splitProblem == nil
+            let needsRestart = guideRequestedPermission && !permissionsReady
+            let detail = permissionsReady ? L("可以从菜单栏随时开始分屏。") : L("分屏需要以下权限，点击后前往系统设置开启。")
+            body.addArrangedSubview(sectionHeading(permissionsReady ? L("权限已就绪") : L("让 Panelet 帮你安排桌面"), detail: detail))
             let record: NSView = Permissions.screenRecording ? settingsText(L("✓ 已授权"), size: 12)
                 : button(L("去授权…"), action: #selector(guideAskRecording))
             let access: NSView = Permissions.accessibility ? settingsText(L("✓ 已授权"), size: 12)
@@ -1447,134 +1693,171 @@ private extension AppController {
                     settingsText(L("请在「桌面与程序坞」打开「显示器使用不同的空间」，重新登录后再拆分。"), size: 12),
                     button(L("系统设置…"), action: #selector(openDesktopSettings))]))
             }
-            body.addArrangedSubview(settingsText(guideRequestedPermission
-                ? L("已在系统设置开启？请重新启动 Panelet，导引会继续检查权限。")
-                : L("从系统设置返回后，会自动检查权限状态。"), size: 12, secondary: true))
-            primary.title = guideRequestedPermission ? L("重新启动并继续") : L("继续")
-            primary.isEnabled = available && (guideRequestedPermission || Permissions.splitProblem == nil)
-        case .layout:
-            guideProgress?.stringValue = "3 / 3"
-            body.addArrangedSubview(guideHeading(L("选一个顺手的布局"), detail: L("从两块分区开始，以后随时可以调整或还原。")))
-            if !screens.contains(where: { $0.id == guideDisplayID }) { guideDisplayID = screens.first?.id }
-            let picker = NSPopUpButton()
-            picker.target = self
-            picker.action = #selector(guideDisplayChanged(_:))
-            picker.setAccessibilityLabel(L("目标显示器"))
-            for screen in screens {
-                picker.addItem(withTitle: screen.menuTitle)
-                picker.lastItem?.representedObject = NSNumber(value: screen.id)
-            }
-            if let id = guideDisplayID, let index = screens.firstIndex(where: { $0.id == id }) { picker.selectItem(at: index) }
-            if screens.isEmpty { picker.addItem(withTitle: L("没有可用显示器")) }
-            picker.isEnabled = available && !screens.isEmpty
-            body.addArrangedSubview(picker)
-            if var screen = screens.first(where: { $0.id == guideDisplayID }) {
-                let session = splits.sessions[screen.id]
-                screen.configuration = session?.configuration ?? guideDrafts[screen.uuid] ?? screen.configuration
-                let preview = SettingsLayoutPreview()
-                preview.screen = screen
-                preview.heightAnchor.constraint(equalToConstant: 150).isActive = true
-                body.addArrangedSubview(preview)
-                let direction = NSPopUpButton()
-                direction.addItems(withTitles: DisplayConfiguration.Direction.allCases.map(\.title))
-                direction.selectItem(at: DisplayConfiguration.Direction.allCases.firstIndex(of: screen.configuration.direction) ?? 0)
-                direction.target = self
-                direction.action = #selector(guideDirectionChanged(_:))
-                direction.setAccessibilityLabel(L("分屏方向"))
-                let ratio = NSPopUpButton()
-                ratio.addItems(withTitles: DisplayConfiguration.Ratio.allCases.map(\.title))
-                ratio.selectItem(at: DisplayConfiguration.Ratio.allCases.firstIndex(of: screen.configuration.ratio) ?? 0)
-                ratio.target = self
-                ratio.action = #selector(guideRatioChanged(_:))
-                ratio.setAccessibilityLabel(L("分区比例"))
-                direction.isEnabled = available && session == nil
-                ratio.isEnabled = direction.isEnabled
-                let choices = NSStackView(views: [settingsText(L("方向"), size: 12), direction, NSView(), settingsText(L("比例"), size: 12), ratio])
-                choices.spacing = 10
-                body.addArrangedSubview(choices)
-                if let warning = screen.splitLayout.smallRegionWarning {
-                    body.addArrangedSubview(settingsText(warning, size: 12, secondary: true))
-                }
-                primary.title = session?.active == true ? L("使用当前分屏") : L("开始分屏")
-                primary.isEnabled = available && splitProblem == nil && (session == nil || session?.active == true)
+            if permissionsReady {
+                let trial = button(L("试一次分屏…"), action: #selector(showGuideTrial))
+                trial.isEnabled = available
+                body.addArrangedSubview(trial)
             } else {
-                primary.title = L("开始分屏")
-                primary.isEnabled = false
+                body.addArrangedSubview(settingsText(needsRestart
+                    ? L("已在系统设置开启？请重新启动 Panelet，导引会继续检查权限。")
+                    : L("从系统设置返回后，会自动检查权限状态。"), size: 12, secondary: true))
             }
-            if let message = guideMessage ?? splitProblem {
-                body.addArrangedSubview(settingsText(message, size: 12, secondary: true))
-            }
-            if Permissions.splitProblem != nil {
-                body.addArrangedSubview(button(L("检查权限…"), action: #selector(guideCheckPermissions)))
-            }
-            if splits.recoveryProblem != nil || splits.sessions.values.contains(where: \.needsRecovery) {
-                body.addArrangedSubview(button(L("重试恢复…"), action: #selector(retryRecovery)))
-            }
-            if guidePendingDisplayID != nil {
-                primary.title = L("正在分屏…")
-                primary.isEnabled = false
-            }
+            primary.title = needsRestart ? L("重新启动并继续") : L("完成设置")
+            primary.isEnabled = available && (permissionsReady || needsRestart)
         case .complete:
-            guideProgress?.stringValue = L("设置完成")
-            body.addArrangedSubview(guideHeading(L("你的桌面，各就各位"), detail: L("分屏已就绪，可以开始工作了。")))
-            body.addArrangedSubview(settingsCard([
-                settingsText(L("下一次，从菜单栏找到我"), weight: .semibold),
-                settingsText(L("点按 Panelet 图标，打开快捷面板或调整布局。"), size: 12, secondary: true),
-                settingsText(L("随时回到完整屏幕"), weight: .semibold),
-                settingsText(L("在菜单中选择「还原分屏…」。"), size: 12, secondary: true)
-            ]))
+            guideProgress?.stringValue = ""
+            let hasSplit = !splits.active.isEmpty
+            let detail = hasSplit ? L("分屏已就绪，可以开始工作了。") : L("从菜单栏的 Panelet 图标选择「拆分桌面」或「快捷窗口分屏」。")
+            body.addArrangedSubview(sectionHeading(L("设置完成"), detail: detail))
+            if hasSplit {
+                body.addArrangedSubview(settingsCard([
+                    settingsText(L("随时回到完整屏幕"), weight: .semibold),
+                    settingsText(L("在菜单中选择「恢复所有显示器…」。"), size: 12, secondary: true)
+                ]))
+            }
             back.title = L("查看设置")
             primary.title = L("完成")
         }
-        for view in body.arrangedSubviews where !(view is NSImageView) {
+        for view in body.arrangedSubviews where !(view is NSImageView) && !(view is NSButton) {
             view.widthAnchor.constraint(equalTo: body.widthAnchor).isActive = true
+        }
+        guideWindow?.contentView?.layoutSubtreeIfNeeded()
+        if let scroll = guideScroll {
+            scroll.contentView.scroll(to: .zero)
+            scroll.reflectScrolledClipView(scroll.contentView)
+        }
+    }
+
+    func renderGuideTrial(in body: NSStackView, primary: NSButton, available: Bool) {
+        guideProgress?.stringValue = L("可选")
+        primary.keyEquivalent = ""
+        body.addArrangedSubview(sectionHeading(L("试一次分屏"), detail: L("选择一个显示器和布局，开始后会把这块显示器拆成两个桌面。")))
+        let screens = splits.screens()
+        if !screens.contains(where: { $0.id == guideDisplayID }) {
+            guideDisplayID = (screens.first { splits.sessions[$0.id] == nil } ?? screens.first)?.id
+        }
+        let picker = NSPopUpButton()
+        picker.target = self
+        picker.action = #selector(guideDisplayChanged(_:))
+        picker.setAccessibilityLabel(L("目标显示器"))
+        for screen in screens {
+            picker.addItem(withTitle: screen.menuTitle)
+            picker.lastItem?.representedObject = NSNumber(value: screen.id)
+        }
+        if let index = screens.firstIndex(where: { $0.id == guideDisplayID }) { picker.selectItem(at: index) }
+        if screens.isEmpty { picker.addItem(withTitle: L("没有可用显示器")) }
+        picker.isEnabled = available && screens.count > 1
+        var controls: [NSView] = [settingsText(L("目标显示器"), size: 12, weight: .semibold), picker]
+        var hasActiveDesktop = false
+        if var screen = screens.first(where: { $0.id == guideDisplayID }) {
+            let session = splits.sessions[screen.id]
+            hasActiveDesktop = session?.active == true
+            screen.configuration = session?.configuration ?? guideDrafts[screen.uuid] ?? screen.configuration
+            let preview = SettingsLayoutPreview()
+            preview.screen = screen
+            let direction = NSPopUpButton()
+            let ratio = NSPopUpButton()
+            controls.append(layoutEditor(preview: preview, direction: direction, ratio: ratio))
+            let warning = settingsText(screen.splitLayout.smallRegionWarning ?? "", size: 12, secondary: true)
+            warning.isHidden = screen.splitLayout.smallRegionWarning == nil
+            controls.append(warning)
+            guideTrialPreview = preview
+            guideTrialWarning = warning
+            direction.selectItem(at: DisplayConfiguration.Direction.allCases.firstIndex(of: screen.configuration.direction) ?? 0)
+            direction.target = self
+            direction.action = #selector(guideDirectionChanged(_:))
+            ratio.selectItem(at: DisplayConfiguration.Ratio.allCases.firstIndex(of: screen.configuration.ratio) ?? 0)
+            ratio.target = self
+            ratio.action = #selector(guideRatioChanged(_:))
+            direction.isEnabled = available && session == nil
+            ratio.isEnabled = direction.isEnabled
+            if hasActiveDesktop {
+                controls.append(settingsText(L("这块显示器已在分屏。合并后可以更改布局。"), size: 12, secondary: true))
+            }
+        }
+        if let message = guideMessage ?? splitProblem {
+            controls.append(settingsText(message, size: 12, secondary: true))
+        }
+        if hasPendingRecovery {
+            let retry = button(L("重试恢复…"), action: #selector(retryRecovery))
+            retry.isEnabled = available
+            controls.append(retry)
+        }
+        body.addArrangedSubview(settingsCard(controls))
+        if guidePendingDisplayID != nil {
+            primary.title = splits.transition?.preparing == true ? L("正在分屏…") : L("正在恢复…")
+            primary.isEnabled = false
+        } else {
+            primary.title = hasActiveDesktop ? L("完成设置") : L("开始分屏")
+            primary.isEnabled = available && (hasActiveDesktop || (guideDisplayID != nil && splitProblem == nil))
         }
     }
 
     @objc func guideBackClicked() {
+        guard operationsAvailable, guidePendingDisplayID == nil else { return }
+        if guideShowingTrial {
+            guideShowingTrial = false
+            guideMessage = nil
+            renderGuide()
+            return
+        }
         switch preferences.guideStep {
         case .welcome: preferences.guideDeferred = true; guideWindow?.orderOut(nil)
-        case .permissions: preferences.guideStep = .welcome; renderGuide()
-        case .layout: preferences.guideStep = .permissions; renderGuide()
+        case .permissions, .ready: preferences.guideStep = .welcome; renderGuide()
         case .complete: guideWindow?.orderOut(nil); showAdvanced()
         }
     }
 
     @objc func guideNextClicked() {
-        guard !splits.busy, !closing, !confirming, !restoringAll else { return }
+        guard operationsAvailable, guidePendingDisplayID == nil else { return }
         switch preferences.guideStep {
         case .welcome:
-            preferences.guideStep = Permissions.splitProblem == nil ? .layout : .permissions
+            preferences.guideStep = Permissions.splitProblem == nil ? .ready : .permissions
             renderGuide()
-        case .permissions:
-            if guideRequestedPermission {
+        case .permissions, .ready:
+            if guideShowingTrial {
+                startGuideTrial()
+            } else if Permissions.splitProblem != nil && guideRequestedPermission {
                 preferences.guideRestartPending = true
                 preferences.guideDeferred = false
                 requestQuit(relaunch: true)
-            } else if Permissions.splitProblem == nil {
-                preferences.guideStep = .layout
+            } else {
+                preferences.finishGuide(permissionsReady: Permissions.splitProblem == nil)
                 renderGuide()
             }
-        case .layout:
-            guard splitProblem == nil, let id = guideDisplayID,
-                  let screen = splits.screens().first(where: { $0.id == id }) else { refreshGuide(); return }
-            if splits.sessions[id]?.active == true {
-                preferences.guideStep = .complete
-                renderGuide()
-                return
-            }
-            guard splits.sessions[id] == nil else { return }
-            if let draft = guideDrafts[screen.uuid] { preferences.save(draft, for: screen.uuid) }
-            guideMessage = nil
-            guidePendingDisplayID = id
-            splits.split(id)
-            if splits.sessions[id] == nil {
-                guidePendingDisplayID = nil
-                guideMessage = L("未能开始分屏，请检查运行环境或重新选择显示器。")
-            }
-            renderGuide()
         case .complete: guideWindow?.orderOut(nil)
         }
+    }
+
+    @objc func showGuideTrial() {
+        guard operationsAvailable, Permissions.splitProblem == nil else { return }
+        guideShowingTrial = true
+        guideMessage = nil
+        renderGuide()
+    }
+
+    func startGuideTrial() {
+        guard let id = guideDisplayID, let screen = splits.screens().first(where: { $0.id == id }) else { renderGuide(); return }
+        if splits.sessions[id]?.active == true {
+            guideShowingTrial = false
+            preferences.finishGuide(permissionsReady: Permissions.splitProblem == nil)
+            renderGuide()
+            return
+        }
+        guard splits.sessions[id] == nil, splitProblem == nil else { return }
+        let uuid = screen.uuid
+        let draft = guideDrafts[uuid]
+        guideTrialConfiguration = draft.map { (uuid, $0) }
+        guideMessage = nil
+        guidePendingDisplayID = id
+        splits.split(id, configuration: draft)
+        if guidePendingDisplayID != nil && splits.sessions[id] == nil {
+            checkEnvironment()
+            guideTrialConfiguration = nil
+            guidePendingDisplayID = nil
+            guideMessage = L("未能开始分屏，请检查运行环境或重新选择显示器。")
+        }
+        renderGuide()
     }
 
     @objc func guideAskRecording() {
@@ -1587,19 +1870,24 @@ private extension AppController {
         Permissions.requestAccessibility()
         renderGuide()
     }
-    @objc func guideCheckPermissions() { preferences.guideStep = .permissions; renderGuide() }
     @objc func guideDisplayChanged(_ sender: NSPopUpButton) {
         guideDisplayID = (sender.selectedItem?.representedObject as? NSNumber)?.uint32Value
         guideMessage = nil
         renderGuide()
     }
     func changeGuideLayout(_ update: (inout DisplayConfiguration) -> Void) {
-        guard let screen = splits.screens().first(where: { $0.id == guideDisplayID }),
-              splits.sessions[screen.id] == nil, !splits.busy else { return }
-        var draft = guideDrafts[screen.uuid] ?? screen.configuration
+        guard operationsAvailable, guideShowingTrial,
+              var screen = splits.screens().first(where: { $0.id == guideDisplayID }),
+              splits.sessions[screen.id] == nil else { return }
+        let uuid = screen.uuid
+        var draft = guideDrafts[uuid] ?? screen.configuration
         update(&draft)
-        guideDrafts[screen.uuid] = draft
-        renderGuide()
+        guideDrafts[uuid] = draft
+        screen.configuration = draft
+        guideTrialPreview?.screen = screen
+        let warning = screen.splitLayout.smallRegionWarning
+        guideTrialWarning?.stringValue = warning ?? ""
+        guideTrialWarning?.isHidden = warning == nil
     }
     @objc func guideDirectionChanged(_ sender: NSPopUpButton) {
         let index = sender.indexOfSelectedItem
