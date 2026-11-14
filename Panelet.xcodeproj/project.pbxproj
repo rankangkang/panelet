@@ -29,6 +29,9 @@
 		A300000000000000000000F3 /* MenuBarTemplate@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = A200000000000000000000F3; };
         A300000000000000000000F4 = {isa = PBXBuildFile; fileRef = A200000000000000000000F4; };
         A300000000000000000000F5 = {isa = PBXBuildFile; fileRef = A200000000000000000000F5; };
+		A300000000000000000000F6 /* LICENSE in Resources */ = {isa = PBXBuildFile; fileRef = A200000000000000000000F6 /* LICENSE */; };
+		A300000000000000000000F7 /* LICENSE_NOTICE in Resources */ = {isa = PBXBuildFile; fileRef = A200000000000000000000F7 /* LICENSE_NOTICE */; };
+		A300000000000000000000F8 /* THIRD_PARTY_NOTICES in Resources */ = {isa = PBXBuildFile; fileRef = A200000000000000000000F8 /* THIRD_PARTY_NOTICES */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -58,6 +61,9 @@
 		A200000000000000000000F3 /* MenuBarTemplate@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "MenuBarTemplate@2x.png"; sourceTree = "<group>"; };
         A200000000000000000000F4 = {isa = PBXFileReference; lastKnownFileType = folder; path = en.lproj; sourceTree = "<group>"; };
         A200000000000000000000F5 = {isa = PBXFileReference; lastKnownFileType = folder; path = "zh-Hans.lproj"; sourceTree = "<group>"; };
+		A200000000000000000000F6 /* LICENSE */ = {isa = PBXFileReference; lastKnownFileType = text; path = LICENSE; sourceTree = "<group>"; };
+		A200000000000000000000F7 /* LICENSE_NOTICE */ = {isa = PBXFileReference; lastKnownFileType = text; path = LICENSE_NOTICE; sourceTree = "<group>"; };
+		A200000000000000000000F8 /* THIRD_PARTY_NOTICES */ = {isa = PBXFileReference; lastKnownFileType = text; path = THIRD_PARTY_NOTICES; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -75,6 +81,9 @@
 			isa = PBXGroup;
 			children = (
 				A1000000000000000000000E /* Panelet */,
+				A200000000000000000000F6 /* LICENSE */,
+				A200000000000000000000F7 /* LICENSE_NOTICE */,
+				A200000000000000000000F8 /* THIRD_PARTY_NOTICES */,
 				A10000000000000000000004 /* Products */,
 			);
 			sourceTree = "<group>";
@@ -174,7 +183,7 @@
         A100000000000000000000F1 /* Resources */ = {
             isa = PBXResourcesBuildPhase;
             buildActionMask = 2147483647;
-            files = (A300000000000000000000F1, A300000000000000000000F2, A300000000000000000000F3, A300000000000000000000F4, A300000000000000000000F5);
+            files = (A300000000000000000000F1, A300000000000000000000F2, A300000000000000000000F3, A300000000000000000000F4, A300000000000000000000F5, A300000000000000000000F6, A300000000000000000000F7, A300000000000000000000F8);
             runOnlyForDeploymentPostprocessing = 0;
         };
 /* End PBXResourcesBuildPhase section */

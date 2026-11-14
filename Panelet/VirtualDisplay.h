@@ -1,5 +1,6 @@
 // Private CoreGraphics API. Apple does not document CGVirtualDisplay; it can change
 // or disappear in a future macOS. The same interface is used by Telas and DeskPad.
+// See THIRD_PARTY_NOTICES for the Telas license and copyright notice.
 #import <Foundation/Foundation.h>
 #import <CoreGraphics/CoreGraphics.h>
 

@@ -54,6 +54,7 @@ trap 'rm -rf "$STAGING"' EXIT
 STAGED_APP="$STAGING/Panelet.app"
 mkdir -p "$STAGED_APP/Contents/MacOS" "$STAGED_APP/Contents/Resources"
 cp -R Panelet/Resources/* "$STAGED_APP/Contents/Resources/"
+cp LICENSE LICENSE_NOTICE THIRD_PARTY_NOTICES "$STAGED_APP/Contents/Resources/"
 python3 - "$STAGED_APP/Contents/Info.plist" <<'PY'
 import pathlib, sys
 text = pathlib.Path("Panelet/Info.plist").read_text()
