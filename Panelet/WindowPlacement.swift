@@ -107,12 +107,43 @@ final class WindowPlacement {
     }
 
     static func focusedWindowFrame(of app: NSRunningApplication) -> CGRect? {
-        let element = AXUIElementCreateApplication(app.processIdentifier)
+        windowFrame(for: app.processIdentifier, attribute: kAXFocusedWindowAttribute)
+    }
+
+    private nonisolated static func windowFrame(for pid: pid_t, attribute: String) -> CGRect? {
+        let element = AXUIElementCreateApplication(pid)
         AXUIElementSetMessagingTimeout(element, 0.1)
-        var focused: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXFocusedWindowAttribute as CFString, &focused) == .success,
-              let focused, CFGetTypeID(focused) == AXUIElementGetTypeID() else { return nil }
-        return Window(element: focused as! AXUIElement).frame
+        var window: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, attribute as CFString, &window) == .success,
+              let window, CFGetTypeID(window) == AXUIElementGetTypeID() else { return nil }
+        return Window(element: window as! AXUIElement).frame
+    }
+
+    nonisolated static func isInteractivePopup(pid: pid_t, frame: CGRect) -> Bool {
+        let application = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(application, 0.05)
+        var hit: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(application, Float(frame.midX), Float(frame.midY), &hit) == .success,
+              let hit else { return false }
+        let role = Window.attribute(kAXRoleAttribute, of: hit) as? String
+        let element: AXUIElement
+        if role == kAXWindowRole {
+            element = hit
+        } else {
+            guard let value = Window.attribute(kAXWindowAttribute, of: hit),
+                  CFGetTypeID(value) == AXUIElementGetTypeID() else { return false }
+            element = value as! AXUIElement
+        }
+        guard let actual = Window(element: element).frame, near(actual, frame) else { return false }
+        if let close = Window.attribute(kAXCloseButtonAttribute, of: element),
+           CFGetTypeID(close) == AXUIElementGetTypeID(),
+           Window.attribute(kAXEnabledAttribute, of: close as! AXUIElement) as? Bool == true { return true }
+
+        // Some popovers have actionable content but no title-bar controls.
+        var actions: CFArray?
+        return Window.attribute(kAXEnabledAttribute, of: hit) as? Bool != false
+            && AXUIElementCopyActionNames(hit, &actions) == .success
+            && (actions as? [String])?.contains(kAXPressAction) == true
     }
 
     init(source: PhysicalScreen, displays: [PhysicalScreen], pair: Pair? = nil, reserved: [Identity] = [], selectedOnly: Bool = false) throws {
@@ -628,45 +659,69 @@ final class WindowPlacement {
         return false
     }
 
-    /// Only rescue visible ordinary windows whose center is on the covered physical desktop.
+    /// Move app windows and floating panels out from behind the physical mirrors.
     func rescueHiddenWindows(to halves: [HalfScreen], protecting: [Identity], shouldContinue: () -> Bool) async {
         let hidden = CGDisplayBounds(source.id)
         let excluded = protecting + identities
         let scan = Task.detached(priority: .utility) {
-            let records = Self.windowList([.optionOnScreenOnly, .excludeDesktopElements]).filter { record in
+            let levels = Set([0, Int(CGWindowLevelForKey(.floatingWindow)), Int(CGWindowLevelForKey(.modalPanelWindow))])
+            let records = Self.windowList([.optionOnScreenOnly, .excludeDesktopElements], levels: levels).filter { record in
                 hidden.contains(CGPoint(x: record.frame.midX, y: record.frame.midY)) &&
                     !excluded.contains { identity in identity.matches(number: record.id, element: nil) }
             }
-            return Self.movableWindows(from: records).filter { match in
+            let candidates = Self.movableWindows(from: records, includePanels: true).filter { match in
                 !match.window.isMinimized && NSRunningApplication(processIdentifier: match.info.pid)?.isHidden == false &&
                     !excluded.contains { $0.matches(number: match.info.id, element: match.window.element) }
             }
+            let panels = candidates.filter { $0.info.layer != 0 || $0.window.isMovablePanel }
+            let panelOwners = Set(panels.map { $0.info.pid })
+            let parents = Dictionary(uniqueKeysWithValues: panelOwners.compactMap { pid in
+                Self.windowFrame(for: pid, attribute: kAXMainWindowAttribute).map { (pid, $0) }
+            })
+            return (candidates, Set(panels.map { $0.info.id }), parents)
         }
-        let candidates = await scan.value
+        let (candidates, panels, parents) = await scan.value
         guard !Task.isCancelled, shouldContinue(), CGDisplayBounds(source.id) == hidden else { return }
-        var moves: [(Window, CGRect)] = []
+        var moves: [(window: Window, frame: CGRect, panel: Bool)] = []
         for match in candidates {
             guard let current = match.window.frame, Self.near(current, match.frame),
                   !match.window.isFullScreen, !match.window.isMinimized else { continue }
             let local = CGPoint(x: current.midX - hidden.minX, y: current.midY - hidden.minY)
-            guard let half = halves.first(where: { $0.localRect.contains(local) }),
+            let panel = panels.contains(match.info.id)
+            let parent = panel ? parents[match.info.pid] : nil
+            let parentHalf = parent.flatMap { frame in
+                halves.first { $0.virtualBounds.contains(CGPoint(x: frame.midX, y: frame.midY)) }
+            }
+            guard let half = parentHalf ?? halves.first(where: { $0.localRect.contains(local) }),
                   let screen = NSScreen.screens.first(where: { $0.displayID == half.virtualID }) else { continue }
-            if !windows.contains(where: { $0.id == match.info.id && $0.pid == match.info.pid }) {
+            // A transient panel follows its app while visible. It does not own a desktop position to restore.
+            if !panel && !windows.contains(where: { $0.id == match.info.id && $0.pid == match.info.pid }) {
                 let original = current.offsetBy(dx: source.bounds.minX - hidden.minX, dy: source.bounds.minY - hidden.minY)
                 windows.append(SavedWindow(window: match.window, id: match.info.id, pid: match.info.pid,
                                            original: original, display: source, slot: nil))
             }
-            let translated = current.offsetBy(dx: half.virtualBounds.minX - hidden.minX - half.localRect.minX,
-                                               dy: half.virtualBounds.minY - hidden.minY - half.localRect.minY)
-            moves.append((match.window, Self.fit(translated, inside: cocoaRect(screen.visibleFrame))))
+            let translated: CGRect
+            if let parent, parentHalf != nil, !half.localRect.contains(local) {
+                translated = CGRect(x: parent.midX - current.width / 2, y: parent.midY - current.height / 2,
+                                    width: current.width, height: current.height)
+            } else {
+                translated = current.offsetBy(dx: half.virtualBounds.minX - hidden.minX - half.localRect.minX,
+                                              dy: half.virtualBounds.minY - hidden.minY - half.localRect.minY)
+            }
+            moves.append((match.window, Self.fit(translated, inside: cocoaRect(screen.visibleFrame)), panel))
         }
         guard !moves.isEmpty else { return }
-        do { try onCheckpoint?() } catch {
+        do {
+            if moves.contains(where: { !$0.panel }) { try onCheckpoint?() }
+        } catch {
             DemoLog.shared.line(L("窗口补位暂缓：%@", String(describing: error.localizedDescription)))
             return
         }
         // Keep the short AX writes on the main actor so a join cannot start between validation and placement.
-        for (window, frame) in moves { window.place(frame) }
+        for (window, frame, panel) in moves {
+            if panel { window.setPosition(frame.origin) }
+            else { window.place(frame) }
+        }
     }
 
     func collectRemainingWindows(on halves: [HalfScreen], reserved: [Identity]) async {
@@ -940,18 +995,20 @@ final class WindowPlacement {
     private struct WindowInfo: Sendable {
         let id: CGWindowID
         let pid: pid_t
+        let layer: Int
         let frame: CGRect
         let title: String
         let onScreen: Bool
     }
 
-    nonisolated private static func movableWindows(from visible: [WindowInfo], allowOffscreen: Bool = false, includeFullScreen: Bool = false) -> [(info: WindowInfo, window: Window, frame: CGRect)] {
+    nonisolated private static func movableWindows(from visible: [WindowInfo], allowOffscreen: Bool = false,
+                                                  includeFullScreen: Bool = false, includePanels: Bool = false) -> [(info: WindowInfo, window: Window, frame: CGRect)] {
         var matches: [CGWindowID: (window: Window, frame: CGRect)] = [:]
         for (pid, candidates) in Dictionary(grouping: visible, by: \.pid) {
             if allowOffscreen, NSRunningApplication(processIdentifier: pid)?.activationPolicy != .regular { continue }
             var remaining = candidates
             for window in Window.accessibleWindows(for: pid) {
-                guard !remaining.isEmpty, (includeFullScreen && window.isFullScreen) || window.canMove,
+                guard !remaining.isEmpty, (includeFullScreen && window.isFullScreen) || window.canMove || (includePanels && window.isMovablePanel),
                       includeFullScreen || !window.isFullScreen, let frame = window.frame else { continue }
                 let index: Int?
                 if let id = window.number { index = remaining.firstIndex { $0.id == id && (allowOffscreen || near(frame, $0.frame)) } }
@@ -984,16 +1041,16 @@ final class WindowPlacement {
         return Window.find(info) ?? Window.findUnlistedWindow(info)
     }
 
-    nonisolated private static func windowList(_ options: CGWindowListOption) -> [WindowInfo] {
+    nonisolated private static func windowList(_ options: CGWindowListOption, levels: Set<Int> = [0]) -> [WindowInfo] {
         let entries = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] ?? []
         return entries.compactMap { entry in
-            guard entry[kCGWindowLayer as String] as? Int == 0,
+            guard let layer = entry[kCGWindowLayer as String] as? Int, levels.contains(layer),
                   let id = entry[kCGWindowNumber as String] as? CGWindowID,
                   let pid = entry[kCGWindowOwnerPID as String] as? pid_t, pid != getpid(),
                   let dictionary = entry[kCGWindowBounds as String] as? [String: Any],
                   let frame = CGRect(dictionaryRepresentation: dictionary as CFDictionary),
                   frame.width > 1, frame.height > 1 else { return nil }
-            return WindowInfo(id: id, pid: pid, frame: frame, title: entry[kCGWindowName as String] as? String ?? "",
+            return WindowInfo(id: id, pid: pid, layer: layer, frame: frame, title: entry[kCGWindowName as String] as? String ?? "",
                               onScreen: entry[kCGWindowIsOnscreen as String] as? Bool == true)
         }
     }
@@ -1115,6 +1172,12 @@ final class WindowPlacement {
 
         var isStandard: Bool {
             Self.attribute(kAXSubroleAttribute as String, of: element) as? String == kAXStandardWindowSubrole as String
+        }
+
+        var isMovablePanel: Bool {
+            guard let subrole = Self.attribute(kAXSubroleAttribute, of: element) as? String,
+                  subrole == kAXFloatingWindowSubrole || subrole == kAXDialogSubrole else { return false }
+            return positionIsSettable
         }
 
         var positionIsSettable: Bool {

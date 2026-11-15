@@ -22,6 +22,7 @@
 		A30000000000000000000010 /* EnvironmentCheck.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000010 /* EnvironmentCheck.swift */; };
 		A30000000000000000000011 /* ProductPreferences.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000011 /* ProductPreferences.swift */; };
 		A30000000000000000000014 /* PlacementGeometry.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000014 /* PlacementGeometry.swift */; };
+		A30000000000000000000015 /* PhysicalScreenScreenshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000015 /* PhysicalScreenScreenshot.swift */; };
 		A30000000000000000000012 /* Diagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000012 /* Diagnostics.swift */; };
 		A30000000000000000000013 /* Localization.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000013 /* Localization.swift */; };
 		A300000000000000000000F1 /* AppIcon.icns in Resources */ = {isa = PBXBuildFile; fileRef = A200000000000000000000F1; };
@@ -54,6 +55,7 @@
 		A20000000000000000000010 /* EnvironmentCheck.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EnvironmentCheck.swift; sourceTree = "<group>"; };
 		A20000000000000000000011 /* ProductPreferences.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProductPreferences.swift; sourceTree = "<group>"; };
 		A20000000000000000000014 /* PlacementGeometry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlacementGeometry.swift; sourceTree = "<group>"; };
+		A20000000000000000000015 /* PhysicalScreenScreenshot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhysicalScreenScreenshot.swift; sourceTree = "<group>"; };
 		A20000000000000000000012 /* Diagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Diagnostics.swift; sourceTree = "<group>"; };
 		A20000000000000000000013 /* Localization.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Localization.swift; sourceTree = "<group>"; };
 		A200000000000000000000F1 /* AppIcon.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = AppIcon.icns; sourceTree = "<group>"; };
@@ -114,6 +116,7 @@
 				A20000000000000000000010 /* EnvironmentCheck.swift */,
 				A20000000000000000000011 /* ProductPreferences.swift */,
 				A20000000000000000000014 /* PlacementGeometry.swift */,
+				A20000000000000000000015 /* PhysicalScreenScreenshot.swift */,
 				A20000000000000000000012 /* Diagnostics.swift */,
 				A20000000000000000000013 /* Localization.swift */,
 				A20000000000000000000006 /* VirtualDisplay.h */,
@@ -208,6 +211,7 @@
 				A30000000000000000000010 /* EnvironmentCheck.swift in Sources */,
 				A30000000000000000000011 /* ProductPreferences.swift in Sources */,
 				A30000000000000000000014 /* PlacementGeometry.swift in Sources */,
+				A30000000000000000000015 /* PhysicalScreenScreenshot.swift in Sources */,
 				A30000000000000000000012 /* Diagnostics.swift in Sources */,
 				A30000000000000000000013 /* Localization.swift in Sources */,
 			);

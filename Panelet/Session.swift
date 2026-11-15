@@ -9,6 +9,15 @@ final class SplitSessions {
     private var originalScreens: [CGDirectDisplayID: PhysicalScreen] = [:]
     private var standby: [CGDirectDisplayID: [HalfScreen]] = [:]
     private var router: MouseRouter?
+    private let captureOverlayQueue = DispatchQueue(label: "dev.cmkk.panelet.capture-overlays", qos: .userInitiated)
+    private let popupValidation = CaptureOverlays.PopupValidation()
+    private var captureOverlayTimer: Timer?
+    private var captureOverlayQueryInFlight = false
+    private var captureOverlayRevision: UInt64 = 0
+    private var captureRouting = MouseRouter.CaptureRouting()
+    private var nextScreenshotShortcutRead = ContinuousClock.now
+    private var mirrorShields: [CGDirectDisplayID: Set<CGWindowID>] = [:]
+    private var updatingMirrorShields = false
     private var routedLayout: [CGDirectDisplayID: CGRect] = [:]
     private var routedDisplays: Set<CGDirectDisplayID> = []
     private var layoutChangedAt: [CGDirectDisplayID: ContinuousClock.Instant] = [:]
@@ -36,6 +45,7 @@ final class SplitSessions {
             Task { @MainActor in
                 guard let self else { return }
                 self.sleeping = true
+                self.captureOverlayRevision &+= 1
                 for session in self.active { session.resetQuickMonitoring() }
             }
         })
@@ -43,6 +53,7 @@ final class SplitSessions {
             Task { @MainActor in
                 guard let self else { return }
                 self.sleeping = false
+                self.captureOverlayRevision &+= 1
                 self.wakeReadyAt = .now + .seconds(2)
                 self.layoutChangedAt.removeAll()
                 for session in self.active { session.resetQuickMonitoring() }
@@ -59,6 +70,7 @@ final class SplitSessions {
                     guard let self else { return }
                     if screenEvent { self.screensSleeping = inactive }
                     else { self.sessionInactive = inactive }
+                    self.captureOverlayRevision &+= 1
                     self.wakeReadyAt = .now + .seconds(2)
                     self.layoutChangedAt.removeAll()
                     for session in self.active { session.resetQuickMonitoring() }
@@ -146,11 +158,9 @@ final class SplitSessions {
     func screens() -> [PhysicalScreen] {
         let current = DisplayScanner.physicalScreens()
         return current.map { screen in
-            guard let session = sessions[screen.id], session.hasHalves,
-                  let logical = logicalBounds(for: screen.id) else { return screen }
             var result = screen
-            result.bounds = logical
-            result.configuration = session.configuration
+            if let logical = logicalBounds(for: screen.id) { result.bounds = logical }
+            if let session = sessions[screen.id], session.hasHalves { result.configuration = session.configuration }
             return result
         }
     }
@@ -170,7 +180,10 @@ final class SplitSessions {
     }
 
     func splitDisplay(at point: CGPoint) -> CGDirectDisplayID? {
-        active.first { $0.halves.contains { $0.virtualBounds.contains(point) } }?.targetID
+        active.first { session in
+            session.halves.contains { $0.virtualBounds.contains(point) }
+                || (captureRouting.allows(session.targetID, at: point) && routedLayout[session.targetID]?.contains(point) == true)
+        }?.targetID
     }
 
     func split(_ id: CGDirectDisplayID, pair: WindowPlacement.Pair? = nil, configuration: DisplayConfiguration? = nil) {
@@ -224,7 +237,10 @@ final class SplitSessions {
 
     func cancelPreparation() { transition?.cancelPreparation() }
 
-    fileprivate func beginDisplayChange() { changingDisplays = true }
+    fileprivate func beginDisplayChange() {
+        changingDisplays = true
+        captureOverlayRevision &+= 1
+    }
 
     fileprivate func endDisplayChange() {
         changingDisplays = false
@@ -316,8 +332,7 @@ final class SplitSessions {
         if session.idle || session.active { transition = nil }
         layoutChangedAt.removeAll()
         if sessions.isEmpty {
-            router?.stop()
-            router = nil
+            stopRouting()
             routedLayout.removeAll()
             originalScreens.removeAll()
         }
@@ -350,57 +365,25 @@ final class SplitSessions {
     }
 
     fileprivate func layout() -> [CGDirectDisplayID: CGRect] {
-        let physical = DisplayScanner.physicalScreens()
-        var layout = Dictionary(uniqueKeysWithValues: physical.map { ($0.id, logicalBounds(for: $0.id) ?? $0.bounds) })
-        let rightmost = physical.map { logicalBounds(for: $0.id) ?? $0.bounds }.max {
+        let physical = Dictionary(uniqueKeysWithValues: DisplayScanner.physicalScreens().map { ($0.id, logicalBounds(for: $0.id) ?? $0.bounds) })
+        let halves = Dictionary(uniqueKeysWithValues: sessions.values.filter { $0.isParkingPhysical && $0.hasHalves }.map { session in
+            (session.targetID, Dictionary(uniqueKeysWithValues: session.halves.map { ($0.virtualID, $0.localRect) }))
+        })
+        var layout = DisplayScanner.splitDisplayFrames(physical: physical, main: CGMainDisplayID(), halves: halves)
+        let rightmost = layout.values.max {
             if $0.maxX != $1.maxX { return $0.maxX < $1.maxX }
             return $0.minY < $1.minY
         }
-        let split = sessions.values.filter { $0.isParkingPhysical && $0.hasHalves }.sorted { $0.targetID < $1.targetID }
-        for session in split {
-            guard let desktop = layout[session.targetID] else { continue }
-            for half in session.halves {
-                layout[half.virtualID] = half.localRect.offsetBy(dx: desktop.minX, dy: desktop.minY)
-            }
-        }
-        // A portrait main display stays at zero while its halves extend from the right edge.
-        let main = CGMainDisplayID()
-        if let session = split.first(where: { $0.targetID == main }), let physicalMain = layout[main] {
-            let right = rightmost ?? physicalMain
-            for half in session.halves {
-                layout[half.virtualID] = half.localRect.offsetBy(dx: right.maxX, dy: right.minY)
-            }
-        }
-        var occupied = layout.filter { id, _ in id == main || !split.contains { $0.targetID == id } }.map(\.value)
-        for session in split where session.targetID != main {
-            guard let desktop = layout[session.targetID] else { continue }
-            // Attach the parked panel to its own desktop, so removing another
-            // pair of virtual displays does not drag this panel along with it.
-            let parked = Self.parkingFrame(size: desktop.size, beside: desktop, avoiding: occupied)
-            layout[session.targetID] = parked
-            occupied.append(parked)
-        }
+        var occupied = Array(layout.values)
         for (id, halves) in standby.sorted(by: { $0.key < $1.key }) {
             var anchor = layout[id] ?? rightmost ?? .zero
             for half in halves {
-                anchor = Self.parkingFrame(size: half.pointSize, beside: anchor, avoiding: occupied)
+                anchor = DisplayScanner.parkingFrame(size: half.pointSize, beside: anchor, avoiding: occupied)
                 layout[half.virtualID] = anchor
                 occupied.append(anchor)
             }
         }
         return layout
-    }
-
-    private static func parkingFrame(size: CGSize, beside desktop: CGRect, avoiding occupied: [CGRect]) -> CGRect {
-        let candidates = [CGPoint(x: desktop.minX, y: desktop.maxY),
-                          CGPoint(x: desktop.minX, y: desktop.minY - size.height),
-                          CGPoint(x: desktop.maxX, y: desktop.minY),
-                          CGPoint(x: desktop.minX - size.width, y: desktop.minY)]
-        if let frame = candidates.map({ CGRect(origin: $0, size: size) }).first(where: { candidate in
-            occupied.allSatisfy { $0.intersection(candidate).isEmpty }
-        }) { return frame }
-        let edge = occupied.max { $0.maxX < $1.maxX } ?? desktop
-        return CGRect(origin: CGPoint(x: edge.maxX, y: edge.minY), size: size)
     }
 
     fileprivate func windowDestination(for id: CGDirectDisplayID?, joining: Session?, beforeJoin: Bool = false) -> NSScreen? {
@@ -443,10 +426,7 @@ final class SplitSessions {
                 && session.halves.allSatisfy { layout[$0.virtualID] != nil }
         }
         guard !split.isEmpty else {
-            if !busy {
-                router?.stop()
-                router = nil
-            }
+            if !busy { stopRouting() }
             routedLayout.removeAll()
             routedDisplays.removeAll()
             return
@@ -462,20 +442,117 @@ final class SplitSessions {
             for session in split { try session.updateLayout(layout) }
         }
         guard layout != routedLayout || parked != routedDisplays || router?.isEnabled != true else { return }
+        captureOverlayRevision &+= 1
         let parking = split.compactMap { session -> MouseRouter.Parking? in
             guard session.isParkingPhysical, let physical = layout[session.targetID],
                   let first = session.halves.first, let upper = layout[first.virtualID] else { return nil }
             let desktop = CGRect(origin: upper.origin, size: physical.size)
-            return MouseRouter.Parking(physical: physical, desktop: desktop)
+            return MouseRouter.Parking(physical: physical, desktop: desktop, displayID: session.targetID)
         }
         let input = router ?? MouseRouter()
         input.update(parked: parking + hidden, screens: layout.filter { !parked.contains($0.key) }.map(\.value))
         if router == nil {
             guard input.start() else { throw DemoError(L("鼠标事件监听启动失败。请检查辅助功能权限并重新启动。")) }
             router = input
+            let timer = Timer(timeInterval: 0.12, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.updateCaptureOverlays() }
+            }
+            captureOverlayTimer = timer
+            RunLoop.main.add(timer, forMode: .common)
         }
         routedLayout = layout
         routedDisplays = parked
+    }
+
+    private func updateCaptureOverlays() {
+        guard router != nil, !changingDisplays else { return }
+        let targets = monitoringAllowed ? captureTargets() : []
+        guard !targets.isEmpty else {
+            setCaptureRouting(.init())
+            router?.configureScreenshots(enabled: false)
+            return
+        }
+        guard !captureOverlayQueryInFlight else { return }
+        captureOverlayQueryInFlight = true
+        let revision = captureOverlayRevision
+        let readShortcuts = ContinuousClock.now >= nextScreenshotShortcutRead
+        if readShortcuts { nextScreenshotShortcutRead = .now + .seconds(1) }
+        captureOverlayQueue.async { [weak self, popupValidation] in
+            let inspection = CaptureOverlays.inspect(on: targets, popupValidation: popupValidation,
+                                                     canInteract: WindowPlacement.isInteractivePopup)
+            let shortcuts = readShortcuts ? PhysicalScreenScreenshot.Shortcuts.current() : nil
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.captureOverlayQueryInFlight = false
+                guard self.captureOverlayRevision == revision,
+                      self.monitoringAllowed, !self.changingDisplays, self.captureTargets() == targets else { return }
+                self.router?.configureScreenshots(enabled: true, shortcuts: shortcuts)
+                guard let inspection else { return }
+                self.setCaptureRouting(inspection.routing)
+                self.updateMirrorShields(inspection.shieldsByDisplay)
+            }
+        }
+    }
+
+    private func captureTargets() -> [CaptureOverlays.Target] {
+        active.compactMap { session -> CaptureOverlays.Target? in
+            guard session.isParkingPhysical, let panel = routedLayout[session.targetID] else { return nil }
+            let halves = session.halves.compactMap { half in
+                routedLayout[half.virtualID].map { CaptureOverlays.Half(id: half.virtualID, frame: $0) }
+            }
+            guard halves.count == 2 else { return nil }
+            return CaptureOverlays.Target(id: session.targetID, physical: panel, halves: halves,
+                                          mirrorWindows: Set(session.halves.compactMap(\.mirrorWindowID)))
+        }.sorted { $0.id < $1.id }
+    }
+
+    private func updateMirrorShields(_ shields: [CGDirectDisplayID: Set<CGWindowID>]) {
+        mirrorShields = shields
+        guard !updatingMirrorShields else { return }
+        let changes = active.flatMap(\.halves).compactMap { half -> (half: HalfScreen, ids: Set<CGWindowID>)? in
+            let ids = shields[half.virtualID, default: []]
+            return half.needsShieldUpdate(ids) ? (half, ids) : nil
+        }
+        guard !changes.isEmpty else { return }
+
+        updatingMirrorShields = true
+        let revision = captureOverlayRevision
+        let requestedIDs = Set(changes.flatMap(\.ids))
+        Task { [weak self] in
+            defer { self?.updatingMirrorShields = false }
+            var availableShields: [SCWindow] = []
+            if !requestedIDs.isEmpty {
+                guard let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true) else { return }
+                availableShields = content.windows.filter { requestedIDs.contains($0.windowID) }
+            }
+            guard let self, self.captureOverlayRevision == revision,
+                  self.monitoringAllowed, !self.changingDisplays else { return }
+
+            await withTaskGroup(of: Void.self) { group in
+                for (half, ids) in changes {
+                    let windows = availableShields.filter { ids.contains($0.windowID) }
+                    guard windows.count == ids.count, self.mirrorShields[half.virtualID, default: []] == ids else { continue }
+                    group.addTask { await half.updateShieldExclusions(windows) }
+                }
+            }
+        }
+    }
+
+    private func setCaptureRouting(_ routing: MouseRouter.CaptureRouting) {
+        guard routing != captureRouting else { return }
+        captureRouting = routing
+        router?.setCaptureRouting(routing)
+    }
+
+    private func stopRouting() {
+        captureOverlayTimer?.invalidate()
+        captureOverlayTimer = nil
+        captureOverlayRevision &+= 1
+        captureRouting = .init()
+        nextScreenshotShortcutRead = .now
+        mirrorShields.removeAll()
+        router?.stop()
+        router = nil
     }
 }
 
@@ -505,6 +582,7 @@ final class Session {
     var idle: Bool { phase == .idle }
     var active: Bool { phase == .split }
     var preparing: Bool { phase == .preparing }
+    var joining: Bool { phase == .joining }
     var canJoin: Bool { preparing || active || needsRecovery }
     var hasHalves: Bool { !halves.isEmpty }
     fileprivate var isParkingPhysical = true

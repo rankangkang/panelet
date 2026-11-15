@@ -762,7 +762,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         retryRecoveryButton.isEnabled = operationsAvailable && hasRecovery
         restoreAllButton.isEnabled = canRestoreAll
         if splits.recovering { recoveryStatus.stringValue = L("正在恢复显示器和窗口…") }
-        else if restoringAll, let transition = splits.transition { recoveryStatus.stringValue = transition.status }
+        else if let transition = splits.transition, restoringAll || transition.joining { recoveryStatus.stringValue = transition.status }
         else {
             recoveryStatus.stringValue = splits.recoveryProblem ?? splits.sessions.values.first(where: \.needsRecovery)?.status ?? L("没有待恢复的窗口。")
         }
@@ -1049,8 +1049,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         guard operationsAvailable else { return }
         let pointer = CGEvent(source: nil)?.location
         let pointed = pointer.flatMap { splits.splitDisplay(at: $0) }
-        let target = pointed.flatMap { splits.sessions[$0] } ?? (splits.active.count == 1 ? splits.active.first : nil)
-        if let target { restore(target.targetID, action: RestoreAction(session: target)) }
+        if let pointed, let target = splits.sessions[pointed] { restore(pointed, action: RestoreAction(session: target)) }
         else { chooseRestore() }
     }
 

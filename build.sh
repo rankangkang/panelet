@@ -86,6 +86,7 @@ swiftc -O -g \
   Panelet/Localization.swift \
   Panelet/HalfScreen.swift \
   Panelet/MouseRouter.swift \
+  Panelet/PhysicalScreenScreenshot.swift \
   Panelet/WindowPlacement.swift \
   Panelet/Session.swift \
   Panelet/QuickExitPolicy.swift \

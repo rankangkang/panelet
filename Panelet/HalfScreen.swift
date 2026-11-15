@@ -43,11 +43,17 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
     private var numberView: NSView?
     private var numberTask: Task<Void, Never>?
     private var stream: SCStream?
+    private var streamFilter: (display: SCDisplay, excludedShields: Set<CGWindowID>)?
     private var displayedStream: ObjectIdentifier?
     private var tornDown = false
     var onFailure: ((Error) -> Void)?
 
     var hasFrame: Bool { stream.map { ObjectIdentifier($0) == displayedStream } ?? false }
+
+    var mirrorWindowID: CGWindowID? {
+        guard let window, window.windowNumber > 0 else { return nil }
+        return CGWindowID(window.windowNumber)
+    }
 
     var virtualBounds: CGRect { CGDisplayBounds(virtualID) }
 
@@ -209,6 +215,7 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         )
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: captureQueue)
         displayedStream = nil
+        streamFilter = nil
         self.stream = stream
         try await stream.startCapture()
         if tornDown || Task.isCancelled {
@@ -216,6 +223,21 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
             throw CancellationError()
         }
         guard self.stream === stream else { throw DemoError(L("%@ 的采集流在启动时中断。", String(describing: name))) }
+        streamFilter = (scDisplay, [])
+    }
+
+    func needsShieldUpdate(_ ids: Set<CGWindowID>) -> Bool {
+        guard stream != nil, let streamFilter else { return false }
+        return streamFilter.excludedShields != ids
+    }
+
+    func updateShieldExclusions(_ windows: [SCWindow]) async {
+        let ids = Set(windows.map(\.windowID))
+        guard let stream, let streamFilter, streamFilter.excludedShields != ids else { return }
+        let filter = SCContentFilter(display: streamFilter.display, excludingWindows: windows)
+        // A shield can close during the filter update. Reconcile on the next scan.
+        guard (try? await stream.updateContentFilter(filter)) != nil, self.stream === stream else { return }
+        self.streamFilter?.excludedShields = ids
     }
 
     func recoverCapture() async throws {
@@ -274,6 +296,7 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         hideWindow()
         let activeStream = stream
         stream = nil
+        streamFilter = nil
         activeStream?.stopCapture { _ in }
         pendingFrame.withLockUnchecked { $0 = nil }
         mirrorLayer.contents = nil

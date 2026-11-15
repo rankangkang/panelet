@@ -63,6 +63,47 @@ struct PhysicalScreen {
 }
 
 enum DisplayScanner {
+    static func splitDisplayFrames(physical: [CGDirectDisplayID: CGRect], main: CGDirectDisplayID,
+                                   halves: [CGDirectDisplayID: [CGDirectDisplayID: CGRect]]) -> [CGDirectDisplayID: CGRect] {
+        var desktops = physical
+        if halves[main] != nil, let panel = physical[main], let leftmost = physical.values.min(by: {
+            if $0.minX != $1.minX { return $0.minX < $1.minX }
+            return abs($0.midY - panel.midY) < abs($1.midY - panel.midY)
+        }) {
+            // WindowServer keeps the main panel at zero. Move the interactive desktop
+            // group together so its shared edges stay in the same physical order.
+            let dx = panel.maxX - leftmost.minX
+            let dy = min(max(0, panel.minY - leftmost.maxY + 1), panel.maxY - leftmost.minY - 1)
+            desktops = desktops.mapValues { $0.offsetBy(dx: dx, dy: dy) }
+        }
+
+        var layout = desktops.filter { halves[$0.key] == nil }
+        for (id, frames) in halves {
+            guard let desktop = desktops[id] else { continue }
+            for (half, frame) in frames {
+                layout[half] = frame.offsetBy(dx: desktop.minX, dy: desktop.minY)
+            }
+        }
+        if let mainPanel = physical[main] { layout[main] = mainPanel }
+        for id in halves.keys.sorted() where id != main {
+            guard let desktop = desktops[id] else { continue }
+            layout[id] = parkingFrame(size: desktop.size, beside: desktop, avoiding: Array(layout.values))
+        }
+        return layout
+    }
+
+    static func parkingFrame(size: CGSize, beside desktop: CGRect, avoiding occupied: [CGRect]) -> CGRect {
+        let candidates = [CGPoint(x: desktop.minX, y: desktop.maxY),
+                          CGPoint(x: desktop.minX, y: desktop.minY - size.height),
+                          CGPoint(x: desktop.maxX, y: desktop.minY),
+                          CGPoint(x: desktop.minX - size.width, y: desktop.minY)]
+        if let frame = candidates.map({ CGRect(origin: $0, size: size) }).first(where: { candidate in
+            occupied.allSatisfy { $0.intersection(candidate).isEmpty }
+        }) { return frame }
+        let edge = occupied.max { $0.maxX < $1.maxX } ?? desktop
+        return CGRect(origin: CGPoint(x: edge.maxX, y: edge.minY), size: size)
+    }
+
     static func physicalScreens() -> [PhysicalScreen] {
         activeDisplayIDs().compactMap { id in
             guard !DemoDisplay.createdIDs.contains(id) else { return nil }

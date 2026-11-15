@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 @main
@@ -26,6 +27,17 @@ struct SplitLayoutTests {
             let moved = original.offsetBy(dx: virtual.x - physical.x - local.x, dy: virtual.y - physical.y - local.y)
             assert(moved.offsetBy(dx: physical.x + local.x - virtual.x, dy: physical.y + local.y - virtual.y) == original)
         }
-        print("SplitLayout: portrait, landscape, square, odd dimensions and coordinate round trips passed")
+        let primary = CGRect(x: 0, y: 0, width: 2560, height: 1440)
+        let right = CGRect(x: 2560, y: 310, width: 1920, height: 1080)
+        let left = CGRect(x: -1920, y: -320, width: 1920, height: 1080)
+        let halves: [CGDirectDisplayID: CGRect] = [3: CGRect(x: 0, y: 0, width: 1280, height: 1440),
+                                                   4: CGRect(x: 1280, y: 0, width: 1280, height: 1440)]
+        let original: [CGDirectDisplayID: CGRect] = [1: primary, 2: right, 5: left]
+        let split = DisplayScanner.splitDisplayFrames(physical: original, main: 1, halves: [1: halves])
+        assert(split[1] == primary)
+        assert(split[5]?.maxX == split[3]?.minX && split[4]?.maxX == split[2]?.minX)
+        assert(split[3]?.minY == 0 && split[2]?.minY == 310 && split[5]?.minY == -320)
+        assert(DisplayScanner.splitDisplayFrames(physical: original, main: 1, halves: [:]) == original)
+        print("SplitLayout: split geometry, adjacent monitors and restoration of original positions passed")
     }
 }
