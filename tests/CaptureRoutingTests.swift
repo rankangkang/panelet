@@ -195,6 +195,87 @@ struct CaptureRoutingTests {
             "value": ["parameters": [51, 21, standard.rawValue]]]])
         assert(keys.handle(keyCode: 20, flags: standard, down: true, repeated: false) == .pass)
         assert(keys.handle(keyCode: 21, flags: standard, down: true, repeated: false) == .capture(.clipboard))
+        let parked = MouseRouter.Parking(physical: physical, desktop: left.union(right), displayID: 1,
+                                         mirrors: [.init(id: 60, frame: physical)])
+        var synchronousHits = 0
+        var hover = MouseRouter.Route(parked: [parked], screens: [left, right],
+                                      liveHitTest: { _, _ in synchronousHits += 1; return true })
+        let nextPoint = CGPoint(x: 3510, y: 50)
+        assert(hover.destination(for: projectedPoint, passiveMotion: true) == nil)
+        assert(hover.scheduleHover(at: projectedPoint, now: 100) == 0)
+        guard let first = hover.hoverPending else { fatalError("Missing hover request") }
+        assert(hover.destination(for: nextPoint, passiveMotion: true) == nil)
+        assert(hover.scheduleHover(at: nextPoint, now: 200) == nil)
+        guard let latest = hover.hoverPending else { fatalError("Missing replacement hover request") }
+        assert(latest.source == nextPoint && !hover.acceptsHover(first) && hover.acceptsHover(latest))
+        assert(synchronousHits == 0)
+        assert(hover.destination(for: nextPoint, button: .down(0)) == CGPoint(x: 950, y: 50))
+        assert(synchronousHits > 0 && !hover.acceptsHover(latest))
+        assert(hover.scheduleHover(at: CGPoint(x: 950, y: 50), now: 300) == nil)
+
+        let interactions = MouseRouter.mouseMask(observingMotion: true)
+        assert(interactions & MouseRouter.motionMask == 0)
+        assert(MouseRouter.mouseMask(observingMotion: false) == interactions | MouseRouter.motionMask)
+        for type: CGEventType in [.leftMouseDown, .leftMouseDragged, .leftMouseUp,
+                                  .rightMouseDown, .rightMouseDragged, .rightMouseUp,
+                                  .otherMouseDown, .otherMouseDragged, .otherMouseUp, .scrollWheel] {
+            assert(interactions & (1 << type.rawValue) != 0)
+        }
+
+        var observed = MouseRouter.Route(parked: [parked], screens: [left, right, other],
+                                         liveHitTest: { _, _ in fatalError("Motion queried the window server") })
+        let ordinaryPoint = CGPoint(x: 550, y: -10)
+        let parkedPoint = CGPoint(x: 550, y: 15)
+        let stamp: UInt64 = 100_000_000
+        guard let ordinary = observed.observeMotion(at: ordinaryPoint, timestamp: stamp, now: stamp + 1) else {
+            fatalError("Missing normal motion")
+        }
+        assert(ordinary.destination == nil && ordinary.hoverStart == nil)
+        guard let boundary = observed.observeMotion(at: parkedPoint, timestamp: stamp + 2, now: stamp + 3) else {
+            fatalError("Missing parking edge correction")
+        }
+        assert(boundary.destination == CGPoint(x: 550, y: -1) && observed.lastPoint == ordinaryPoint)
+        assert(observed.observeMotion(at: parkedPoint, timestamp: stamp + 4, now: stamp + 5)?.destination == boundary.destination)
+        assert(!observed.acceptsMove(revision: boundary.revision))
+        assert(observed.destination(for: ordinaryPoint, button: .down(0), timestamp: stamp + 8) == nil)
+        assert(observed.observeMotion(at: projectedPoint, timestamp: stamp + 9, now: stamp + 10) == nil)
+        assert(observed.destination(for: ordinaryPoint, button: .up(0), timestamp: stamp + 12) == nil)
+        assert(observed.observeMotion(at: projectedPoint, timestamp: stamp + 11, now: stamp + 13) == nil)
+        assert(observed.observeMotion(at: projectedPoint, timestamp: stamp + 14, now: stamp + 50_000_000) == nil)
+        assert(observed.observeMotion(at: projectedPoint, timestamp: stamp + 16, now: stamp + 15) == nil)
+        guard let splitMotion = observed.observeMotion(at: projectedPoint, timestamp: stamp + 16, now: stamp + 17),
+              let splitHover = observed.hoverPending else {
+            fatalError("Missing hover after returning to the split")
+        }
+        assert(splitMotion.destination == nil && splitMotion.hoverStart != nil && observed.acceptsHover(splitHover))
+        assert(observed.observeMotion(at: ordinaryPoint, timestamp: stamp + 18, now: stamp + 19)?.hoverStart == nil)
+        assert(!observed.acceptsHover(splitHover))
+
+        let selectorWindows = [
+            window("PixPin", 12, pixPinLevel, physical, id: 70),
+            window("PixPin", 12, pixPinLevel, left, id: 71),
+            window("PixPin", 12, pixPinLevel, right, id: 72)
+        ]
+        let selectorScreens = [physical, left, right]
+        assert(CaptureOverlays.pixPinSelectorWindows(selectorWindows, pid: 12, screens: selectorScreens) == [70, 71, 72])
+        assert(CaptureOverlays.pixPinSelectorWindows(selectorWindows, pid: 13, screens: selectorScreens) == nil)
+        assert(CaptureOverlays.pixPinSelectorWindows(Array(selectorWindows.dropLast()), pid: 12, screens: selectorScreens) == nil)
+
+        var waiting = MouseRouter.Route(parked: [parked], screens: [left, right], liveHitTest: { _, _ in false })
+        assert(waiting.reservePixPinPress(on: parked))
+        assert(waiting.setCaptureRouting(.init(displays: [1]), cursor: projectedPoint) == nil)
+        waiting.pixPinQueuedUntil = 120
+        let queuedPoint = CGPoint(x: 4200, y: 90)
+        assert(waiting.destination(for: queuedPoint, timestamp: 119) == CGPoint(x: 1640, y: 90))
+        assert(waiting.destination(for: queuedPoint, timestamp: 121) == CGPoint(x: 2559, y: 90))
+        assert(waiting.destination(for: queuedPoint, button: .up(0), timestamp: 122) == CGPoint(x: 2559, y: 90))
+        assert(waiting.pixPinQueuedUntil == nil && waiting.gesturePanel == nil)
+        assert(waiting.reservePixPinPress(on: parked))
+        waiting.suppressPixPinPress()
+        assert(waiting.discardSuppressedPixPinEvent(.leftMouseDragged))
+        assert(!waiting.discardSuppressedPixPinEvent(.mouseMoved))
+        assert(waiting.discardSuppressedPixPinEvent(.leftMouseUp))
+        assert(waiting.pressedButtons.isEmpty && waiting.gesturePanel == nil)
         print("CaptureRouting: real-window picking, capture controls, recording shields and whole-screen shortcuts passed")
     }
 }

@@ -19,7 +19,7 @@ final class SplitSessions {
     private var mirrorShields: [CGDirectDisplayID: Set<CGWindowID>] = [:]
     private var updatingMirrorShields = false
     private var routedLayout: [CGDirectDisplayID: CGRect] = [:]
-    private var routedDisplays: Set<CGDirectDisplayID> = []
+    private var routedParking: [MouseRouter.Parking] = []
     private var layoutChangedAt: [CGDirectDisplayID: ContinuousClock.Instant] = [:]
     private var failedSessions: [CGDirectDisplayID: Error] = [:]
     private var captureRecovery: [CGDirectDisplayID: Task<Void, Never>] = [:]
@@ -334,6 +334,7 @@ final class SplitSessions {
         if sessions.isEmpty {
             stopRouting()
             routedLayout.removeAll()
+            routedParking.removeAll()
             originalScreens.removeAll()
         }
         do { try checkpointRecovery() }
@@ -428,10 +429,10 @@ final class SplitSessions {
         guard !split.isEmpty else {
             if !busy { stopRouting() }
             routedLayout.removeAll()
-            routedDisplays.removeAll()
+            routedParking.removeAll()
             return
         }
-        let hidden = standby.values.flatMap { $0 }.compactMap { half -> MouseRouter.Parking? in
+        let hidden = standby.values.flatMap { $0 }.sorted { $0.virtualID < $1.virtualID }.compactMap { half -> MouseRouter.Parking? in
             guard let physical = layout[half.virtualID], let desktop = layout[half.physicalID] else { return nil }
             return MouseRouter.Parking(physical: physical, desktop: desktop)
         }
@@ -441,27 +442,31 @@ final class SplitSessions {
         if !changingDisplays {
             for session in split { try session.updateLayout(layout) }
         }
-        guard layout != routedLayout || parked != routedDisplays || router?.isEnabled != true else { return }
-        captureOverlayRevision &+= 1
-        let parking = split.compactMap { session -> MouseRouter.Parking? in
+        let parking = split.sorted { $0.targetID < $1.targetID }.compactMap { session -> MouseRouter.Parking? in
             guard session.isParkingPhysical, let physical = layout[session.targetID],
                   let first = session.halves.first, let upper = layout[first.virtualID] else { return nil }
             let desktop = CGRect(origin: upper.origin, size: physical.size)
-            return MouseRouter.Parking(physical: physical, desktop: desktop, displayID: session.targetID)
-        }
+            let mirrors = session.halves.compactMap { half in
+                half.mirrorWindowID.map { MouseRouter.NativeWindow(id: $0, frame: half.physicalRect) }
+            }
+            return MouseRouter.Parking(physical: physical, desktop: desktop, displayID: session.targetID, mirrors: mirrors)
+        } + hidden
+        guard layout != routedLayout || parking != routedParking || router?.isEnabled != true else { return }
+        captureOverlayRevision &+= 1
         let input = router ?? MouseRouter()
-        input.update(parked: parking + hidden, screens: layout.filter { !parked.contains($0.key) }.map(\.value))
+        input.update(parked: parking, screens: layout.filter { !parked.contains($0.key) }.map(\.value))
         if router == nil {
             guard input.start() else { throw DemoError(L("鼠标事件监听启动失败。请检查辅助功能权限并重新启动。")) }
             router = input
-            let timer = Timer(timeInterval: 0.12, repeats: true) { [weak self] _ in
+            let interval: TimeInterval = WindowServerHitTest.supportsLiveRouting ? 0.5 : 0.12
+            let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { self?.updateCaptureOverlays() }
             }
             captureOverlayTimer = timer
             RunLoop.main.add(timer, forMode: .common)
         }
         routedLayout = layout
-        routedDisplays = parked
+        routedParking = parking
     }
 
     private func updateCaptureOverlays() {
@@ -875,6 +880,7 @@ final class Session {
         }
         try coordinator.updateRoutes()
         for half in halves { try half.placeWindow() }
+        try coordinator.updateRoutes()
     }
 
     private static func startCaptures(_ halves: [HalfScreen], displays: [SCDisplay]) async throws {
