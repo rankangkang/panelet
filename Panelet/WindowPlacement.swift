@@ -659,13 +659,18 @@ final class WindowPlacement {
         return false
     }
 
+    nonisolated static func rescuableWindows(in entries: [[String: Any]]) -> [WindowInfo] {
+        let levels = Set([0, Int(CGWindowLevelForKey(.floatingWindow)), Int(CGWindowLevelForKey(.modalPanelWindow))])
+        return windowInfo(from: entries, levels: levels)
+    }
+
     /// Move app windows and floating panels out from behind the physical mirrors.
-    func rescueHiddenWindows(to halves: [HalfScreen], protecting: [Identity], shouldContinue: () -> Bool) async {
+    func rescueHiddenWindows(_ visibleWindows: [WindowInfo], to halves: [HalfScreen], protecting: [Identity],
+                             shouldContinue: () -> Bool) async {
         let hidden = CGDisplayBounds(source.id)
         let excluded = protecting + identities
         let scan = Task.detached(priority: .utility) {
-            let levels = Set([0, Int(CGWindowLevelForKey(.floatingWindow)), Int(CGWindowLevelForKey(.modalPanelWindow))])
-            let records = Self.windowList([.optionOnScreenOnly, .excludeDesktopElements], levels: levels).filter { record in
+            let records = visibleWindows.filter { record in
                 hidden.contains(CGPoint(x: record.frame.midX, y: record.frame.midY)) &&
                     !excluded.contains { identity in identity.matches(number: record.id, element: nil) }
             }
@@ -992,7 +997,7 @@ final class WindowPlacement {
         }.value
     }
 
-    private struct WindowInfo: Sendable {
+    struct WindowInfo: Sendable {
         let id: CGWindowID
         let pid: pid_t
         let layer: Int
@@ -1041,9 +1046,13 @@ final class WindowPlacement {
         return Window.find(info) ?? Window.findUnlistedWindow(info)
     }
 
-    nonisolated private static func windowList(_ options: CGWindowListOption, levels: Set<Int> = [0]) -> [WindowInfo] {
+    nonisolated private static func windowList(_ options: CGWindowListOption) -> [WindowInfo] {
         let entries = CGWindowListCopyWindowInfo(options, kCGNullWindowID) as? [[String: Any]] ?? []
-        return entries.compactMap { entry in
+        return windowInfo(from: entries, levels: [0])
+    }
+
+    nonisolated private static func windowInfo(from entries: [[String: Any]], levels: Set<Int>) -> [WindowInfo] {
+        entries.compactMap { entry in
             guard let layer = entry[kCGWindowLayer as String] as? Int, levels.contains(layer),
                   let id = entry[kCGWindowNumber as String] as? CGWindowID,
                   let pid = entry[kCGWindowOwnerPID as String] as? pid_t, pid != getpid(),

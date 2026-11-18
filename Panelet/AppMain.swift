@@ -71,6 +71,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private var logView: NSTextView!
     private var displays: [PhysicalScreen] = []
     private var lastScreenKey = ""
+    private var refreshTimer: Timer?
     private var closing = false
     private var allowIncompleteExit = false
     private var quitDeadline: Task<Void, Never>?
@@ -132,9 +133,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         updateShortcutControls()
         shortcutInfo.stringValue = shortcutInstructions
         if !unavailableShortcuts.isEmpty { DemoLog.shared.line(shortcutInstructions) }
-        Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
-            Task { @MainActor in self?.refresh() }
-        }
+        NotificationCenter.default.addObserver(self, selector: #selector(startRefreshing(_:)),
+                                               name: NSWindow.didBecomeKeyNotification, object: nil)
         refresh()
         logStartup()
         Task {
@@ -672,7 +672,24 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         }
     }
 
+    @objc private func startRefreshing(_ notification: Notification? = nil) {
+        guard refreshTimer == nil else { return }
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] timer in
+            MainActor.assumeIsolated {
+                if let self, self.window.isVisible || self.quick.isVisible || self.guideWindow?.isVisible == true {
+                    self.refresh()
+                } else if let self, !self.splits.active.isEmpty {
+                    self.splits.checkActive()
+                } else {
+                    timer.invalidate()
+                    self?.refreshTimer = nil
+                }
+            }
+        }
+    }
+
     private func refresh() {
+        startRefreshing()
         splits.checkActive()
         if !splits.busy {
             if quick.isVisible { quick.setProblem(splitProblem, actionTitle: quickSettingsTitle) }
@@ -873,6 +890,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         window.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary, .canJoinAllApplications]
         NSApp.activate(ignoringOtherApps: true)
         window.makeKeyAndOrderFront(nil)
+        refresh()
     }
 
     private func splitQuick(displayID: CGDirectDisplayID, pair: WindowPlacement.Pair) {

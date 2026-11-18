@@ -278,7 +278,6 @@ final class SplitSessions {
         guard layoutChangedAt.isEmpty else { return }
         for session in active {
             session.checkQuickExit()
-            session.checkHiddenWindows()
         }
         if current != routedLayout {
             do { try updateRoutes() }
@@ -480,11 +479,18 @@ final class SplitSessions {
         guard !captureOverlayQueryInFlight else { return }
         captureOverlayQueryInFlight = true
         let revision = captureOverlayRevision
+        let rescueDue = !busy && layoutChangedAt.isEmpty && active.contains(where: \.hiddenWindowCheckDue)
         let readShortcuts = ContinuousClock.now >= nextScreenshotShortcutRead
         if readShortcuts { nextScreenshotShortcutRead = .now + .seconds(1) }
         captureOverlayQueue.async { [weak self, popupValidation] in
-            let inspection = CaptureOverlays.inspect(on: targets, popupValidation: popupValidation,
-                                                     canInteract: WindowPlacement.isInteractivePopup)
+            // Window rescue and overlay routing both need the visible window list.
+            let visible = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                as? [[String: Any]]
+            let inspection = visible.map {
+                CaptureOverlays.inspect(visible: $0, on: targets, popupValidation: popupValidation,
+                                        canInteract: WindowPlacement.isInteractivePopup)
+            }
+            let rescueWindows = rescueDue ? visible.map(WindowPlacement.rescuableWindows(in:)) : nil
             let shortcuts = readShortcuts ? PhysicalScreenScreenshot.Shortcuts.current() : nil
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
@@ -495,6 +501,9 @@ final class SplitSessions {
                 guard let inspection else { return }
                 self.setCaptureRouting(inspection.routing)
                 self.updateMirrorShields(inspection.shieldsByDisplay)
+                if let rescueWindows, !self.busy, self.layoutChangedAt.isEmpty {
+                    for session in self.active { session.checkHiddenWindows(rescueWindows) }
+                }
             }
         }
     }
@@ -708,15 +717,18 @@ final class Session {
         for (index, half) in halves.enumerated() { half.showNumber("\(number).\(index + 1)") }
     }
 
-    fileprivate func checkHiddenWindows() {
-        guard active, !needsRecovery, rescueTask == nil, ContinuousClock.now - lastRescue >= .seconds(1),
-              let placement else { return }
+    fileprivate var hiddenWindowCheckDue: Bool {
+        active && !needsRecovery && placement != nil && rescueTask == nil && ContinuousClock.now - lastRescue >= .seconds(1)
+    }
+
+    fileprivate func checkHiddenWindows(_ windows: [WindowPlacement.WindowInfo]) {
+        guard hiddenWindowCheckDue, let placement else { return }
         lastRescue = .now
         let protected = coordinator.active.flatMap(\.managedWindows)
         rescueTask = Task { [weak self] in
             guard let self else { return }
             defer { self.rescueTask = nil }
-            await placement.rescueHiddenWindows(to: self.halves, protecting: protected) {
+            await placement.rescueHiddenWindows(windows, to: self.halves, protecting: protected) {
                 self.active && !self.needsRecovery && !self.coordinator.busy && self.coordinator.monitoringAllowed &&
                     self.layoutProblem(in: Dictionary(uniqueKeysWithValues: DisplayScanner.activeDisplayIDs().map { ($0, CGDisplayBounds($0)) })) == nil
             }

@@ -656,7 +656,9 @@ enum CaptureOverlays {
     final class PopupValidation: @unchecked Sendable {
         private var results: [CGWindowID: (pid: pid_t, accepted: Bool, retryAfter: ContinuousClock.Instant)] = [:]
 
-        fileprivate func retainVisible(_ ids: Set<CGWindowID>) {
+        fileprivate func retainVisible(_ windows: [[String: Any]]) {
+            guard !results.isEmpty else { return }
+            let ids = Set(windows.compactMap { $0[kCGWindowNumber as String] as? CGWindowID })
             results = results.filter { ids.contains($0.key) }
         }
 
@@ -671,12 +673,10 @@ enum CaptureOverlays {
         }
     }
 
-    // Preserve the current state if WindowServer cannot provide a window list.
-    static func inspect(on targets: [Target], popupValidation: PopupValidation,
-                        canInteract: (pid_t, CGRect) -> Bool) -> Inspection? {
-        guard var windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
-                as? [[String: Any]] else { return nil }
-        popupValidation.retainVisible(Set(windows.compactMap { $0[kCGWindowNumber as String] as? CGWindowID }))
+    static func inspect(visible: [[String: Any]], on targets: [Target], popupValidation: PopupValidation,
+                        canInteract: (pid_t, CGRect) -> Bool) -> Inspection {
+        var windows = visible
+        popupValidation.retainVisible(visible)
         let pixPinPIDs = Set(NSRunningApplication.runningApplications(withBundleIdentifier: pixPinBundleIdentifier)
             .map(\.processIdentifier))
         let apple = windows.filter { $0[kCGWindowOwnerName as String] as? String == "screencapture" }

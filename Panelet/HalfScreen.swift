@@ -318,7 +318,7 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     nonisolated func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
-        guard type == .screen, Self.isUsefulFrame(sampleBuffer), let pixels = sampleBuffer.imageBuffer else { return }
+        guard type == .screen, let pixels = sampleBuffer.imageBuffer, Self.isUsefulFrame(sampleBuffer) else { return }
         let frame = Frame(pixels: pixels, streamID: ObjectIdentifier(stream), receivedAt: ProcessInfo.processInfo.systemUptime)
         // Keep one pending frame, replacing it when the main thread has not displayed it yet.
         let previous = pendingFrame.withLockUnchecked { pending in
@@ -403,8 +403,9 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     nonisolated private static func isUsefulFrame(_ sampleBuffer: CMSampleBuffer) -> Bool {
-        guard let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
-              let raw = attachments.first?[.status] as? Int,
+        let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as NSArray?
+        guard let frameInfo = attachments?.firstObject as? NSDictionary,
+              let raw = frameInfo[SCStreamFrameInfo.status.rawValue] as? Int,
               let status = SCFrameStatus(rawValue: raw) else {
             return false
         }
