@@ -2,6 +2,106 @@ import AppKit
 import ApplicationServices
 import Carbon
 
+/// App-level accessibility notifications for changes to windows outside Panelet.
+@MainActor
+final class CaptureWindowEvents {
+    private let onChange: () -> Void
+    private let registrationQueue = DispatchQueue(label: "dev.cmkk.panelet.window-notifications", qos: .utility)
+    private var applications: NSKeyValueObservation?
+    private var workspaceObservers: [NSObjectProtocol] = []
+    private var watching = Set<pid_t>()
+    private var observers: [pid_t: AXObserver] = [:]
+    private var generation: UInt64 = 0
+
+    init(onChange: @escaping () -> Void) { self.onChange = onChange }
+
+    func start() {
+        guard applications == nil else { return }
+        let workspace = NSWorkspace.shared
+        applications = workspace.observe(\.runningApplications, options: [.new]) { [weak self] _, _ in
+            Task { @MainActor in self?.updateApplications() }
+        }
+        for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification,
+                     NSWorkspace.didActivateApplicationNotification, NSWorkspace.activeSpaceDidChangeNotification,
+                     NSWorkspace.didHideApplicationNotification, NSWorkspace.didUnhideApplicationNotification] {
+            workspaceObservers.append(workspace.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    guard let self else { return }
+                    if name == NSWorkspace.didLaunchApplicationNotification || name == NSWorkspace.didTerminateApplicationNotification
+                        || name == NSWorkspace.didActivateApplicationNotification {
+                        self.updateApplications()
+                    }
+                    self.onChange()
+                }
+            })
+        }
+        updateApplications()
+    }
+
+    func stop() {
+        applications?.invalidate()
+        applications = nil
+        generation &+= 1
+        workspaceObservers.forEach(NSWorkspace.shared.notificationCenter.removeObserver)
+        workspaceObservers.removeAll()
+        for observer in observers.values {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+        }
+        observers.removeAll()
+        watching.removeAll()
+    }
+
+    private func updateApplications() {
+        guard applications != nil else { return }
+        let pids = Set(NSWorkspace.shared.runningApplications.compactMap { app -> pid_t? in
+            guard app.processIdentifier != getpid(), !app.isTerminated, app.activationPolicy != .prohibited else { return nil }
+            return app.processIdentifier
+        })
+        guard pids != watching else { return }
+        let added = pids.subtracting(watching)
+        for pid in watching.subtracting(pids) {
+            if let observer = observers.removeValue(forKey: pid) {
+                CFRunLoopRemoveSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+            }
+        }
+        watching = pids
+        onChange()
+        let generation = self.generation
+        registrationQueue.async { [self] in
+            for pid in added {
+                guard let observer = Self.makeObserver(pid: pid, context: Unmanaged.passUnretained(self).toOpaque()) else { continue }
+                DispatchQueue.main.async { [self] in
+                    guard self.generation == generation, self.watching.contains(pid), self.observers[pid] == nil else { return }
+                    self.observers[pid] = observer
+                    CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
+                    // A window can open before the new process finishes registration.
+                    self.onChange()
+                }
+            }
+        }
+    }
+
+    private nonisolated static func makeObserver(pid: pid_t, context: UnsafeMutableRawPointer) -> AXObserver? {
+        var observer: AXObserver?
+        guard AXObserverCreate(pid, { _, _, _, context in
+            guard let context else { return }
+            MainActor.assumeIsolated {
+                Unmanaged<CaptureWindowEvents>.fromOpaque(context).takeUnretainedValue().onChange()
+            }
+        }, &observer) == .success, let observer else { return nil }
+
+        let app = AXUIElementCreateApplication(pid)
+        AXUIElementSetMessagingTimeout(app, 0.1)
+        let notifications = [kAXWindowCreatedNotification, kAXWindowMovedNotification, kAXWindowResizedNotification,
+                             kAXWindowDeminiaturizedNotification, kAXUIElementDestroyedNotification]
+        var registered = false
+        for notification in notifications {
+            if AXObserverAddNotification(observer, app, notification as CFString, context) == .success { registered = true }
+        }
+        return registered ? observer : nil
+    }
+}
+
 /// The windows and presentation states to restore when the display is joined.
 @MainActor
 final class WindowPlacement {

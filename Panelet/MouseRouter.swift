@@ -417,9 +417,9 @@ final class MouseRouter {
         }
     }
 
-    func configureScreenshots(enabled: Bool, shortcuts: PhysicalScreenScreenshot.Shortcuts? = nil) {
+    func configureScreenshots(enabled: Bool? = nil, shortcuts: PhysicalScreenScreenshot.Shortcuts? = nil) {
         screenshotKeys.withLock { state in
-            state.enabled = enabled
+            if let enabled { state.enabled = enabled }
             if let shortcuts { state.shortcuts = shortcuts }
         }
     }
@@ -635,6 +635,7 @@ enum CaptureOverlays {
     struct Inspection: Sendable {
         var routing = MouseRouter.CaptureRouting()
         var shieldsByDisplay: [CGDirectDisplayID: Set<CGWindowID>] = [:]
+        var screenshotUIVisible = false
     }
 
     fileprivate static let pixPinBundleIdentifier = "com.depthpicture.PixPin"
@@ -710,10 +711,12 @@ enum CaptureOverlays {
         }
         let screenshotUI = apple.isEmpty ? [] : Set(NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.screencaptureui")
             .map(\.processIdentifier))
-        return inspect(windows, on: targets, pixPinPIDs: pixPinPIDs, screenshotUIPIDs: screenshotUI,
-                       nativeHitTesting: WindowServerHitTest.isAvailable) { id, pid, frame in
+        var inspection = inspect(windows, on: targets, pixPinPIDs: pixPinPIDs, screenshotUIPIDs: screenshotUI,
+                                 nativeHitTesting: WindowServerHitTest.isAvailable) { id, pid, frame in
             popupValidation.accepts(id: id, pid: pid) { canInteract(pid, frame) }
         }
+        inspection.screenshotUIVisible = !apple.isEmpty || !inspection.routing.displays.isEmpty
+        return inspection
     }
 
     static func inspect(_ windows: [[String: Any]], on targets: [Target], pixPinPIDs: Set<pid_t>,

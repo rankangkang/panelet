@@ -12,6 +12,12 @@ final class SplitSessions {
     private let captureOverlayQueue = DispatchQueue(label: "dev.cmkk.panelet.capture-overlays", qos: .userInitiated)
     private let popupValidation = CaptureOverlays.PopupValidation()
     private var captureOverlayTimer: Timer?
+    private var captureOverlayTask: Task<Void, Never>?
+    private var captureOverlayPending = false
+    private var captureRescuePending = false
+    private var captureUIVisible = false
+    private var nextCaptureOverlayCheck = ContinuousClock.now
+    private var nextHiddenWindowReconciliation = ContinuousClock.now
     private var captureOverlayQueryInFlight = false
     private var captureOverlayRevision: UInt64 = 0
     private var captureOverlayAnchor: CGWindowID?
@@ -32,6 +38,9 @@ final class SplitSessions {
     private var sessionInactive = false
     private var wakeReadyAt = ContinuousClock.now
     fileprivate var monitoringAllowed: Bool { !sleeping && !screensSleeping && !sessionInactive && ContinuousClock.now >= wakeReadyAt }
+    private lazy var captureWindowEvents = CaptureWindowEvents { [weak self] in
+        self?.requestCaptureOverlayUpdate(rescue: true)
+    }
     var onChange: ((Session) -> Void)?
 
     var active: [Session] { sessions.values.filter(\.active) }
@@ -48,6 +57,7 @@ final class SplitSessions {
                 self.sleeping = true
                 self.captureOverlayRevision &+= 1
                 for session in self.active { session.resetQuickMonitoring() }
+                self.captureAvailabilityChanged()
             }
         })
         powerObservers.append(notifications.addObserver(forName: NSWorkspace.didWakeNotification, object: nil, queue: .main) { [weak self] _ in
@@ -58,6 +68,7 @@ final class SplitSessions {
                 self.wakeReadyAt = .now + .seconds(2)
                 self.layoutChangedAt.removeAll()
                 for session in self.active { session.resetQuickMonitoring() }
+                self.captureAvailabilityChanged()
             }
         })
         for (name, inactive, screenEvent) in [
@@ -75,6 +86,7 @@ final class SplitSessions {
                     self.wakeReadyAt = .now + .seconds(2)
                     self.layoutChangedAt.removeAll()
                     for session in self.active { session.resetQuickMonitoring() }
+                    self.captureAvailabilityChanged()
                 }
             })
         }
@@ -85,6 +97,7 @@ final class SplitSessions {
                 guard let self else { return }
                 if self.busy { try? self.updateRoutes() }
                 else { self.checkActive() }
+                self.requestCaptureOverlayUpdate(rescue: true)
             }
         }
     }
@@ -245,6 +258,7 @@ final class SplitSessions {
 
     fileprivate func endDisplayChange() {
         changingDisplays = false
+        scheduleCaptureOverlayUpdate()
     }
 
     func checkActive() {
@@ -261,6 +275,7 @@ final class SplitSessions {
             fail(first, error: DemoError(L("鼠标事件监听已停止。")))
             return
         }
+        refreshScreenshotShortcuts()
         let current = Dictionary(uniqueKeysWithValues: DisplayScanner.activeDisplayIDs().map { ($0, CGDisplayBounds($0)) })
         // Screen capture can keep delivering valid frames while an active virtual display reports no mode.
         for session in active where !session.needsRecovery {
@@ -277,6 +292,12 @@ final class SplitSessions {
             }
         }
         guard layoutChangedAt.isEmpty else { return }
+        // An app can move a background window without delivering an AX notification.
+        if WindowServerHitTest.supportsLiveRouting, .now >= nextHiddenWindowReconciliation {
+            nextHiddenWindowReconciliation = .now + .seconds(4)
+            requestCaptureOverlayUpdate(rescue: true)
+        }
+        retryCaptureWindowRescue()
         for session in active {
             session.checkQuickExit()
         }
@@ -336,6 +357,8 @@ final class SplitSessions {
             routedLayout.removeAll()
             routedParking.removeAll()
             originalScreens.removeAll()
+        } else if !busy {
+            requestCaptureOverlayUpdate(rescue: true)
         }
         do { try checkpointRecovery() }
         catch { DemoLog.shared.line(L("无法更新恢复记录：%@", String(describing: error.localizedDescription))) }
@@ -458,19 +481,73 @@ final class SplitSessions {
         if router == nil {
             guard input.start() else { throw DemoError(L("鼠标事件监听启动失败。请检查辅助功能权限并重新启动。")) }
             router = input
-            let interval: TimeInterval = WindowServerHitTest.supportsLiveRouting ? 0.5 : 0.12
-            let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
-                MainActor.assumeIsolated { self?.updateCaptureOverlays() }
+            if WindowServerHitTest.supportsLiveRouting {
+                captureWindowEvents.start()
+            } else {
+                let timer = Timer(timeInterval: 0.12, repeats: true) { [weak self] _ in
+                    MainActor.assumeIsolated { self?.updateCaptureOverlays() }
+                }
+                captureOverlayTimer = timer
+                RunLoop.main.add(timer, forMode: .common)
             }
-            captureOverlayTimer = timer
-            RunLoop.main.add(timer, forMode: .common)
         }
         routedLayout = layout
         routedParking = parking
+        requestCaptureOverlayUpdate(rescue: true)
+    }
+
+    fileprivate func requestCaptureOverlayUpdate(rescue: Bool = false) {
+        guard router != nil, WindowServerHitTest.supportsLiveRouting else { return }
+        captureOverlayPending = true
+        captureRescuePending = captureRescuePending || rescue
+        scheduleCaptureOverlayUpdate()
+    }
+
+    fileprivate func retryCaptureWindowRescue() {
+        guard captureRescuePending, active.contains(where: \.hiddenWindowCheckAvailable) else { return }
+        requestCaptureOverlayUpdate(rescue: true)
+    }
+
+    private func scheduleCaptureOverlayUpdate() {
+        guard captureOverlayPending, captureOverlayTask == nil, !captureOverlayQueryInFlight, !changingDisplays,
+              !sleeping, !screensSleeping, !sessionInactive else { return }
+        let deadline = max(nextCaptureOverlayCheck, wakeReadyAt, .now + .milliseconds(40))
+        captureOverlayTask = Task { [weak self] in
+            do { try await ContinuousClock().sleep(until: deadline) } catch { return }
+            guard !Task.isCancelled, let self else { return }
+            self.captureOverlayTask = nil
+            self.updateCaptureOverlays()
+        }
+    }
+
+    private func captureAvailabilityChanged() {
+        captureOverlayTask?.cancel()
+        captureOverlayTask = nil
+        if sleeping || screensSleeping || sessionInactive {
+            captureUIVisible = false
+            setCaptureRouting(.init())
+            router?.configureScreenshots(enabled: false)
+        } else {
+            requestCaptureOverlayUpdate(rescue: true)
+        }
+    }
+
+    private func refreshScreenshotShortcuts() {
+        guard router != nil, monitoringAllowed, .now >= nextScreenshotShortcutRead else { return }
+        nextScreenshotShortcutRead = .now + .seconds(1)
+        let revision = captureOverlayRevision
+        captureOverlayQueue.async { [weak self] in
+            let shortcuts = PhysicalScreenScreenshot.Shortcuts.current()
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.captureOverlayRevision == revision else { return }
+                self.router?.configureScreenshots(shortcuts: shortcuts)
+            }
+        }
     }
 
     private func updateCaptureOverlays() {
         guard router != nil, !changingDisplays else { return }
+        captureOverlayPending = false
         let targets = monitoringAllowed ? captureTargets() : []
         guard !targets.isEmpty else {
             setCaptureRouting(.init())
@@ -479,12 +556,20 @@ final class SplitSessions {
         }
         guard !captureOverlayQueryInFlight else { return }
         captureOverlayQueryInFlight = true
+        nextCaptureOverlayCheck = .now + .milliseconds(500)
         let revision = captureOverlayRevision
-        let rescueDue = !busy && layoutChangedAt.isEmpty && active.contains(where: \.hiddenWindowCheckDue)
+        let rescueTargets: Set<CGDirectDisplayID>
+        if !busy && layoutChangedAt.isEmpty {
+            rescueTargets = Set(active.filter {
+                $0.hiddenWindowCheckDue || (captureRescuePending && $0.hiddenWindowCheckAvailable)
+            }.map(\.targetID))
+            captureRescuePending = captureRescuePending && active.contains(where: \.checkingHiddenWindows)
+        } else {
+            rescueTargets = []
+        }
         // Rescue needs windows behind the mirrors as well.
-        let anchor = rescueDue ? nil : captureOverlayAnchor
-        let readShortcuts = ContinuousClock.now >= nextScreenshotShortcutRead
-        if readShortcuts { nextScreenshotShortcutRead = .now + .seconds(1) }
+        let anchor = rescueTargets.isEmpty ? captureOverlayAnchor : nil
+        refreshScreenshotShortcuts()
         captureOverlayQueue.async { [weak self, popupValidation] in
             let mirrors = Set(targets.flatMap(\.mirrorWindows))
             let snapshot = CaptureOverlays.visibleSnapshot(mirrors: mirrors, above: anchor)
@@ -494,20 +579,28 @@ final class SplitSessions {
                                         canInteract: WindowPlacement.isInteractivePopup)
             }
             let nextAnchor = snapshot?.backmostMirror
-            let rescueWindows = rescueDue ? visible.map(WindowPlacement.rescuableWindows(in:)) : nil
-            let shortcuts = readShortcuts ? PhysicalScreenScreenshot.Shortcuts.current() : nil
+            let rescueWindows = rescueTargets.isEmpty ? nil : visible.map(WindowPlacement.rescuableWindows(in:))
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.captureOverlayQueryInFlight = false
+                defer {
+                    // Capture tools can change modes while their existing windows stay on screen.
+                    if self.captureUIVisible { self.requestCaptureOverlayUpdate() }
+                    self.scheduleCaptureOverlayUpdate()
+                }
                 guard self.captureOverlayRevision == revision,
                       self.monitoringAllowed, !self.changingDisplays, self.captureTargets() == targets else { return }
                 self.captureOverlayAnchor = nextAnchor
-                self.router?.configureScreenshots(enabled: true, shortcuts: shortcuts)
+                self.router?.configureScreenshots(enabled: true)
                 guard let inspection else { return }
+                self.captureUIVisible = inspection.screenshotUIVisible
                 self.setCaptureRouting(inspection.routing)
                 self.updateMirrorShields(inspection.shieldsByDisplay)
                 if let rescueWindows, !self.busy, self.layoutChangedAt.isEmpty {
-                    for session in self.active { session.checkHiddenWindows(rescueWindows) }
+                    self.nextHiddenWindowReconciliation = .now + .seconds(4)
+                    for session in self.active where rescueTargets.contains(session.targetID) {
+                        session.checkHiddenWindows(rescueWindows)
+                    }
                 }
             }
         }
@@ -538,7 +631,12 @@ final class SplitSessions {
         let revision = captureOverlayRevision
         let requestedIDs = Set(changes.flatMap(\.ids))
         Task { [weak self] in
-            defer { self?.updatingMirrorShields = false }
+            defer {
+                if let self {
+                    self.updatingMirrorShields = false
+                    if self.mirrorShields != shields { self.updateMirrorShields(self.mirrorShields) }
+                }
+            }
             var availableShields: [SCWindow] = []
             if !requestedIDs.isEmpty {
                 guard let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true) else { return }
@@ -566,6 +664,14 @@ final class SplitSessions {
     private func stopRouting() {
         captureOverlayTimer?.invalidate()
         captureOverlayTimer = nil
+        captureOverlayTask?.cancel()
+        captureOverlayTask = nil
+        captureWindowEvents.stop()
+        captureOverlayPending = false
+        captureRescuePending = false
+        captureUIVisible = false
+        nextCaptureOverlayCheck = .now
+        nextHiddenWindowReconciliation = .now
         captureOverlayRevision &+= 1
         captureOverlayAnchor = nil
         captureRouting = .init()
@@ -723,17 +829,20 @@ final class Session {
         for (index, half) in halves.enumerated() { half.showNumber("\(number).\(index + 1)") }
     }
 
-    fileprivate var hiddenWindowCheckDue: Bool {
-        active && !needsRecovery && placement != nil && rescueTask == nil && ContinuousClock.now - lastRescue >= .seconds(1)
-    }
+    fileprivate var checkingHiddenWindows: Bool { rescueTask != nil }
+    fileprivate var hiddenWindowCheckAvailable: Bool { active && !needsRecovery && placement != nil && !checkingHiddenWindows }
+    fileprivate var hiddenWindowCheckDue: Bool { hiddenWindowCheckAvailable && ContinuousClock.now - lastRescue >= .seconds(1) }
 
     fileprivate func checkHiddenWindows(_ windows: [WindowPlacement.WindowInfo]) {
-        guard hiddenWindowCheckDue, let placement else { return }
+        guard hiddenWindowCheckAvailable, let placement else { return }
         lastRescue = .now
         let protected = coordinator.active.flatMap(\.managedWindows)
         rescueTask = Task { [weak self] in
             guard let self else { return }
-            defer { self.rescueTask = nil }
+            defer {
+                self.rescueTask = nil
+                self.coordinator.retryCaptureWindowRescue()
+            }
             await placement.rescueHiddenWindows(windows, to: self.halves, protecting: protected) {
                 self.active && !self.needsRecovery && !self.coordinator.busy && self.coordinator.monitoringAllowed &&
                     self.layoutProblem(in: Dictionary(uniqueKeysWithValues: DisplayScanner.activeDisplayIDs().map { ($0, CGDisplayBounds($0)) })) == nil
@@ -848,6 +957,7 @@ final class Session {
             }
         }
         for half in halves {
+            half.onFrame = { [weak coordinator] in coordinator?.requestCaptureOverlayUpdate() }
             half.onFailure = { [weak self, weak half] error in
                 guard let self, let half else { return }
                 self.coordinator.recoverCapture(half, in: self,

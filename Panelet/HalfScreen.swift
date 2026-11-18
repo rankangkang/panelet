@@ -47,6 +47,7 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
     private var displayedStream: ObjectIdentifier?
     private var tornDown = false
     var onFailure: ((Error) -> Void)?
+    var onFrame: (() -> Void)?
 
     var hasFrame: Bool { stream.map { ObjectIdentifier($0) == displayedStream } ?? false }
 
@@ -293,6 +294,7 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func park() {
         onFailure = nil
+        onFrame = nil
         hideWindow()
         let activeStream = stream
         stream = nil
@@ -353,6 +355,7 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         withExtendedLifetime(frame.pixels) { mirrorLayer.contents = surface }
         displayedStream = frame.streamID
+        onFrame?()
     }
 
     private func applyInitialMode(to display: CGVirtualDisplay) throws {

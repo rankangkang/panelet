@@ -92,6 +92,10 @@ struct CaptureRoutingTests {
         assert(selection.routing.displays == [1] && selection.shieldsByDisplay == [3: [22], 4: [23]])
         let recording = inspect(recordingShields)
         assert(recording.routing.displays.isEmpty && recording.shieldsByDisplay == [3: [22], 4: [23]])
+        assert(CaptureOverlays.inspect(visible: recordingShields, on: targets, popupValidation: .init()) { _, _ in false }
+            .screenshotUIVisible, "An open system capture needs reconciliation even without a routed selector")
+        assert(!CaptureOverlays.inspect(visible: [unrelated], on: targets, popupValidation: .init()) { _, _ in false }
+            .screenshotUIVisible, "An ordinary window must not keep an overlay timer alive")
         let windowSelection = window("screencapture", 10, 25, CGRect(x: 2600, y: 100, width: 500, height: 400), name: "windowselection")
         let picker = inspect([regionSelector, windowSelection, appleToolbar])
         assert(picker.routing.displays.isEmpty && picker.routing.controls == [1: [toolbar]])
