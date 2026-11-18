@@ -758,7 +758,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         for control in [directionPicker, ratioPicker, renderingPicker, displayAlias] as [NSControl] {
             control.isEnabled = id != nil && session == nil && !splits.busy && !restoringAll
         }
-        splitButton.title = layoutPreview.screen.map { L("%@拆分桌面", String(describing: $0.splitLayout.direction)) } ?? L("拆分桌面")
+        let canCancelDesktopSplit = session?.preparing == true && session?.hasQuick == false && !closing && !restoringAll
+        splitButton.title = canCancelDesktopSplit ? L("取消分屏")
+            : layoutPreview.screen.map { L("%@拆分桌面", String(describing: $0.splitLayout.direction)) } ?? L("拆分桌面")
         let hasRecovery = hasPendingRecovery
         let problem = splitProblem
         if let transition = splits.transition {
@@ -768,8 +770,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         }
         let activeSession = session.flatMap { $0.active ? $0 : nil }
         let restore = activeSession.map { RestoreAction(session: $0) }
-        splitButton.isHidden = session != nil
-        splitButton.isEnabled = id != nil && problem == nil && operationsAvailable && session == nil
+        splitButton.isHidden = session != nil && !canCancelDesktopSplit
+        splitButton.isEnabled = canCancelDesktopSplit || (id != nil && problem == nil && operationsAvailable && session == nil)
         popup.isEnabled = id != nil && operationsAvailable
         restoreButton.isHidden = restore == nil
         restoreButton.isEnabled = operationsAvailable && restore != nil
@@ -1049,7 +1051,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     @objc private func displayChanged() { applySessionState() }
 
     @objc private func splitClicked() {
-        guard operationsAvailable, splitProblem == nil, let id = selectedDisplayID(), splits.sessions[id] == nil else { return }
+        guard let id = selectedDisplayID() else { return }
+        if let session = splits.sessions[id], session.preparing && !session.hasQuick && !closing && !restoringAll {
+            splits.cancelPreparation()
+            return
+        }
+        guard operationsAvailable, splitProblem == nil, splits.sessions[id] == nil else { return }
         splits.split(id)
     }
 

@@ -114,8 +114,12 @@ struct ProductBehaviorTests {
         for _ in 0..<105 { ledger.record("test", started: ProcessInfo.processInfo.systemUptime - 0.5, succeeded: true) }
         assert(ledger.entries.count == 100 && ledger.entries.allSatisfy { $0.seconds >= 0.5 })
         let cancelled = PerformanceLedger()
-        cancelled.record("start", started: ProcessInfo.processInfo.systemUptime, succeeded: false, cancelled: true)
+        cancelled.record("start", started: ProcessInfo.processInfo.systemUptime, succeeded: false, cancelled: true,
+                         stages: [.windowScan: 0.1, .firstFrame: 0.2])
         assert(cancelled.failedCount == 0 && cancelled.cancelledCount == 1)
+        assert(cancelled.summary.contains("\(PerformanceLedger.Stage.windowScan.title) 0.10 s"))
+        assert(cancelled.summary.contains("\(PerformanceLedger.Stage.firstFrame.title) 0.20 s"))
+        assert(!cancelled.summary.contains(PerformanceLedger.Stage.fullScreen.title))
         print("ProductBehavior: persisted preferences, safe workspace matching, 27 layouts, rendering limits, diagnostic privacy and bounded metrics passed")
     }
 }

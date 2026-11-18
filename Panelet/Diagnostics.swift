@@ -3,10 +3,39 @@ import AppKit
 @MainActor
 final class PerformanceLedger {
     static let shared = PerformanceLedger()
-    struct Entry { let operation: String; let seconds: Double; let succeeded: Bool; let cancelled: Bool }
+    enum Stage: CaseIterable {
+        case windowScan, windowPreparation, displaySetup, firstFrame, windowMigration, fullScreen
+
+        var title: String {
+            switch self {
+            case .windowScan: L("窗口扫描")
+            case .windowPreparation: L("窗口准备")
+            case .displaySetup: L("虚拟显示器就绪")
+            case .firstFrame: L("两区首帧")
+            case .windowMigration: L("窗口迁移")
+            case .fullScreen: L("进入全屏")
+            }
+        }
+    }
+
+    struct Entry {
+        let operation: String
+        let seconds: Double
+        let succeeded: Bool
+        let cancelled: Bool
+        let stages: [Stage: TimeInterval]
+
+        var detail: String {
+            Stage.allCases.compactMap { stage in
+                stages[stage].map { "\(stage.title) \(String(format: "%.2f", $0)) s" }
+            }.joined(separator: " · ")
+        }
+    }
     private(set) var entries: [Entry] = []
-    func record(_ operation: String, started: TimeInterval, succeeded: Bool, cancelled: Bool = false) {
-        entries.append(Entry(operation: operation, seconds: max(0, ProcessInfo.processInfo.systemUptime - started), succeeded: succeeded, cancelled: cancelled))
+    func record(_ operation: String, started: TimeInterval, succeeded: Bool, cancelled: Bool = false,
+                stages: [Stage: TimeInterval] = [:]) {
+        entries.append(Entry(operation: operation, seconds: max(0, ProcessInfo.processInfo.systemUptime - started),
+                             succeeded: succeeded, cancelled: cancelled, stages: stages))
         if entries.count > 100 { entries.removeFirst(entries.count - 100) }
     }
     var failedCount: Int { entries.filter { !$0.succeeded && !$0.cancelled }.count }
@@ -14,7 +43,11 @@ final class PerformanceLedger {
     var summary: String {
         guard !entries.isEmpty else { return L("本次运行尚无分屏性能记录。") }
         return [L("本次运行最近 %@ 次操作，失败或恢复未完成 %@ 次，主动取消 %@ 次。", String(describing: entries.count), String(describing: failedCount), String(describing: cancelledCount))]
-            .adding(entries.suffix(10).map { "\($0.operation)：\(String(format: "%.2f", $0.seconds)) s · \($0.cancelled ? L("已取消分屏") : ($0.succeeded ? L("完成") : L("未完成")))" })
+            .adding(entries.suffix(10).map { entry in
+                let result = entry.cancelled ? L("已取消分屏") : (entry.succeeded ? L("完成") : L("未完成"))
+                let line = "\(entry.operation)：\(String(format: "%.2f", entry.seconds)) s · \(result)"
+                return entry.stages.isEmpty ? line : "\(line)\n  \(entry.detail)"
+            })
             .joined(separator: "\n")
     }
 }

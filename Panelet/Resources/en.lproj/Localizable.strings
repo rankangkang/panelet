@@ -55,8 +55,10 @@
 "缺少可选接口：%@" = "Missing optional interface: %@";
 "上次分屏未正常结束。请完成授权，再点“重试恢复窗口…”。" = "The previous split did not end normally. Grant the required permissions, then retry window recovery.";
 "系统尚未恢复原显示器排列，请重试。" = "The original display arrangement has not been restored yet. Try again.";
-"上次分屏的部分窗口尚未恢复，请点“重试恢复窗口…”。" = "Some windows from the previous split still need recovery. Choose Retry Window Recovery.";
-"已恢复上次异常退出的显示器排列和可用的组合窗口。" = "Restored the display arrangement and available paired windows after the previous unexpected exit.";
+"显示器组合已变化，保留当前排列。" = "The connected displays have changed. The current arrangement was kept.";
+"已恢复上次分屏的 %@ 个窗口。" = "Restored %@ windows from the previous split.";
+"%@ 个窗口正在等待原显示器。请连接原显示器后重试。" = "%@ windows are waiting for their original displays. Reconnect the displays and retry.";
+"%@ 个窗口尚未恢复，请点“重试恢复窗口…”。" = "%@ windows still need recovery. Choose Retry Window Recovery.";
 "恢复上次分屏失败：%@" = "Could not recover the previous split: %@";
 "无法更新退出恢复记录，将保留此前记录：%@" = "Could not update recovery information; the previous record will be kept: %@";
 "鼠标事件监听已停止。" = "Mouse event monitoring stopped.";
@@ -406,3 +408,11 @@
 "重新启动并继续" = "Restart and Continue";
 "重新查看导引…" = "Review Getting Started…";
 "随时回到完整屏幕" = "Restore your full display anytime";
+"取消分屏" = "Cancel Split";
+"正在扫描窗口…" = "Scanning windows…";
+"窗口扫描" = "Window scan";
+"窗口准备" = "Window preparation";
+"虚拟显示器就绪" = "Virtual display setup";
+"两区首帧" = "First frames";
+"窗口迁移" = "Window migration";
+"进入全屏" = "Enter full screen";

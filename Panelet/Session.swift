@@ -7,6 +7,9 @@ final class SplitSessions {
     private(set) var sessions: [CGDirectDisplayID: Session] = [:]
     private(set) var transition: Session?
     private var originalScreens: [CGDirectDisplayID: PhysicalScreen] = [:]
+    private var originalDisplayUUIDs: [CGDirectDisplayID: String] = [:]
+    private var recoveryRegions: [CGDirectDisplayID: (physicalID: CGDirectDisplayID, offset: CGPoint)] = [:]
+    private var lastCheckpoint: RecoveryJournal?
     private var standby: [CGDirectDisplayID: [HalfScreen]] = [:]
     private var router: MouseRouter?
     private let captureOverlayQueue = DispatchQueue(label: "dev.cmkk.panelet.capture-overlays", qos: .userInitiated)
@@ -116,27 +119,34 @@ final class SplitSessions {
                 return
             }
             let physical = DisplayScanner.physicalScreens()
-            var layout: [CGDirectDisplayID: CGRect] = [:]
-            for record in journal.displays {
-                guard let screen = physical.first(where: { RecoveryJournal.uuid($0.id) == record.uuid }),
-                      screen.bounds.size == record.bounds.size else { continue }
-                layout[screen.id] = record.bounds
-            }
-            // Restore topology only when all original displays are present and unchanged.
-            if layout.count == journal.displays.count, layout.count == physical.count {
-                try await Session.setOrigins(layout)
-                try await Task.sleep(for: .milliseconds(500))
-                guard layout.allSatisfy({ CGDisplayBounds($0.key) == $0.value }) else {
-                    throw DemoError(L("系统尚未恢复原显示器排列，请重试。"))
+            let displays = Dictionary(uniqueKeysWithValues: physical.compactMap { screen -> (CGDirectDisplayID, RecoveryJournal.Display)? in
+                guard let uuid = RecoveryJournal.uuid(screen.id) else { return nil }
+                return (screen.id, RecoveryJournal.Display(uuid: uuid, bounds: screen.bounds))
+            })
+            if displays.count == physical.count, let layout = journal.originalLayout(on: displays, main: CGMainDisplayID()) {
+                if layout != displays.mapValues(\.bounds) { try await Session.setOrigins(layout) }
+                try await Session.wait(steps: 18, error: L("系统尚未恢复原显示器排列，请重试。")) {
+                    layout.allSatisfy { id, bounds in
+                        CGDisplayBounds(id) == bounds && NSScreen.screens.contains {
+                            $0.displayID == id && cocoaRect($0.frame) == bounds
+                        }
+                    }
                 }
+            } else if !journal.displays.isEmpty {
+                DemoLog.shared.line(L("显示器组合已变化，保留当前排列。"))
             }
-            guard await WindowPlacement.recoverWindows(journal.windows) else {
-                recoveryProblem = L("上次分屏的部分窗口尚未恢复，请点“重试恢复窗口…”。")
-                return
+            let result = await WindowPlacement.recoverWindows(journal)
+            if result.pending.isEmpty { try RecoveryJournal.clear() }
+            else { try RecoveryJournal(displays: [], windows: result.pending).save() }
+            DemoLog.shared.line(L("已恢复上次分屏的 %@ 个窗口。", String(result.restored)))
+            var remaining: [String] = []
+            if result.waitingForDisplay > 0 {
+                remaining.append(L("%@ 个窗口正在等待原显示器。请连接原显示器后重试。", String(result.waitingForDisplay)))
             }
-            try RecoveryJournal.clear()
-            recoveryProblem = nil
-            DemoLog.shared.line(L("已恢复上次异常退出的显示器排列和可用的组合窗口。"))
+            if result.failed > 0 {
+                remaining.append(L("%@ 个窗口尚未恢复，请点“重试恢复窗口…”。", String(result.failed)))
+            }
+            recoveryProblem = remaining.isEmpty ? nil : remaining.joined(separator: "\n")
         } catch {
             recoveryProblem = L("恢复上次分屏失败：%@", String(describing: error.localizedDescription))
         }
@@ -148,25 +158,39 @@ final class SplitSessions {
     }
 
     fileprivate func checkpointRecovery() throws {
-        if sessions.isEmpty { try RecoveryJournal.clear(); return }
-        let displays = originalScreens.values.compactMap { screen -> RecoveryJournal.Display? in
-            guard let uuid = RecoveryJournal.uuid(screen.id) else { return nil }
-            return RecoveryJournal.Display(uuid: uuid, bounds: screen.bounds)
+        if sessions.isEmpty {
+            if lastCheckpoint != nil { try RecoveryJournal.clear(); lastCheckpoint = nil }
+            return
         }
-        let windows = sessions.values.flatMap { session in
-            session.recoveryWindows { saved in
-                for owner in self.sessions.values {
-                    if let half = owner.halves.first(where: { $0.virtualID == saved.id }),
-                       let original = self.originalScreens[owner.targetID] {
-                        return (original, CGPoint(x: original.bounds.minX + half.localRect.minX,
-                                                  y: original.bounds.minY + half.localRect.minY))
-                    }
+        let displays = originalDisplayUUIDs.compactMap { (id, uuid) in
+            originalScreens[id].map { RecoveryJournal.Display(uuid: uuid, bounds: $0.bounds) }
+        }.sorted { $0.uuid < $1.uuid }
+        func target(for saved: PhysicalScreen) -> WindowPlacement.RecoveryTarget? {
+            let region = recoveryRegions[saved.id]
+            let id = region?.physicalID ?? saved.id
+            guard let uuid = originalDisplayUUIDs[id], let original = originalScreens[id] else { return nil }
+            let offset = region?.offset ?? .zero
+            return (RecoveryJournal.Display(uuid: uuid, bounds: original.bounds),
+                    CGPoint(x: original.bounds.minX + offset.x, y: original.bounds.minY + offset.y))
+        }
+        // A selected window's state at the start of the pair takes precedence over its old desktop placement.
+        var windows: [CGWindowID: RecoveryJournal.Window] = [:]
+        for selected in [true, false] {
+            for session in sessions.values {
+                for record in session.recoveryWindows(selected: selected, mapDisplay: target) where windows[record.number] == nil {
+                    windows[record.number] = record
                 }
-                let physical = self.originalScreens[saved.id] ?? saved
-                return (physical, physical.bounds.origin)
             }
         }
-        try RecoveryJournal(displays: displays, windows: windows).save()
+        let checkpoint = RecoveryJournal(displays: displays, windows: windows.values.sorted { $0.number < $1.number })
+        guard checkpoint != lastCheckpoint else { return }
+        try checkpoint.save()
+        lastCheckpoint = checkpoint
+    }
+
+    fileprivate func updateRecoveryCheckpoint() {
+        do { try checkpointRecovery() }
+        catch { DemoLog.shared.line(L("无法更新恢复记录：%@", String(describing: error.localizedDescription))) }
     }
 
     func screens() -> [PhysicalScreen] {
@@ -213,12 +237,11 @@ final class SplitSessions {
             return
         }
         let physical = DisplayScanner.physicalScreens()
-        if sessions.isEmpty {
-            originalScreens = Dictionary(uniqueKeysWithValues: physical.map { ($0.id, $0) })
-        } else {
-            for screen in physical where originalScreens[screen.id] == nil { originalScreens[screen.id] = screen }
-        }
         guard var screen = physical.first(where: { $0.id == id }) else { return }
+        for original in physical where originalScreens[original.id] == nil {
+            originalScreens[original.id] = original
+            originalDisplayUUIDs[original.id] = RecoveryJournal.uuid(original.id)
+        }
         if let configuration { screen.configuration = configuration }
         let reserved = sessions.values.flatMap(\.managedWindows)
         let session = Session(screen: screen, pair: pair, coordinator: self)
@@ -231,7 +254,8 @@ final class SplitSessions {
         DisplayScanner.physicalScreens().flatMap { screen -> [PhysicalScreen] in
             guard let session = sessions[screen.id], session.hasHalves else { return [screen] }
             return session.halves.map { half in
-                PhysicalScreen(id: half.virtualID, name: half.name, bounds: half.virtualBounds,
+                recoveryRegions[half.virtualID] = (screen.id, half.localRect.origin)
+                return PhysicalScreen(id: half.virtualID, name: half.name, bounds: half.virtualBounds,
                                scale: screen.scale, refreshRate: screen.refreshRate, isBuiltin: false)
             }
         }
@@ -357,11 +381,12 @@ final class SplitSessions {
             routedLayout.removeAll()
             routedParking.removeAll()
             originalScreens.removeAll()
+            originalDisplayUUIDs.removeAll()
+            recoveryRegions.removeAll()
         } else if !busy {
             requestCaptureOverlayUpdate(rescue: true)
         }
-        do { try checkpointRecovery() }
-        catch { DemoLog.shared.line(L("无法更新恢复记录：%@", String(describing: error.localizedDescription))) }
+        updateRecoveryCheckpoint()
         onChange?(session)
         if !busy, monitoringAllowed, let id = failedSessions.keys.first, let error = failedSessions.removeValue(forKey: id),
            let affected = sessions[id] { fail(affected, error: error) }
@@ -598,12 +623,27 @@ final class SplitSessions {
                 self.setCaptureRouting(inspection.routing)
                 self.updateMirrorShields(inspection.shieldsByDisplay)
                 if let rescueWindows, !self.busy, self.layoutChangedAt.isEmpty {
+                    self.reconcileRecoveryOwnership(rescueWindows)
                     for session in self.active where rescueTargets.contains(session.targetID) {
                         session.checkHiddenWindows(rescueWindows)
                     }
                 }
             }
         }
+    }
+
+    private func reconcileRecoveryOwnership(_ windows: [WindowPlacement.WindowInfo]) {
+        guard !windows.isEmpty, Set(DisplayScanner.activeDisplayIDs()) == Set(routedLayout.keys),
+              routedLayout.allSatisfy({ CGDisplayBounds($0.key) == $0.value }) else { return }
+        let observed = Dictionary(uniqueKeysWithValues: windows.filter { $0.layer == 0 && $0.onScreen }.map { ($0.id, $0) })
+        let hidden = parkedIDs.union(standby.values.flatMap { $0.map(\.virtualID) })
+        let visible = routedLayout.filter { !hidden.contains($0.key) }.map(\.value)
+        let protected = Set(active.flatMap(\.managedWindows).compactMap(\.number))
+        var changed = false
+        for session in active {
+            if session.updateRecoveryOwnership(in: observed, visibleDesktops: visible, protecting: protected) { changed = true }
+        }
+        if changed { updateRecoveryCheckpoint() }
     }
 
     private func captureTargets() -> [CaptureOverlays.Target] {
@@ -715,8 +755,15 @@ final class Session {
     fileprivate var isParkingPhysical = true
     var selectedChoices: [WindowPlacement.Choice] { pair.map { [$0.upper, $0.lower] } ?? [] }
     var managedWindows: [WindowPlacement.Identity] { (placement?.identities ?? []) + (quickPlacement?.identities ?? []) }
-    fileprivate func recoveryWindows(mapDisplay: (PhysicalScreen) -> (screen: PhysicalScreen, origin: CGPoint)) -> [RecoveryJournal.Window] {
-        (quickPlacement ?? placement)?.recoveryWindows(mapDisplay: mapDisplay) ?? []
+    fileprivate func recoveryWindows(selected: Bool, mapDisplay: (PhysicalScreen) -> WindowPlacement.RecoveryTarget?) -> [RecoveryJournal.Window] {
+        (quickPlacement?.recoveryWindows(selected: selected, mapDisplay: mapDisplay) ?? [])
+            + (placement?.recoveryWindows(selected: selected, mapDisplay: mapDisplay) ?? [])
+    }
+    fileprivate func updateRecoveryOwnership(in observed: [CGWindowID: WindowPlacement.WindowInfo],
+                                              visibleDesktops: [CGRect], protecting: Set<CGWindowID>) -> Bool {
+        guard !needsRecovery, let placement else { return false }
+        return placement.updateRecoveryOwnership(in: observed, on: halves.map(\.virtualBounds),
+                                                 visibleDesktops: visibleDesktops, protecting: protecting)
     }
     fileprivate func releaseWindows(_ identities: [WindowPlacement.Identity]) { placement?.release(identities) }
     func layoutProblem(in layout: [CGDirectDisplayID: CGRect]) -> String? {
@@ -735,6 +782,8 @@ final class Session {
     private var operationStarted: TimeInterval?
     private var operationName = ""
     private var operationIsRecovery = false
+    private var stageStarts: [PerformanceLedger.Stage: TimeInterval] = [:]
+    private var stageSeconds: [PerformanceLedger.Stage: TimeInterval] = [:]
     private var cancelledByUser = false
     private var phase = Phase.idle
     fileprivate private(set) var halves: [HalfScreen] = []
@@ -775,7 +824,7 @@ final class Session {
             publish(error.localizedDescription, phase: .idle)
             return
         }
-        publish(L("正在准备分屏…"), phase: .preparing)
+        publish(L("正在扫描窗口…"), phase: .preparing)
 
         deadline = Task { [weak self] in
             do {
@@ -787,29 +836,36 @@ final class Session {
             do {
                 try Task.checkCancellation()
                 if let placement {
-                    let task = Task { try await placement.prepareSelection() }
+                    try await time(.windowScan) { try await placement.scanDesktopWindows() }
+                    let task = Task { try await time(.windowPreparation) { try await placement.prepareSelection() } }
                     windowPreparation = task
                     try await task.value
                     try Task.checkCancellation()
                     windowPreparation = nil
                 }
-                try coordinator.checkpointRecovery()
                 var ordinary: [(Session, Set<CGWindowID>)] = []
                 for other in coordinator.active {
                     if let placement = other.placement, let upper = other.halves.first {
                         ordinary.append((other, await placement.ordinaryWindows(on: upper)))
                     }
                 }
+                try Task.checkCancellation()
+                try placement?.revalidateDesktopWindows()
+                try coordinator.checkpointRecovery()
                 publish(L("正在创建%@两个虚拟显示器…", String(describing: screen.splitLayout.direction)), phase: .preparing)
                 DemoLog.shared.line(L("拆分 %@，已记录 %@ 个可迁移窗口的位置和尺寸。", String(describing: screen.menuTitle), String(describing: placement?.count ?? 0)))
                 try await prepare()
                 try Task.checkCancellation()
                 let owned = managedWindows
                 let protected = owned + coordinator.active.flatMap(\.managedWindows)
-                for (other, windows) in ordinary {
-                    other.releaseWindows(owned)
-                    if !windows.isEmpty { await other.placeOrdinaryWindows(protecting: protected, only: windows) }
-                    try Task.checkCancellation()
+                if !ordinary.isEmpty {
+                    try await time(.windowMigration) {
+                        for (other, windows) in ordinary {
+                            other.releaseWindows(owned)
+                            if !windows.isEmpty { await other.placeOrdinaryWindows(protecting: protected, only: windows) }
+                            try Task.checkCancellation()
+                        }
+                    }
                 }
                 deadline?.cancel()
                 deadline = nil
@@ -900,11 +956,11 @@ final class Session {
         setup = Task {
             do {
                 guard let quickPlacement else { return }
-                try await quickPlacement.prepareSelection()
+                try await time(.windowPreparation) { try await quickPlacement.prepareSelection() }
                 try coordinator.checkpointRecovery()
                 try Task.checkCancellation()
-                _ = try await quickPlacement.migrate(to: halves)
-                try await quickPlacement.enterSelectedFullScreen(on: halves)
+                try await time(.windowMigration) { _ = try await quickPlacement.migrate(to: halves) }
+                try await time(.fullScreen) { try await quickPlacement.enterSelectedFullScreen(on: halves) }
                 try Task.checkCancellation()
                 deadline?.cancel()
                 deadline = nil
@@ -942,6 +998,7 @@ final class Session {
     }
 
     private func prepare() async throws {
+        let displaySetup = startStage(.displaySetup)
         coordinator.beginDisplayChange()
         defer { coordinator.endDisplayChange() }
         halves = coordinator.takeStandby(for: targetID)
@@ -981,31 +1038,34 @@ final class Session {
         try await configureSplitLayout(layout)
         coordinator.endDisplayChange()
         try coordinator.updateRoutes()
+        endStage(.displaySetup, started: displaySetup)
 
         publish(L("正在等待%@半屏的画面…", String(describing: screen.splitLayout.direction)), phase: .preparing)
+        let firstFrame = startStage(.firstFrame)
         let displays = try await captureDisplays
         let placement = self.placement
         async let capturing: Void = Self.startCaptures(activeHalves, displays: displays)
         if let placement {
-            let moved = try await placement.migrate(to: activeHalves)
+            let moved = try await time(.windowMigration) { try await placement.migrate(to: activeHalves) }
             DemoLog.shared.line(L("已迁移 %@/%@ 个窗口。", String(describing: moved), String(describing: placement.count)))
             if pair != nil {
                 try Task.checkCancellation()
                 publish(L("正在让%@半屏的窗口进入全屏…", String(describing: screen.splitLayout.direction)), phase: .preparing)
-                fullScreenTask = Task { try await placement.enterSelectedFullScreen(on: activeHalves) }
+                fullScreenTask = Task { try await time(.fullScreen) { try await placement.enterSelectedFullScreen(on: activeHalves) } }
             }
         }
         try await capturing
         try await Self.wait(steps: 50, error: L("有半屏未收到符合分辨率的画面。")) {
             halves.allSatisfy(\.hasFrame)
         }
+        endStage(.firstFrame, started: firstFrame, ended: firstFramesAt)
 
         if let task = fullScreenTask {
             try await task.value
             try Task.checkCancellation()
             fullScreenTask = nil
         }
-        await placeOrdinaryWindows(protecting: coordinator.active.flatMap(\.managedWindows))
+        await time(.windowMigration) { await placeOrdinaryWindows(protecting: coordinator.active.flatMap(\.managedWindows)) }
         try await Self.wait(steps: 9, error: L("全屏切换后显示器排列发生变化。")) {
             Self.layoutMatches(layout, ignoringParked: coordinator.parkedIDs) && halves.allSatisfy(\.hasExpectedMode)
         }
@@ -1121,6 +1181,7 @@ final class Session {
                 if joining {
                     await placement.collectRemainingWindows(on: halves, reserved: protected)
                     if mode == .desktop { await placement.preserveDesktopChanges(on: halves) }
+                    coordinator.updateRecoveryCheckpoint()
                 }
                 guard await placement.leaveFullScreen(on: halves, includeSelected: transition != nil || !halves.isEmpty) else {
                     needsRecovery = true
@@ -1263,7 +1324,7 @@ final class Session {
         }
     }
 
-    private static func wait(steps: Int, error: String, until ready: () -> Bool) async throws {
+    fileprivate static func wait(steps: Int, error: String, until ready: () -> Bool) async throws {
         for _ in 0..<steps {
             try Task.checkCancellation()
             if ready() { return }
@@ -1272,16 +1333,50 @@ final class Session {
         throw DemoError(error)
     }
 
+    private var firstFramesAt: TimeInterval? {
+        let times = halves.compactMap(\.firstFrameAt)
+        return times.count == 2 ? times.max() : nil
+    }
+
+    private func startStage(_ stage: PerformanceLedger.Stage) -> TimeInterval? {
+        guard preparing else { return nil }
+        let now = ProcessInfo.processInfo.systemUptime
+        stageStarts[stage] = now
+        return now
+    }
+
+    private func endStage(_ stage: PerformanceLedger.Stage, started: TimeInterval?, ended: TimeInterval? = nil) {
+        // Cancellation can publish the outcome before a child task returns.
+        guard let started, stageStarts[stage] == started else { return }
+        stageStarts[stage] = nil
+        stageSeconds[stage, default: 0] += max(0, (ended ?? ProcessInfo.processInfo.systemUptime) - started)
+    }
+
+    private func time<T>(_ stage: PerformanceLedger.Stage, _ work: () async throws -> T) async rethrows -> T {
+        let started = startStage(stage)
+        defer { endStage(stage, started: started) }
+        return try await work()
+    }
+
+    private func recordOperation(started: TimeInterval, succeeded: Bool, cancelled: Bool = false) {
+        for (stage, start) in stageStarts {
+            endStage(stage, started: start, ended: stage == .firstFrame ? firstFramesAt : nil)
+        }
+        PerformanceLedger.shared.record(operationName, started: started, succeeded: succeeded, cancelled: cancelled,
+                                        stages: stageSeconds)
+        stageSeconds.removeAll()
+    }
+
     private func publish(_ status: String, phase: Phase) {
         if (phase == .preparing || phase == .joining), phase != self.phase {
             if let started = operationStarted {
-                PerformanceLedger.shared.record(operationName, started: started, succeeded: false, cancelled: cancelledByUser && !operationIsRecovery)
+                recordOperation(started: started, succeeded: false, cancelled: cancelledByUser && !operationIsRecovery)
             }
             operationStarted = ProcessInfo.processInfo.systemUptime
             operationIsRecovery = phase == .joining
             operationName = phase == .preparing ? L("开始分屏") : L("恢复桌面")
         } else if phase == .split || phase == .idle, let started = operationStarted {
-            PerformanceLedger.shared.record(operationName, started: started, succeeded: !needsRecovery && (operationIsRecovery || !failed))
+            recordOperation(started: started, succeeded: !needsRecovery && (operationIsRecovery || !failed))
             operationStarted = nil
         }
         self.status = status

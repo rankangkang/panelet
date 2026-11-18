@@ -44,12 +44,16 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
     private var numberTask: Task<Void, Never>?
     private var stream: SCStream?
     private var streamFilter: (display: SCDisplay, excludedShields: Set<CGWindowID>)?
-    private var displayedStream: ObjectIdentifier?
+    private var firstFrame: (stream: ObjectIdentifier, time: TimeInterval)?
     private var tornDown = false
     var onFailure: ((Error) -> Void)?
     var onFrame: (() -> Void)?
 
-    var hasFrame: Bool { stream.map { ObjectIdentifier($0) == displayedStream } ?? false }
+    var firstFrameAt: TimeInterval? {
+        guard let stream, let firstFrame, ObjectIdentifier(stream) == firstFrame.stream else { return nil }
+        return firstFrame.time
+    }
+    var hasFrame: Bool { firstFrameAt != nil }
 
     var mirrorWindowID: CGWindowID? {
         guard let window, window.windowNumber > 0 else { return nil }
@@ -215,7 +219,7 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
             delegate: self
         )
         try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: captureQueue)
-        displayedStream = nil
+        firstFrame = nil
         streamFilter = nil
         self.stream = stream
         try await stream.startCapture()
@@ -346,15 +350,15 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         let width = IOSurfaceGetWidth(surface)
         let height = IOSurfaceGetHeight(surface)
         guard width == Int(pointSize.width) * scale, height == Int(pointSize.height) * scale else { return }
-        if !hasFrame {
-            DemoLog.shared.line(L("%@ 已收到 %@×%@ 像素首帧（%@×）。", String(describing: name), String(describing: width), String(describing: height), String(describing: scale)))
-        }
         measurements.withLock {
             $0.presented += 1
             $0.maxQueueDelay = max($0.maxQueueDelay, ProcessInfo.processInfo.systemUptime - frame.receivedAt)
         }
         withExtendedLifetime(frame.pixels) { mirrorLayer.contents = surface }
-        displayedStream = frame.streamID
+        if !hasFrame {
+            firstFrame = (frame.streamID, ProcessInfo.processInfo.systemUptime)
+            DemoLog.shared.line(L("%@ 已收到 %@×%@ 像素首帧（%@×）。", String(describing: name), String(describing: width), String(describing: height), String(describing: scale)))
+        }
         onFrame?()
     }
 
