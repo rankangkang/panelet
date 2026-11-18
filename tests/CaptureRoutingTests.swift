@@ -113,6 +113,11 @@ struct CaptureRoutingTests {
         let mirrors = [window("Panelet", 15, mirrorLevel, CGRect(x: 0, y: 0, width: 1280, height: 1440), id: 60),
                        window("Panelet", 15, mirrorLevel, CGRect(x: 1280, y: 0, width: 1280, height: 1440), id: 61)]
         let front = window("App", 21, pixPinLevel, popup, id: 62)
+        assert(CaptureOverlays.canUseFrontSnapshot([front] + mirrors, mirrors: popupTarget.mirrorWindows))
+        assert(!CaptureOverlays.canUseFrontSnapshot([front, mirrors[1]], mirrors: popupTarget.mirrorWindows),
+               "An anchor that is no longer the backmost mirror must trigger a full snapshot")
+        assert(!CaptureOverlays.canUseFrontSnapshot([regionSelector] + mirrors, mirrors: popupTarget.mirrorWindows),
+               "Apple's screenshot UI may have a picker window behind the mirrors")
         func popups(_ windows: [[String: Any]], accessible: Bool = true) -> MouseRouter.CaptureRouting {
             CaptureOverlays.inspect(windows, on: [popupTarget], pixPinPIDs: [12], screenshotUIPIDs: [11]) { id, pid, _ in
                 accessible && id == 62 && pid == 21

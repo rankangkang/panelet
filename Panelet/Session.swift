@@ -14,6 +14,7 @@ final class SplitSessions {
     private var captureOverlayTimer: Timer?
     private var captureOverlayQueryInFlight = false
     private var captureOverlayRevision: UInt64 = 0
+    private var captureOverlayAnchor: CGWindowID?
     private var captureRouting = MouseRouter.CaptureRouting()
     private var nextScreenshotShortcutRead = ContinuousClock.now
     private var mirrorShields: [CGDirectDisplayID: Set<CGWindowID>] = [:]
@@ -480,16 +481,19 @@ final class SplitSessions {
         captureOverlayQueryInFlight = true
         let revision = captureOverlayRevision
         let rescueDue = !busy && layoutChangedAt.isEmpty && active.contains(where: \.hiddenWindowCheckDue)
+        // Rescue needs windows behind the mirrors as well.
+        let anchor = rescueDue ? nil : captureOverlayAnchor
         let readShortcuts = ContinuousClock.now >= nextScreenshotShortcutRead
         if readShortcuts { nextScreenshotShortcutRead = .now + .seconds(1) }
         captureOverlayQueue.async { [weak self, popupValidation] in
-            // Window rescue and overlay routing both need the visible window list.
-            let visible = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
-                as? [[String: Any]]
+            let mirrors = Set(targets.flatMap(\.mirrorWindows))
+            let snapshot = CaptureOverlays.visibleSnapshot(mirrors: mirrors, above: anchor)
+            let visible = snapshot?.windows
             let inspection = visible.map {
                 CaptureOverlays.inspect(visible: $0, on: targets, popupValidation: popupValidation,
                                         canInteract: WindowPlacement.isInteractivePopup)
             }
+            let nextAnchor = snapshot?.backmostMirror
             let rescueWindows = rescueDue ? visible.map(WindowPlacement.rescuableWindows(in:)) : nil
             let shortcuts = readShortcuts ? PhysicalScreenScreenshot.Shortcuts.current() : nil
             DispatchQueue.main.async { [weak self] in
@@ -497,6 +501,7 @@ final class SplitSessions {
                 self.captureOverlayQueryInFlight = false
                 guard self.captureOverlayRevision == revision,
                       self.monitoringAllowed, !self.changingDisplays, self.captureTargets() == targets else { return }
+                self.captureOverlayAnchor = nextAnchor
                 self.router?.configureScreenshots(enabled: true, shortcuts: shortcuts)
                 guard let inspection else { return }
                 self.setCaptureRouting(inspection.routing)
@@ -562,6 +567,7 @@ final class SplitSessions {
         captureOverlayTimer?.invalidate()
         captureOverlayTimer = nil
         captureOverlayRevision &+= 1
+        captureOverlayAnchor = nil
         captureRouting = .init()
         nextScreenshotShortcutRead = .now
         mirrorShields.removeAll()

@@ -673,6 +673,27 @@ enum CaptureOverlays {
         }
     }
 
+    static func visibleSnapshot(mirrors: Set<CGWindowID>, above anchor: CGWindowID?)
+        -> (windows: [[String: Any]], backmostMirror: CGWindowID?)? {
+        if let anchor, WindowServerHitTest.supportsLiveRouting, mirrors.contains(anchor),
+           let front = CGWindowListCopyWindowInfo([.optionOnScreenAboveWindow, .optionIncludingWindow, .excludeDesktopElements], anchor)
+                as? [[String: Any]],
+           canUseFrontSnapshot(front, mirrors: mirrors) {
+            return (front, anchor)
+        }
+        guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID)
+                as? [[String: Any]] else { return nil }
+        let backmostMirror = windows.reversed().lazy.compactMap { $0[kCGWindowNumber as String] as? CGWindowID }
+            .first(where: mirrors.contains)
+        return (windows, backmostMirror)
+    }
+
+    static func canUseFrontSnapshot(_ windows: [[String: Any]], mirrors: Set<CGWindowID>) -> Bool {
+        // Apple's window picker can order its highlight behind the mirrors.
+        !windows.contains { $0[kCGWindowOwnerName as String] as? String == "screencapture" }
+            && mirrors.isSubset(of: windows.compactMap { $0[kCGWindowNumber as String] as? CGWindowID })
+    }
+
     static func inspect(visible: [[String: Any]], on targets: [Target], popupValidation: PopupValidation,
                         canInteract: (pid_t, CGRect) -> Bool) -> Inspection {
         var windows = visible
