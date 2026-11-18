@@ -75,7 +75,8 @@ struct CaptureRoutingTests {
             CaptureOverlays.inspect(windows, on: targets, pixPinPIDs: pixPinPIDs, screenshotUIPIDs: [11])
         }
         func detected(_ windows: [[String: Any]], pixPinPIDs: Set<pid_t> = [12]) -> Set<CGDirectDisplayID> {
-            inspect(windows, pixPinPIDs: pixPinPIDs).routing.displays
+            let routing = inspect(windows, pixPinPIDs: pixPinPIDs).routing
+            return routing.displays.union(routing.pixPinDisplays)
         }
         assert(detected(pixPinWindows + [magnifier]) == [1])
         assert(detected(pixPinWindows, pixPinPIDs: []).isEmpty)
@@ -259,6 +260,24 @@ struct CaptureRoutingTests {
         assert(splitMotion.destination == nil && splitMotion.hoverStart != nil && observed.acceptsHover(splitHover))
         assert(observed.observeMotion(at: ordinaryPoint, timestamp: stamp + 18, now: stamp + 19)?.hoverStart == nil)
         assert(!observed.acceptsHover(splitHover))
+
+        let detached = MouseRouter.Parking(physical: CGRect(x: 1000, y: 1800, width: 960, height: 1600),
+                                            desktop: CGRect(x: 1000, y: -200, width: 960, height: 1600), displayID: 8)
+        let adjacent = CGRect(x: 0, y: 0, width: 1000, height: 1000)
+        let leftEdge = CGPoint(x: 1000, y: 2270)
+        let movingLeft = CGVector(dx: -9, dy: 0)
+        var pixPin = MouseRouter.Route(parked: [detached], screens: [adjacent, detached.desktop],
+                                      capture: .init(pixPinDisplays: [8]), lastPoint: CGPoint(x: 1005, y: 2270))
+        assert(pixPin.observeMotion(at: leftEdge, delta: movingLeft, timestamp: stamp, now: stamp)?.destination
+            == CGPoint(x: 996, y: 270))
+        pixPin.lastPoint = CGPoint(x: 1005, y: 1850)
+        assert(pixPin.observeMotion(at: CGPoint(x: 1000, y: 1850), delta: movingLeft, timestamp: stamp + 1, now: stamp + 1)?
+            .destination == nil, "Open desktop edges must stay clamped")
+        assert(pixPin.destination(for: leftEdge, button: .down(0)) == nil)
+        assert(pixPin.destination(for: CGPoint(x: 850, y: 2270)) == leftEdge, "A selection stays on the display where it started")
+        assert(pixPin.destination(for: leftEdge, button: .up(0)) == nil)
+        assert(pixPin.destination(for: leftEdge, passiveMotion: true, delta: movingLeft) == CGPoint(x: 991, y: 270))
+        assert(pixPin.destination(for: CGPoint(x: 1005, y: 270), passiveMotion: true) == CGPoint(x: 1005, y: 2270))
 
         let selectorWindows = [
             window("PixPin", 12, pixPinLevel, physical, id: 70),

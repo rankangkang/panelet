@@ -431,6 +431,85 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 }
 
+/// Observe changes on the parked desktop even when an app sends no AX window event.
+@MainActor
+final class ParkedDisplayChanges: NSObject, SCStreamOutput, SCStreamDelegate {
+    private let displayID: CGDirectDisplayID
+    private let onChange: () -> Void
+    private var startTask: Task<Void, Never>?
+    private var stream: SCStream?
+    private(set) var isRunning = false
+    private static let queue = DispatchQueue(label: "dev.cmkk.panelet.parked-display", qos: .utility)
+
+    init(displayID: CGDirectDisplayID, onChange: @escaping () -> Void) {
+        self.displayID = displayID
+        self.onChange = onChange
+    }
+
+    func start() {
+        guard startTask == nil, stream == nil else { return }
+        startTask = Task { [weak self] in
+            guard let self else { return }
+            defer { self.startTask = nil }
+            do {
+                let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
+                try Task.checkCancellation()
+                guard let display = content.displays.first(where: { $0.displayID == self.displayID }) else { return }
+                let excluded = content.windows.filter {
+                    $0.windowLayer < 0 || $0.owningApplication?.processID == getpid()
+                        || $0.owningApplication?.bundleIdentifier == "com.apple.dock"
+                }
+                let filter = SCContentFilter(display: display, excludingWindows: excluded)
+                if #available(macOS 14.2, *) { filter.includeMenuBar = false }
+                let configuration = SCStreamConfiguration()
+                configuration.width = 96
+                configuration.height = 96
+                configuration.minimumFrameInterval = CMTime(value: 1, timescale: 2)
+                configuration.showsCursor = false
+                let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
+                try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: Self.queue)
+                self.stream = stream
+                try await stream.startCapture()
+                guard self.stream === stream, !Task.isCancelled else {
+                    try? await stream.stopCapture()
+                    return
+                }
+                self.isRunning = true
+                self.onChange()
+            } catch {
+                self.stream = nil
+            }
+        }
+    }
+
+    func stop() {
+        startTask?.cancel()
+        let activeStream = stream
+        stream = nil
+        isRunning = false
+        activeStream?.stopCapture { _ in }
+    }
+
+    nonisolated func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .screen, sampleBuffer.imageBuffer != nil else { return }
+        let streamID = ObjectIdentifier(stream)
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let stream = self.stream, ObjectIdentifier(stream) == streamID, self.isRunning else { return }
+            self.onChange()
+        }
+    }
+
+    nonisolated func stream(_ stream: SCStream, didStopWithError error: Error) {
+        let streamID = ObjectIdentifier(stream)
+        DispatchQueue.main.async { [weak self] in
+            guard let self, let stream = self.stream, ObjectIdentifier(stream) == streamID else { return }
+            self.stream = nil
+            self.isRunning = false
+            self.onChange()
+        }
+    }
+}
+
 /// Borderless overlay. It must not become key, or it steals the keyboard from the control window.
 final class MirrorWindow: NSWindow {
     override var canBecomeKey: Bool { false }

@@ -17,7 +17,7 @@ final class SplitSessions {
     private var captureRescuePending = false
     private var captureUIVisible = false
     private var nextCaptureOverlayCheck = ContinuousClock.now
-    private var nextHiddenWindowReconciliation = ContinuousClock.now
+    private var nextUnobservedRescue = ContinuousClock.now
     private var captureOverlayQueryInFlight = false
     private var captureOverlayRevision: UInt64 = 0
     private var captureOverlayAnchor: CGWindowID?
@@ -292,9 +292,9 @@ final class SplitSessions {
             }
         }
         guard layoutChangedAt.isEmpty else { return }
-        // An app can move a background window without delivering an AX notification.
-        if WindowServerHitTest.supportsLiveRouting, .now >= nextHiddenWindowReconciliation {
-            nextHiddenWindowReconciliation = .now + .seconds(4)
+        if WindowServerHitTest.supportsLiveRouting, .now >= nextUnobservedRescue,
+           active.contains(where: { !$0.needsRecovery && !$0.observesParkedDisplay }) {
+            nextUnobservedRescue = .now + .seconds(4)
             requestCaptureOverlayUpdate(rescue: true)
         }
         retryCaptureWindowRescue()
@@ -528,6 +528,7 @@ final class SplitSessions {
             setCaptureRouting(.init())
             router?.configureScreenshots(enabled: false)
         } else {
+            for session in active { session.resumeParkedObservation() }
             requestCaptureOverlayUpdate(rescue: true)
         }
     }
@@ -597,7 +598,6 @@ final class SplitSessions {
                 self.setCaptureRouting(inspection.routing)
                 self.updateMirrorShields(inspection.shieldsByDisplay)
                 if let rescueWindows, !self.busy, self.layoutChangedAt.isEmpty {
-                    self.nextHiddenWindowReconciliation = .now + .seconds(4)
                     for session in self.active where rescueTargets.contains(session.targetID) {
                         session.checkHiddenWindows(rescueWindows)
                     }
@@ -671,7 +671,7 @@ final class SplitSessions {
         captureRescuePending = false
         captureUIVisible = false
         nextCaptureOverlayCheck = .now
-        nextHiddenWindowReconciliation = .now
+        nextUnobservedRescue = .now
         captureOverlayRevision &+= 1
         captureOverlayAnchor = nil
         captureRouting = .init()
@@ -695,6 +695,7 @@ final class Session {
     private var exitPolicy = QuickExitPolicy()
     private var exitCheck: Task<Void, Never>?
     private var rescueTask: Task<Void, Never>?
+    private var parkedDisplayChanges: ParkedDisplayChanges?
     private var lastRescue = ContinuousClock.now
     var hasQuick: Bool { pair != nil }
     var canStartQuick: Bool { active && mode == .desktop && !hasQuick && !needsRecovery }
@@ -830,6 +831,8 @@ final class Session {
     }
 
     fileprivate var checkingHiddenWindows: Bool { rescueTask != nil }
+    fileprivate var observesParkedDisplay: Bool { parkedDisplayChanges?.isRunning == true }
+    fileprivate func resumeParkedObservation() { parkedDisplayChanges?.start() }
     fileprivate var hiddenWindowCheckAvailable: Bool { active && !needsRecovery && placement != nil && !checkingHiddenWindows }
     fileprivate var hiddenWindowCheckDue: Bool { hiddenWindowCheckAvailable && ContinuousClock.now - lastRescue >= .seconds(1) }
 
@@ -1283,6 +1286,17 @@ final class Session {
         }
         self.status = status
         self.phase = phase
+        if active, !needsRecovery, hasHalves, WindowServerHitTest.supportsLiveRouting {
+            if parkedDisplayChanges == nil {
+                parkedDisplayChanges = ParkedDisplayChanges(displayID: targetID) { [weak coordinator] in
+                    coordinator?.requestCaptureOverlayUpdate(rescue: true)
+                }
+            }
+            resumeParkedObservation()
+        } else {
+            parkedDisplayChanges?.stop()
+            parkedDisplayChanges = nil
+        }
         coordinator.changed(self)
     }
 }

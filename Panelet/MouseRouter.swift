@@ -12,13 +12,18 @@ final class MouseRouter {
 
     struct CaptureRouting: Equatable, Sendable {
         var displays: Set<CGDirectDisplayID> = []
+        var pixPinDisplays: Set<CGDirectDisplayID> = []
         var controls: [CGDirectDisplayID: [CGRect]] = [:]
         var nativeWindows: [CGDirectDisplayID: [NativeWindow]] = [:]
+
+        func hasSelector(on display: CGDirectDisplayID) -> Bool {
+            displays.contains(display) || pixPinDisplays.contains(display)
+        }
 
         func allows(_ display: CGDirectDisplayID?, at point: CGPoint, includeControls: Bool = true,
                     hitTest: (CGPoint) -> CGWindowID? = WindowServerHitTest.window) -> Bool {
             guard let display else { return false }
-            if displays.contains(display) { return true }
+            if hasSelector(on: display) { return true }
             guard includeControls else { return false }
             if controls[display]?.contains(where: { $0.contains(point) }) == true { return true }
             let candidates = nativeWindows[display]?.filter { $0.frame.contains(point) } ?? []
@@ -84,7 +89,7 @@ final class MouseRouter {
             guard liveHitTest != nil, pressedButtons.isEmpty,
                   let panel = parked.first(where: {
                       $0.displayID != nil && ($0.desktop.contains(point) || $0.physical.contains(point))
-                  }), let id = panel.displayID, !capture.displays.contains(id) else { return nil }
+                  }), let id = panel.displayID, !capture.hasSelector(on: id) else { return nil }
             let isPhysical = panel.physical.contains(point)
             let physical = isPhysical ? point : panel.pointOnPhysical(point)
             guard capture.controls[id]?.contains(where: { $0.contains(physical) }) != true,
@@ -109,12 +114,12 @@ final class MouseRouter {
             latestInput = max(latestInput, timestamp)
         }
 
-        mutating func observeMotion(at point: CGPoint, timestamp: CGEventTimestamp, now: UInt64)
+        mutating func observeMotion(at point: CGPoint, delta: CGVector = .zero, timestamp: CGEventTimestamp, now: UInt64)
             -> (destination: CGPoint?, revision: UInt64, hoverStart: UInt64?)? {
             // The movement observer and interaction filter can dequeue events in a different order.
             guard pressedButtons.isEmpty, timestamp > latestInput, MouseRouter.isRecent(timestamp, at: now) else { return nil }
             recordInput(timestamp)
-            let destination = routePoint(point, hovering: true, timestamp: timestamp)
+            let destination = routePoint(point, delta: delta, hovering: true, timestamp: timestamp)
             invalidateHover()
             if let destination { return (destination, hoverRevision, nil) }
             lastPoint = point
@@ -124,7 +129,7 @@ final class MouseRouter {
         func allows(_ panel: Parking, at point: CGPoint, includeControls: Bool = true,
                     hovering: Bool = false, retainPhysical: Bool = false) -> Bool {
             guard let display = panel.displayID else { return false }
-            if capture.displays.contains(display) { return true }
+            if capture.hasSelector(on: display) { return true }
             guard includeControls else { return false }
             if capture.controls[display]?.contains(where: { $0.contains(point) }) == true { return true }
             if let liveHitTest, let mirror = panel.mirrors.first(where: { $0.frame.contains(point) }) {
@@ -136,7 +141,8 @@ final class MouseRouter {
 
         mutating func setCaptureRouting(_ routing: CaptureRouting, cursor: CGPoint, timestamp: CGEventTimestamp = 0) -> CGPoint? {
             guard routing != capture else { return nil }
-            let captureModeChanged = capture.displays != routing.displays || capture.controls != routing.controls
+            let captureModeChanged = capture.displays != routing.displays || capture.pixPinDisplays != routing.pixPinDisplays
+                || capture.controls != routing.controls
             capture = routing
             guard pressedButtons.isEmpty else { return nil }
             let destination: CGPoint?
@@ -158,11 +164,11 @@ final class MouseRouter {
             return destination
         }
 
-        mutating func destination(for point: CGPoint, button: ButtonChange? = nil, passiveMotion: Bool = false,
+        mutating func destination(for point: CGPoint, button: ButtonChange? = nil, passiveMotion: Bool = false, delta: CGVector = .zero,
                                   timestamp: CGEventTimestamp = 0) -> CGPoint? {
             recordInput(timestamp)
             invalidateHover()
-            let destination = routePoint(point, hovering: passiveMotion, timestamp: timestamp)
+            let destination = routePoint(point, delta: delta, hovering: passiveMotion, timestamp: timestamp)
             lastPoint = destination ?? point
             switch button {
             case .down(let button):
@@ -222,7 +228,7 @@ final class MouseRouter {
             suppressPixPinGesture = false
         }
 
-        private func routePoint(_ point: CGPoint, hovering: Bool, timestamp: CGEventTimestamp) -> CGPoint? {
+        private func routePoint(_ point: CGPoint, delta: CGVector, hovering: Bool, timestamp: CGEventTimestamp) -> CGPoint? {
             // Keep a press and its release on the same surface even if a popup opens,
             // closes, or moves while the button is held.
             if let gesturePanel, let panel = parked.first(where: { $0.displayID == gesturePanel }) {
@@ -235,6 +241,12 @@ final class MouseRouter {
             let destination: CGPoint?
             let mayEnterPanel = pressedButtons.isEmpty
             let previousPanel = parked.first { $0.displayID != nil && $0.physical.contains(lastPoint) }
+            if hovering, mayEnterPanel, let previousPanel, let id = previousPanel.displayID, capture.pixPinDisplays.contains(id) {
+                if let exit = pixPinExit(from: previousPanel, point: point, delta: delta) {
+                    return exit == point ? nil : exit
+                }
+                return previousPanel.physical.contains(point) ? nil : Self.clamp(point, to: previousPanel.physical)
+            }
             if let parking = parked.first(where: {
                 $0.physical.contains(point) && !allows($0, at: point, includeControls: mayEnterPanel,
                            hovering: hovering, retainPhysical: previousPanel?.displayID == $0.displayID)
@@ -250,7 +262,7 @@ final class MouseRouter {
             }) {
                 // A drag reaching the edge of the physical panel must not jump to the far side
                 // when WindowServer crosses into one of its virtual displays.
-                if let previousPanel, let id = previousPanel.displayID, capture.displays.contains(id) {
+                if let previousPanel, let id = previousPanel.displayID, capture.hasSelector(on: id) {
                     destination = Self.clamp(point, to: previousPanel.physical)
                 } else {
                     destination = parking.pointOnPhysical(point)
@@ -259,6 +271,23 @@ final class MouseRouter {
                 destination = nil
             }
             return destination
+        }
+
+        private func pixPinExit(from panel: Parking, point: CGPoint, delta: CGVector) -> CGPoint? {
+            // WindowServer clamps the cursor at a parked edge, but still reports the movement past it.
+            func extend(_ position: CGFloat, last: CGFloat, by movement: CGFloat, min: CGFloat, max: CGFloat) -> CGFloat {
+                if position <= min, movement < 0 { return Swift.min(position, last + movement) }
+                if position >= max - 1, movement > 0 { return Swift.max(position, last + movement) }
+                return position
+            }
+            let attempted = CGPoint(x: extend(point.x, last: lastPoint.x, by: delta.dx, min: panel.physical.minX, max: panel.physical.maxX),
+                                    y: extend(point.y, last: lastPoint.y, by: delta.dy, min: panel.physical.minY, max: panel.physical.maxY))
+            let desktop = panel.pointOnDesktop(attempted)
+            guard !panel.desktop.contains(desktop), screens.contains(where: { $0.contains(desktop) }) else { return nil }
+            if let neighbor = parked.first(where: { $0.desktop.contains(desktop) && $0.displayID.map(capture.hasSelector(on:)) == true }) {
+                return neighbor.pointOnPhysical(desktop)
+            }
+            return desktop
         }
 
         private static func clamp(_ point: CGPoint, to frame: CGRect) -> CGPoint {
@@ -297,6 +326,7 @@ final class MouseRouter {
             route.screens = screens
             let displayIDs = Set(parked.compactMap(\.displayID))
             route.capture.displays.formIntersection(displayIDs)
+            route.capture.pixPinDisplays.formIntersection(displayIDs)
             route.capture.controls = route.capture.controls.filter { displayIDs.contains($0.key) }
             route.capture.nativeWindows = route.capture.nativeWindows.filter { displayIDs.contains($0.key) }
             let parking = parked.first { $0.physical.contains(point) && !route.allows($0, at: point, hovering: true) }
@@ -392,7 +422,11 @@ final class MouseRouter {
         let point = event.location
         let timestamp = event.timestamp
         let now = DispatchTime.now().uptimeNanoseconds
-        guard let motion = routing.withLock({ $0.observeMotion(at: point, timestamp: timestamp, now: now) }) else { return }
+        let motion = routing.withLock { route in
+            let delta = route.capture.pixPinDisplays.isEmpty ? .zero : Self.mouseDelta(event)
+            return route.observeMotion(at: point, delta: delta, timestamp: timestamp, now: now)
+        }
+        guard let motion else { return }
         if let destination = motion.destination {
             guard moveCursor(from: point, to: destination, revision: motion.revision, timestamp: timestamp) else { return }
             let work = routing.withLock { route -> UInt64? in
@@ -403,6 +437,11 @@ final class MouseRouter {
         } else if let work = motion.hoverStart {
             submitHover(at: work)
         }
+    }
+
+    private static func mouseDelta(_ event: CGEvent) -> CGVector {
+        CGVector(dx: CGFloat(event.getIntegerValueField(.mouseEventDeltaX)),
+                 dy: CGFloat(event.getIntegerValueField(.mouseEventDeltaY)))
     }
 
     private static func isTrackingMove(_ event: CGEvent) -> Bool {
@@ -604,9 +643,11 @@ final class MouseRouter {
             button = nil
         }
         let (destination, work) = routing.withLock { route -> (CGPoint?, UInt64?) in
+            let moving = type == .mouseMoved
+            let delta = moving && !route.capture.pixPinDisplays.isEmpty ? Self.mouseDelta(event) : .zero
             let destination = route.destination(for: event.location, button: button,
-                                                passiveMotion: type == .mouseMoved, timestamp: timestamp)
-            let work = type == .mouseMoved
+                                                passiveMotion: moving, delta: delta, timestamp: timestamp)
+            let work = moving
                 ? route.scheduleHover(at: route.lastPoint, now: DispatchTime.now().uptimeNanoseconds) : nil
             return (destination, work)
         }
@@ -715,7 +756,7 @@ enum CaptureOverlays {
                                  nativeHitTesting: WindowServerHitTest.isAvailable) { id, pid, frame in
             popupValidation.accepts(id: id, pid: pid) { canInteract(pid, frame) }
         }
-        inspection.screenshotUIVisible = !apple.isEmpty || !inspection.routing.displays.isEmpty
+        inspection.screenshotUIVisible = !apple.isEmpty || !inspection.routing.pixPinDisplays.isEmpty
         return inspection
     }
 
@@ -783,7 +824,7 @@ enum CaptureOverlays {
             // PixPin opens an elevated window on each display, with up to 10 points
             // of padding in the tested version. A single full-screen pin cannot match.
             if pixPinSelectors.values.contains(where: { coversPixPinScreens($0, screens: screens) }) {
-                inspection.routing.displays.insert(target.id)
+                inspection.routing.pixPinDisplays.insert(target.id)
             } else {
                 let popups = popupRegions(in: panelWindows, on: target, nativeHitTesting: nativeHitTesting,
                                           validate: validatePopup)
