@@ -285,10 +285,14 @@ final class WindowPlacement {
 
     func revalidateDesktopWindows() throws {
         guard CGDisplayBounds(source.id) == source.bounds else { throw DemoError(L("物理显示器已断开或分辨率发生变化。")) }
-        let visible = Dictionary(uniqueKeysWithValues: Self.windowList([.optionOnScreenOnly, .excludeDesktopElements]).map { ($0.id, $0) })
+        // Exiting a native full-screen Space can hide windows that the scan already verified.
+        let changedSpaces = windows.contains { $0.fullScreenDisplay != nil }
+        let options: CGWindowListOption = changedSpaces ? [.excludeDesktopElements] : [.optionOnScreenOnly, .excludeDesktopElements]
+        let current = Dictionary(uniqueKeysWithValues: Self.windowList(options).map { ($0.id, $0) })
         windows = windows.compactMap { saved in
             guard saved.slot == nil, saved.fullScreenDisplay == nil else { return saved }
-            guard let id = saved.id, let info = visible[id], info.pid == saved.pid else { return nil }
+            guard let id = saved.id, let info = current[id], info.pid == saved.pid,
+                  info.onScreen || saved.original.map({ Self.near($0, info.frame) }) == true else { return nil }
             let overlap = Self.overlap(of: info.frame, with: source.bounds)
             guard overlap > 0, displays.allSatisfy({ Self.overlap(of: info.frame, with: $0.bounds) <= overlap }) else { return nil }
             var current = saved
@@ -544,11 +548,11 @@ final class WindowPlacement {
     }
 
     func placeOrdinary(on half: HalfScreen, protecting: [Identity] = [], only: Set<CGWindowID>? = nil) async -> Int {
-        guard windows.contains(where: { $0.slot == nil }),
-              let screen = NSScreen.screens.first(where: { $0.displayID == half.virtualID }) else { return 0 }
-        let result = await restore(for: .milliseconds(500), destination: { _ in screen }, ordinary: screen, ordinaryOnly: true, only: only)
         let targets = windows.filter { $0.slot == nil && (only == nil || $0.id.map { only?.contains($0) == true } == true) }
+        guard !targets.isEmpty, let screen = NSScreen.screens.first(where: { $0.displayID == half.virtualID }) else { return 0 }
+        // Assign the Space first so Accessibility can see windows from the old desktop.
         await Self.moveWindowsToDesktop(targets, on: half.virtualID, protecting: protecting + identities)
+        let result = await restore(for: .milliseconds(500), destination: { _ in screen }, ordinary: screen, ordinaryOnly: true, only: only)
         return result.restored
     }
 
@@ -1042,29 +1046,45 @@ final class WindowPlacement {
                 ? translated : Self.fit(translated, inside: cocoaRect(target.visibleFrame))
             return (saved.slot ?? -1, saved, bounds, desired)
         }
+        let migrationDisplay = ordinaryOnly ? ordinary?.displayID : nil
         // AX calls can wait for another app to respond; keep the mirrors drawing during that wait.
         return await Task.detached(priority: .userInitiated) {
             var pending = work
             var restored = 0
             var settled: [Int: ContinuousClock.Instant] = [:]
+            var replacementWindows: [CGWindowID: Window] = [:]
+            let migrationSpace = migrationDisplay.flatMap { DesktopSpaces()?.desktop(on: $0) }
             let deadline = ContinuousClock.now + timeout
             repeat {
-                var live: [CGWindowID: WindowInfo]?
+                var live = migrationDisplay == nil ? nil : Self.liveWindows()
                 pending = pending.filter { slot, saved, bounds, desired in
                     guard NSRunningApplication(processIdentifier: saved.pid)?.isTerminated == false else { return false }
-                    var window = saved.window
-                    if window.frame == nil {
+                    if migrationDisplay != nil, saved.fullScreenDisplay == nil,
+                       let id = saved.id, let info = live?[id], info.pid == saved.pid, Self.near(info.frame, desired),
+                       info.onScreen || (migrationSpace.map { DesktopSpaces.spaces(for: id)?.contains($0) == true } == true) {
+                        restored += 1
+                        return false
+                    }
+                    var window = saved.id.flatMap { replacementWindows[$0] } ?? saved.window
+                    var current = window.frame
+                    if current == nil {
                         if live == nil { live = Self.liveWindows() }
                         if let id = saved.id, live?[id]?.pid != saved.pid { return false }
-                        guard let replacement = live.flatMap({ Self.resolve(saved, in: $0) }) else { return true }
+                        guard let replacement = live.flatMap({ Self.findReplacement(for: saved, in: $0) }) else { return true }
                         window = replacement
+                        if let id = saved.id { replacementWindows[id] = replacement }
+                        current = window.frame
                     }
-                    guard let frame = window.frame else { return true }
+                    guard let frame = current else { return true }
                     if saved.slot == nil && window.isFullScreen { return false }
                     if !Self.near(desired, frame) {
                         settled[slot] = nil
-                        if frame.width > bounds.width || frame.height > bounds.height { window.setSize(desired.size) }
-                        window.place(desired)
+                        if frame.width > bounds.width || frame.height > bounds.height {
+                            window.setSize(desired.size)
+                            window.place(desired)
+                        } else {
+                            window.place(desired, from: frame)
+                        }
                         guard let actual = window.frame, Self.near(desired, actual) else { return true }
                     }
                     if slot >= 0 {
@@ -1180,7 +1200,8 @@ final class WindowPlacement {
                     if fullScreen == true {
                         guard await exitFullScreen(window) else { return false }
                     } else if fullScreen == false, let frame {
-                        window.place(Self.fit(frame, inside: bounds))
+                        let desired = Self.fit(frame, inside: bounds)
+                        if frame != desired { window.place(desired, from: frame) }
                         let now = ContinuousClock.now
                         if requestedAt == nil || now - requestedAt! >= .seconds(1) {
                             window.setFullScreen(true)
@@ -1241,6 +1262,10 @@ final class WindowPlacement {
 
     nonisolated private static func resolve(_ saved: SavedWindow, in live: [CGWindowID: WindowInfo]) -> Window? {
         if saved.window.frame != nil { return saved.window }
+        return findReplacement(for: saved, in: live)
+    }
+
+    nonisolated private static func findReplacement(for saved: SavedWindow, in live: [CGWindowID: WindowInfo]) -> Window? {
         guard let id = saved.id, let info = live[id], info.pid == saved.pid else { return nil }
         return Window.find(info) ?? Window.findUnlistedWindow(info)
     }
@@ -1475,8 +1500,8 @@ final class WindowPlacement {
             return values
         }
 
-        func place(_ desired: CGRect) {
-            guard let before = frame else { return }
+        func place(_ desired: CGRect, from knownFrame: CGRect? = nil) {
+            guard let before = knownFrame ?? frame else { return }
             if before.origin != desired.origin {
                 setPosition(desired.origin)
             }
