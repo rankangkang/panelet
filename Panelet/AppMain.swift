@@ -30,7 +30,7 @@ enum DemoMain {
 final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate, NSMenuItemValidation {
     private let splits = SplitSessions()
     private var environment = EnvironmentCheck.inspect()
-    private let environmentLabel = NSTextField(wrappingLabelWithString: "")
+    private let environmentResult = EnvironmentStatusView(frame: .zero)
     private let quick = QuickSplitPanel()
     private let preferences = ProductPreferences()
     private let identifiers = DisplayIdentifiers()
@@ -54,6 +54,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private var popup: NSPopUpButton!
     private var settingsPages: [NSView] = []
     private var settingsNavigation: [NSButton] = []
+    private let displayArrangement = SettingsDisplayArrangement(frame: .zero)
     private let layoutPreview = SettingsLayoutPreview()
     private let layoutLock = NSTextField(wrappingLabelWithString: L("合并桌面后可更改布局"))
     private var recordPermissionButton: NSButton!
@@ -65,9 +66,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private var retryRecoveryButton: NSButton!
     private var restoreAllButton: NSButton!
     private let recoveryStatus = NSTextField(wrappingLabelWithString: "")
-    private var screenRecordingLabel: NSTextField!
-    private var accessibilityLabel: NSTextField!
-    private var spacesLabel: NSTextField!
+    private let screenRecordingStatus = SettingsStatusLine(frame: .zero)
+    private let accessibilityStatus = SettingsStatusLine(frame: .zero)
+    private let spacesStatus = SettingsStatusLine(frame: .zero)
     private var logView: NSTextView!
     private var displays: [PhysicalScreen] = []
     private var lastScreenKey = ""
@@ -362,6 +363,13 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         popup.target = self
         popup.action = #selector(displayChanged)
         popup.setAccessibilityLabel(L("目标显示器"))
+        displayArrangement.heightAnchor.constraint(equalToConstant: 90).isActive = true
+        displayArrangement.onSelect = { [weak self] id in
+            guard let self, self.operationsAvailable,
+                  let index = self.displays.firstIndex(where: { $0.id == id }) else { return }
+            self.popup.selectItem(at: index)
+            self.displayChanged()
+        }
         statusLabel = settingsText(L("未拆分"), size: 12, secondary: true)
         splitButton = button(L("拆分桌面"), action: #selector(splitClicked))
         splitButton.bezelColor = .controlAccentColor
@@ -389,11 +397,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         layoutLock.font = .systemFont(ofSize: 11)
         layoutLock.textColor = .secondaryLabelColor
         let desktop = settingsPage(L("桌面分屏"), subtitle: L("让一块显示器，拥有两个独立的工作空间。"), views: [
-            settingsCard([settingsText(L("目标显示器"), size: 12, weight: .semibold), popup, layout, layoutDetail, layoutLock, statusLabel, actions]),
+            settingsCard([settingsRow(L("目标显示器"), detail: L("点击屏幕选择；编号与“识别显示器”一致。"),
+                                      control: button(L("识别显示器"), action: #selector(identifyDisplays))),
+                          displayArrangement, popup, layout, layoutDetail, layoutLock, statusLabel, actions]),
             settingsCard([
                 settingsRow(L("画面模式"), detail: L("清晰优先保留原生缩放；流畅优先降低分辨率"), control: renderingPicker),
-                settingsRow(L("显示器名称"), detail: L("仅保存在本机，按回车保存"), control: displayAlias),
-                button(L("识别显示器"), action: #selector(identifyDisplays))]),
+                settingsRow(L("显示器名称"), detail: L("仅保存在本机，按回车保存"), control: displayAlias)]),
             settingsCard([settingsRow(L("临时组合两个窗口"), detail: L("选好窗口后分别全屏，退出全屏即可还原。"),
                                      control: button(L("快捷分屏…"), action: #selector(openQuick)))])
         ])
@@ -414,15 +423,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         let keys = settingsPage(L("快捷键"), subtitle: L("不用离开当前工作，也能快速切换。"), views: [settingsCard(shortcutRows),
             settingsText(L("点击右侧快捷键，再按下新的组合键。\n使用 Control、Option 或 Command 搭配一个按键。"), size: 12, secondary: true)])
 
-        screenRecordingLabel = settingsText(L("检查中"), size: 12)
-        accessibilityLabel = settingsText(L("检查中"), size: 12)
-        spacesLabel = settingsText(L("检查中"), size: 12)
         recordPermissionButton = button(L("去授权"), action: #selector(askScreenRecording))
         accessPermissionButton = button(L("去授权"), action: #selector(askAccessibility))
         let permissions = settingsPage(L("权限"), subtitle: L("只开启分屏所需的系统权限。"), views: [
-            settingsCard([settingsRow(L("屏幕录制"), detail: L("显示分区画面和窗口预览。"), control: recordPermissionButton), screenRecordingLabel]),
-            settingsCard([settingsRow(L("辅助功能"), detail: L("移动窗口，并处理分屏间的鼠标操作。"), control: accessPermissionButton), accessibilityLabel]),
-            settingsCard([settingsRow(L("显示器使用不同的空间"), detail: L("让每个分区拥有独立的全屏空间。"), control: button(L("系统设置…"), action: #selector(openDesktopSettings))), spacesLabel]),
+            settingsCard([settingsRow(L("屏幕录制"), detail: L("显示分区画面和窗口预览。"), control: recordPermissionButton), screenRecordingStatus]),
+            settingsCard([settingsRow(L("辅助功能"), detail: L("移动窗口，并处理分屏间的鼠标操作。"), control: accessPermissionButton), accessibilityStatus]),
+            settingsCard([settingsRow(L("显示器使用不同的空间"), detail: L("让每个分区拥有独立的全屏空间。"), control: button(L("系统设置…"), action: #selector(openDesktopSettings))), spacesStatus]),
             settingsText(L("更改权限后，请重新启动 Panelet。"), size: 12, secondary: true),
             button(L("重新启动 Panelet"), action: #selector(relaunch))
         ])
@@ -439,18 +445,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         scroll.documentView = logView
         scroll.heightAnchor.constraint(equalToConstant: 150).isActive = true
         logView.setAccessibilityLabel(L("运行日志"))
-        environmentLabel.font = .systemFont(ofSize: 12)
-        environmentLabel.preferredMaxLayoutWidth = 408
-        environmentLabel.stringValue = environment.summary
+        environmentResult.update(environment, checkedAt: Date())
         retryRecoveryButton = button(L("重试恢复窗口…"), action: #selector(retryRecovery))
         restoreAllButton = button(L("恢复所有显示器…"), action: #selector(restoreAll))
         recoveryStatus.textColor = .secondaryLabelColor
         recoveryStatus.font = .systemFont(ofSize: 12)
         recoveryStatus.preferredMaxLayoutWidth = 408
         let diagnostics = settingsPage(L("诊断"), subtitle: L("查看运行状态，在需要时恢复窗口。"), views: [
-            settingsCard([settingsRow(L("运行环境"), detail: L("只读检测，不会开始分屏或移动窗口。"), control: button(L("重新检测"), action: #selector(checkEnvironment))), environmentLabel]),
-            settingsCard([settingsRow(L("运行日志"), detail: L("本次启动的显示器与分屏记录。"), control: button(L("预览诊断报告…"), action: #selector(copySettingsLog))), scroll]),
-            settingsCard([settingsRow(L("窗口恢复"), detail: L("分屏中断或窗口未归位时使用。"), control: retryRecoveryButton), recoveryStatus, restoreAllButton])
+            settingsCard([settingsRow(L("运行环境"), detail: L("只读检测，不会开始分屏或移动窗口。"), control: button(L("重新检测"), action: #selector(checkEnvironment))), environmentResult]),
+            settingsCard([settingsRow(L("窗口恢复"), detail: L("分屏中断或窗口未归位时使用。"), control: retryRecoveryButton), recoveryStatus, restoreAllButton]),
+            settingsCard([settingsRow(L("运行日志"), detail: L("本次启动的显示器与分屏记录。"), control: button(L("预览诊断报告…"), action: #selector(copySettingsLog))), scroll])
         ])
         launchPanel.target = self
         launchPanel.action = #selector(saveGeneralPreferences)
@@ -606,7 +610,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             stack.topAnchor.constraint(equalTo: content.topAnchor, constant: 16),
             stack.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -16)
         ])
-        for view in views where view is NSPopUpButton || view is NSScrollView || (view as? NSStackView)?.orientation == .horizontal {
+        for view in views where view is NSPopUpButton || view is NSScrollView || view is EnvironmentStatusView || view is SettingsDisplayArrangement || (view as? NSStackView)?.orientation == .horizontal {
             view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
         return box
@@ -649,7 +653,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     @objc private func checkEnvironment() {
         environment = EnvironmentCheck.inspect()
-        environmentLabel.stringValue = environment.summary
+        environmentResult.update(environment, checkedAt: Date())
+        if window.isVisible && !settingsPages[3].isHidden {
+            NSAccessibility.post(element: window!, notification: .announcementRequested,
+                                 userInfo: [.announcement: environment.statusTitle, .priority: NSAccessibilityPriorityLevel.medium.rawValue])
+        }
         DemoLog.shared.line(environment.details)
         refresh()
     }
@@ -703,13 +711,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
                 }
             }
         }
-        screenRecordingLabel.stringValue = Permissions.screenRecording ? L("✓ 已授权") : L("未授权 · 请前往系统设置开启")
-        accessibilityLabel.stringValue = Permissions.accessibility ? L("✓ 已授权") : L("未授权 · 请前往系统设置开启")
-        if Permissions.separateSpacesEnabled {
-            spacesLabel.stringValue = L("✓ 已打开")
-        } else {
-            spacesLabel.stringValue = L("未打开 · 开启后需要重新登录 macOS")
-        }
+        screenRecordingStatus.update(Permissions.screenRecording ? L("已授权") : L("未授权 · 请前往系统设置开启"), ready: Permissions.screenRecording)
+        accessibilityStatus.update(Permissions.accessibility ? L("已授权") : L("未授权 · 请前往系统设置开启"), ready: Permissions.accessibility)
+        spacesStatus.update(Permissions.separateSpacesEnabled ? L("已打开") : L("未打开 · 开启后需要重新登录 macOS"), ready: Permissions.separateSpacesEnabled)
         recordPermissionButton.title = Permissions.screenRecording ? L("管理权限…") : L("去授权…")
         accessPermissionButton.title = Permissions.accessibility ? L("管理权限…") : L("去授权…")
         applySessionState()
@@ -718,16 +722,18 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     private func reloadPopup(_ screens: [PhysicalScreen]) {
         let previous = selectedDisplayID()
-        displays = screens
+        displays = screens.sorted { $0.id < $1.id }
+        displayArrangement.updateDisplays(displays)
         popup.removeAllItems()
         if displays.isEmpty {
             popup.addItem(withTitle: L("没有可用显示器"))
             return
         }
-        for screen in displays {
+        for (index, screen) in displays.enumerated() {
             let session = splits.sessions[screen.id]
             let mode = session?.hasQuick == true ? L("快捷全屏") : L("桌面拆分")
-            let label = session?.active == true ? "\(screen.menuTitle) · \(mode)" : screen.menuTitle
+            let displayTitle = "\(index + 1) · \(screen.menuTitle)"
+            let label = session?.active == true ? "\(displayTitle) · \(mode)" : displayTitle
             popup.addItem(withTitle: label)
             popup.lastItem?.representedObject = NSNumber(value: screen.id)
         }
@@ -773,6 +779,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         splitButton.isHidden = session != nil && !canCancelDesktopSplit
         splitButton.isEnabled = canCancelDesktopSplit || (id != nil && problem == nil && operationsAvailable && session == nil)
         popup.isEnabled = id != nil && operationsAvailable
+        displayArrangement.updateSelection(id, enabled: popup.isEnabled)
         restoreButton.isHidden = restore == nil
         restoreButton.isEnabled = operationsAvailable && restore != nil
         if let restore { restoreButton.title = restore.menuTitle }
@@ -780,6 +787,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         mergeButton.isEnabled = operationsAvailable && restore == .endPair
         retryRecoveryButton.isEnabled = operationsAvailable && hasRecovery
         restoreAllButton.isEnabled = canRestoreAll
+        recoveryStatus.textColor = hasRecovery ? .labelColor : .secondaryLabelColor
+        recoveryStatus.font = .systemFont(ofSize: 12, weight: hasRecovery ? .medium : .regular)
         if splits.recovering { recoveryStatus.stringValue = L("正在恢复显示器和窗口…") }
         else if let transition = splits.transition, restoringAll || transition.joining { recoveryStatus.stringValue = transition.status }
         else {
@@ -1328,9 +1337,174 @@ private final class RestoreDisplayPicker: NSPopUpButton {
     @objc func selectionChanged() { onSelect?(indexOfSelectedItem) }
 }
 
+private final class SettingsStatusLine: NSStackView {
+    private let icon = NSImageView()
+    private let label = NSTextField(wrappingLabelWithString: "")
+    private var lastReady: Bool?
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        orientation = .horizontal
+        alignment = .centerY
+        spacing = 7
+        icon.setAccessibilityElement(false)
+        icon.widthAnchor.constraint(equalToConstant: 14).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 14).isActive = true
+        label.font = .systemFont(ofSize: 12, weight: .medium)
+        addArrangedSubview(icon)
+        addArrangedSubview(label)
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func update(_ text: String, ready: Bool) {
+        guard label.stringValue != text || lastReady != ready else { return }
+        label.stringValue = text
+        icon.image = NSImage(systemSymbolName: ready ? "checkmark.circle.fill" : "exclamationmark.triangle.fill", accessibilityDescription: nil)
+        icon.contentTintColor = ready ? .systemGreen : .systemOrange
+        lastReady = ready
+    }
+}
+
+private final class EnvironmentStatusView: NSBox {
+    private let icon = NSImageView()
+    private let heading = NSTextField(wrappingLabelWithString: "")
+    private let detail = NSTextField(wrappingLabelWithString: "")
+    private let checked = NSTextField(labelWithString: "")
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        boxType = .custom
+        titlePosition = .noTitle
+        cornerRadius = 9
+        borderWidth = 0
+        contentViewMargins = .zero
+        icon.setAccessibilityElement(false)
+        icon.widthAnchor.constraint(equalToConstant: 18).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 18).isActive = true
+        heading.font = .systemFont(ofSize: 13, weight: .semibold)
+        detail.font = .systemFont(ofSize: 12)
+        detail.preferredMaxLayoutWidth = 370
+        checked.font = .systemFont(ofSize: 11)
+        checked.textColor = .secondaryLabelColor
+        let labels = NSStackView(views: [heading, detail, checked])
+        labels.orientation = .vertical
+        labels.alignment = .leading
+        labels.spacing = 5
+        let row = NSStackView(views: [icon, labels])
+        row.alignment = .top
+        row.spacing = 10
+        row.translatesAutoresizingMaskIntoConstraints = false
+        let content = NSView()
+        contentView = content
+        content.addSubview(row)
+        NSLayoutConstraint.activate([
+            row.leadingAnchor.constraint(equalTo: content.leadingAnchor, constant: 12),
+            row.trailingAnchor.constraint(equalTo: content.trailingAnchor, constant: -12),
+            row.topAnchor.constraint(equalTo: content.topAnchor, constant: 12),
+            row.bottomAnchor.constraint(equalTo: content.bottomAnchor, constant: -12)
+        ])
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func update(_ report: EnvironmentCheck.Report, checkedAt: Date) {
+        let symbol: String
+        let color: NSColor
+        switch report.status {
+        case .available: (symbol, color) = ("checkmark.circle.fill", .systemGreen)
+        case .limited: (symbol, color) = ("exclamationmark.triangle.fill", .systemOrange)
+        case .unavailable: (symbol, color) = ("xmark.octagon.fill", .systemRed)
+        }
+        icon.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        icon.contentTintColor = color
+        fillColor = color.withAlphaComponent(0.10)
+        heading.stringValue = report.statusTitle
+        detail.stringValue = report.statusDetail
+        checked.stringValue = L("上次检测：%@", DateFormatter.localizedString(from: checkedAt, dateStyle: .none, timeStyle: .medium))
+    }
+}
+
 @MainActor
 private final class FlippedDocumentView: NSView {
     override var isFlipped: Bool { true }
+}
+
+@MainActor
+private final class SettingsDisplayArrangement: NSView {
+    private struct Tile {
+        let screen: PhysicalScreen
+        let button: NSButton
+    }
+
+    var onSelect: ((CGDirectDisplayID) -> Void)?
+    override var isFlipped: Bool { true }
+    private var tiles: [Tile] = []
+    private var selectedID: CGDirectDisplayID?
+    private var enabled = false
+
+    func updateDisplays(_ screens: [PhysicalScreen]) {
+        tiles.forEach { $0.button.removeFromSuperview() }
+        tiles = screens.enumerated().map { index, screen in
+            let number = String(index + 1)
+            let button = NSButton(title: number, target: self, action: #selector(displayClicked(_:)))
+            button.setButtonType(.pushOnPushOff)
+            button.isBordered = false
+            button.contentTintColor = .labelColor
+            button.wantsLayer = true
+            button.layer?.cornerRadius = 6
+            button.setAccessibilityLabel(L("显示器 %@：%@", number, screen.displayName))
+            button.toolTip = "\(number) · \(screen.menuTitle)"
+            addSubview(button)
+            return Tile(screen: screen, button: button)
+        }
+        needsLayout = true
+        updateAppearance()
+    }
+
+    func updateSelection(_ id: CGDirectDisplayID?, enabled: Bool) {
+        guard selectedID != id || self.enabled != enabled else { return }
+        selectedID = id
+        self.enabled = enabled
+        updateAppearance()
+    }
+
+    override func layout() {
+        super.layout()
+        let frames = DisplayScanner.arrangementFrames(tiles.map(\.screen.bounds), in: bounds.insetBy(dx: 8, dy: 5))
+        for (tile, frame) in zip(tiles, frames) {
+            tile.button.frame = frame.insetBy(dx: min(3, frame.width / 10), dy: min(3, frame.height / 10))
+            let size = min(tile.button.bounds.width, tile.button.bounds.height)
+            tile.button.font = .systemFont(ofSize: min(16, max(9, size * 0.3)), weight: .semibold)
+        }
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateAppearance()
+    }
+
+    private func updateAppearance() {
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            let accent = NSColor.controlAccentColor
+            let selection = accent.blended(withFraction: 0.82, of: .controlBackgroundColor) ?? .controlBackgroundColor
+            for tile in tiles {
+                let selected = tile.screen.id == selectedID
+                tile.button.state = selected ? .on : .off
+                tile.button.isEnabled = enabled
+                tile.button.layer?.backgroundColor = (selected ? selection : .controlBackgroundColor).cgColor
+                tile.button.layer?.borderColor = (selected ? accent : .separatorColor).cgColor
+                tile.button.layer?.borderWidth = selected ? 2 : 1
+                tile.button.setAccessibilitySelected(selected)
+                tile.button.setAccessibilityHelp(selected ? L("当前选中") : L("选择此显示器"))
+            }
+        }
+    }
+
+    @objc private func displayClicked(_ sender: NSButton) {
+        guard let tile = tiles.first(where: { $0.button === sender }) else { return }
+        onSelect?(tile.screen.id)
+    }
 }
 
 @MainActor

@@ -63,6 +63,20 @@ struct PhysicalScreen {
 }
 
 enum DisplayScanner {
+    static func arrangementFrames(_ frames: [CGRect], in area: CGRect) -> [CGRect] {
+        let desktop = frames.reduce(CGRect.null) { $0.union($1) }
+        guard !desktop.isNull, !desktop.isEmpty, area.width > 0, area.height > 0 else {
+            return frames.map { _ in .zero }
+        }
+        let scale = min(area.width / desktop.width, area.height / desktop.height)
+        let origin = CGPoint(x: area.midX - desktop.width * scale / 2, y: area.midY - desktop.height * scale / 2)
+        return frames.map { frame in
+            CGRect(x: origin.x + (frame.minX - desktop.minX) * scale,
+                   y: origin.y + (frame.minY - desktop.minY) * scale,
+                   width: frame.width * scale, height: frame.height * scale)
+        }
+    }
+
     static func splitDisplayFrames(physical: [CGDirectDisplayID: CGRect], main: CGDirectDisplayID,
                                    halves: [CGDirectDisplayID: [CGDirectDisplayID: CGRect]]) -> [CGDirectDisplayID: CGRect] {
         var desktops = physical

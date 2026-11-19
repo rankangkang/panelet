@@ -38,6 +38,15 @@ struct SplitLayoutTests {
         assert(split[5]?.maxX == split[3]?.minX && split[4]?.maxX == split[2]?.minX)
         assert(split[3]?.minY == 0 && split[2]?.minY == 310 && split[5]?.minY == -320)
         assert(DisplayScanner.splitDisplayFrames(physical: original, main: 1, halves: [:]) == original)
+        let displays = [CGRect(x: -1000, y: -400, width: 1000, height: 2000),
+                        CGRect(x: 0, y: 0, width: 2000, height: 1000),
+                        CGRect(x: 0, y: 1000, width: 1000, height: 2000)]
+        let diagram = DisplayScanner.arrangementFrames(displays, in: CGRect(x: 0, y: 0, width: 300, height: 340))
+        assert(diagram.count == 3 && diagram[0].maxX == diagram[1].minX)
+        assert(diagram[1].maxY == diagram[2].minY && diagram[0].minY < diagram[1].minY)
+        assert(diagram[0].height == diagram[0].width * 2 && diagram[1].width == diagram[1].height * 2)
+        assert(DisplayScanner.arrangementFrames([], in: .zero).isEmpty)
+        assert(DisplayScanner.arrangementFrames(displays, in: .zero).allSatisfy { $0 == .zero })
         print("SplitLayout: split geometry, adjacent monitors and restoration of original positions passed")
     }
 }

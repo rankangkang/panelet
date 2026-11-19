@@ -49,6 +49,15 @@
 "当前环境不支持新建分屏" = "This environment cannot start new splits";
 "必要接口检查通过，实际兼容性以分屏运行为准" = "Required interfaces found; actual compatibility depends on runtime behavior";
 "必要接口检查通过，部分窗口兼容能力受限" = "Required interfaces found; some window compatibility features are limited";
+"必要接口检测通过" = "Required interfaces found";
+"部分窗口兼容能力受限" = "Some window compatibility features are limited";
+"无法新建分屏" = "Cannot start new splits";
+"仅确认接口存在，实际兼容性以分屏运行为准。权限请查看“权限”页。" = "This only checks that interfaces exist. Compatibility depends on runtime behavior. See Permissions for access status.";
+"必要接口已找到，部分窗口兼容功能可能不可用。可预览诊断报告查看详情。" = "Required interfaces were found, but some window compatibility features may be unavailable. Preview the diagnostic report for details.";
+"系统缺少必要接口，已有分屏仍可还原。可预览诊断报告查看详情。" = "Required interfaces are missing. Existing splits can still be restored. Preview the diagnostic report for details.";
+"上次检测：%@" = "Last checked: %@";
+"已授权" = "Granted";
+"已打开" = "Enabled";
 "系统：%@" = "System: %@";
 "此检查不创建显示器、不移动窗口。接口存在不代表其行为兼容；权限状态请查看“权限”页。" = "This check does not create displays or move windows. Interface presence does not guarantee compatible behavior. See Permissions for access status.";
 "缺少必要接口：%@" = "Missing required interface: %@";
@@ -218,6 +227,9 @@
 "通用" = "General";
 "一块屏幕，更多空间。" = "One screen. More room.";
 "目标显示器" = "Target display";
+"点击屏幕选择；编号与“识别显示器”一致。" = "Click a display to select it. Numbers match Identify Displays.";
+"显示器 %@：%@" = "Display %@: %@";
+"选择此显示器" = "Select this display";
 "合并桌面…" = "Merge Desktop…";
 "分屏方向" = "Split direction";
 "分区比例" = "Region ratio";
