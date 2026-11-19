@@ -1,0 +1,145 @@
+{
+  "date": "2026-11-17",
+  "system": "macOS 26.6.2",
+  "applications": [
+    "TextEdit",
+    "Finder"
+  ],
+  "target_window": {
+    "frame_origin": [
+      2200,
+      -200
+    ],
+    "size": [
+      640,
+      420
+    ]
+  },
+  "host_content_origin": [
+    900,
+    300
+  ],
+  "menu_projected_hover": [
+    {
+      "position": [
+        2251,
+        -156
+      ],
+      "size": [
+        156,
+        248
+      ]
+    }
+  ],
+  "menu_native_hover": [
+    {
+      "position": [
+        2251,
+        -156
+      ],
+      "size": [
+        156,
+        248
+      ]
+    },
+    {
+      "position": [
+        2402,
+        -73
+      ],
+      "size": [
+        109,
+        58
+      ]
+    }
+  ],
+  "host_log": [
+    {
+      "target": [
+        2250,
+        -150
+      ],
+      "time": 3466068.242791417,
+      "forward": 5,
+      "pointer": [
+        950,
+        350
+      ],
+      "recipientWindow": 268992
+    },
+    {
+      "target": [
+        2250,
+        -150
+      ],
+      "time": 3466068.2654103334,
+      "forward": 3,
+      "pointer": [
+        950,
+        350
+      ],
+      "recipientWindow": 268992
+    },
+    {
+      "target": [
+        2250,
+        -150
+      ],
+      "time": 3466068.3483309587,
+      "forward": 4,
+      "pointer": [
+        950,
+        350
+      ],
+      "recipientWindow": 268992
+    },
+    {
+      "target": [
+        2300,
+        -56
+      ],
+      "time": 3466068.6388441254,
+      "forward": 5,
+      "pointer": [
+        1000,
+        444
+      ],
+      "recipientWindow": 269034
+    },
+    {
+      "target": [
+        3600,
+        -556
+      ],
+      "time": 3466085.486230042,
+      "forward": 5,
+      "pointer": [
+        2300,
+        -56
+      ],
+      "recipientWindow": 268992
+    },
+    {
+      "time": 3466088.4674223335,
+      "nativeDragEntered": [
+        "projection-drag.txt"
+      ],
+      "location": [
+        0,
+        325
+      ]
+    }
+  ],
+  "projected_file_drop_text": [
+    "Panelet menu and drag test.\nSelect this temporary text.\n"
+  ],
+  "native_cross_display_drop_text": [
+    "Panelet menu and drag test.\nSelect this temporary text.\n/private/tmp/panelet-real-20261117/source/projection-drag.txt"
+  ],
+  "excluded_control": "Same-screen native trial excluded because Stage Manager hid the target. Final control uses native destination on virtual display.",
+  "limitations": [
+    "Static window image, no live menu rendering",
+    "Drag destination logging on host explicitly returns NSDragOperationNone; no drag-session bridge was implemented",
+    "Hover difference may involve both actual global cursor and AppKit tracking state; exact internal read path was not instrumented"
+  ]
+}
