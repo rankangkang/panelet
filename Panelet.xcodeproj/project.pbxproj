@@ -25,6 +25,10 @@
 		A30000000000000000000015 /* PhysicalScreenScreenshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000015 /* PhysicalScreenScreenshot.swift */; };
 		A30000000000000000000012 /* Diagnostics.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000012 /* Diagnostics.swift */; };
 		A30000000000000000000013 /* Localization.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000013 /* Localization.swift */; };
+		A30000000000000000000016 /* SystemBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000016 /* SystemBridge.swift */; };
+		A30000000000000000000017 /* DisplayTopology.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000017 /* DisplayTopology.swift */; };
+		A30000000000000000000018 /* SettingsComponents.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000018 /* SettingsComponents.swift */; };
+		A30000000000000000000019 /* OnboardingGuide.swift in Sources */ = {isa = PBXBuildFile; fileRef = A20000000000000000000019 /* OnboardingGuide.swift */; };
 		A300000000000000000000F1 /* AppIcon.icns in Resources */ = {isa = PBXBuildFile; fileRef = A200000000000000000000F1; };
 		A300000000000000000000F2 /* MenuBarTemplate.png in Resources */ = {isa = PBXBuildFile; fileRef = A200000000000000000000F2; };
 		A300000000000000000000F3 /* MenuBarTemplate@2x.png in Resources */ = {isa = PBXBuildFile; fileRef = A200000000000000000000F3; };
@@ -58,6 +62,10 @@
 		A20000000000000000000015 /* PhysicalScreenScreenshot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PhysicalScreenScreenshot.swift; sourceTree = "<group>"; };
 		A20000000000000000000012 /* Diagnostics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Diagnostics.swift; sourceTree = "<group>"; };
 		A20000000000000000000013 /* Localization.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Localization.swift; sourceTree = "<group>"; };
+		A20000000000000000000016 /* SystemBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SystemBridge.swift; sourceTree = "<group>"; };
+		A20000000000000000000017 /* DisplayTopology.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DisplayTopology.swift; sourceTree = "<group>"; };
+		A20000000000000000000018 /* SettingsComponents.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsComponents.swift; sourceTree = "<group>"; };
+		A20000000000000000000019 /* OnboardingGuide.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = OnboardingGuide.swift; sourceTree = "<group>"; };
 		A200000000000000000000F1 /* AppIcon.icns */ = {isa = PBXFileReference; lastKnownFileType = image.icns; path = AppIcon.icns; sourceTree = "<group>"; };
 		A200000000000000000000F2 /* MenuBarTemplate.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = MenuBarTemplate.png; sourceTree = "<group>"; };
 		A200000000000000000000F3 /* MenuBarTemplate@2x.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "MenuBarTemplate@2x.png"; sourceTree = "<group>"; };
@@ -119,6 +127,10 @@
 				A20000000000000000000015 /* PhysicalScreenScreenshot.swift */,
 				A20000000000000000000012 /* Diagnostics.swift */,
 				A20000000000000000000013 /* Localization.swift */,
+				A20000000000000000000016 /* SystemBridge.swift */,
+				A20000000000000000000017 /* DisplayTopology.swift */,
+				A20000000000000000000018 /* SettingsComponents.swift */,
+				A20000000000000000000019 /* OnboardingGuide.swift */,
 				A20000000000000000000006 /* VirtualDisplay.h */,
 				A20000000000000000000007 /* Info.plist */,
 				A20000000000000000000008 /* Panelet.entitlements */,
@@ -214,6 +226,10 @@
 				A30000000000000000000015 /* PhysicalScreenScreenshot.swift in Sources */,
 				A30000000000000000000012 /* Diagnostics.swift in Sources */,
 				A30000000000000000000013 /* Localization.swift in Sources */,
+				A30000000000000000000016 /* SystemBridge.swift in Sources */,
+				A30000000000000000000017 /* DisplayTopology.swift in Sources */,
+				A30000000000000000000018 /* SettingsComponents.swift in Sources */,
+				A30000000000000000000019 /* OnboardingGuide.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

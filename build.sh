@@ -78,7 +78,9 @@ swiftc -O -g \
   -framework ApplicationServices \
   -framework Carbon \
   -framework QuartzCore \
+  Panelet/SystemBridge.swift \
   Panelet/DisplayScanner.swift \
+  Panelet/DisplayTopology.swift \
   Panelet/EnvironmentCheck.swift \
   Panelet/ProductPreferences.swift \
   Panelet/PlacementGeometry.swift \
@@ -95,6 +97,8 @@ swiftc -O -g \
   Panelet/WindowPreviewGrid.swift \
   Panelet/QuickSplitPanel.swift \
   Panelet/GlobalShortcuts.swift \
+  Panelet/SettingsComponents.swift \
+  Panelet/OnboardingGuide.swift \
   Panelet/AppMain.swift \
   -o "$STAGED_APP/Contents/MacOS/Panelet"
 

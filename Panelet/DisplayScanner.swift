@@ -186,6 +186,16 @@ extension NSScreen {
     var displayID: CGDirectDisplayID? {
         (deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
     }
+
+    /// Global CoreGraphics coordinates (top-left of main display, y downward).
+    var quartzFrame: CGRect {
+        ScreenCoordinates.quartzFrame(forCocoa: frame)
+    }
+
+    /// Visible work area in global CoreGraphics coordinates (top-left of main display, y downward).
+    var quartzVisibleFrame: CGRect {
+        ScreenCoordinates.quartzFrame(forCocoa: visibleFrame)
+    }
 }
 
 enum Permissions {
@@ -227,14 +237,6 @@ enum Permissions {
         let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?\(pane)")!
         NSWorkspace.shared.open(url)
     }
-}
-
-/// Global CoreGraphics coordinates have their origin at the top-left of the main
-/// display and increase downward. AppKit windows use the bottom-left of the main
-/// display and increase upward.
-func cocoaRect(_ rect: CGRect) -> CGRect {
-    let mainHeight = CGDisplayBounds(CGMainDisplayID()).height
-    return CGRect(x: rect.minX, y: mainHeight - rect.maxY, width: rect.width, height: rect.height)
 }
 
 func stableSerial(_ text: String) -> UInt32 {

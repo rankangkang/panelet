@@ -25,10 +25,12 @@ final class WindowPreviewGrid: NSScrollView, NSCollectionViewDataSource {
         let refreshAfter: ContinuousClock.Instant
     }
 
+    private static let maxConcurrentCaptures = 4
     private let collection = NSCollectionView()
     private let clock = ContinuousClock()
     private var choices: [WindowPlacement.Choice] = []
     private var previews: [WindowPlacement.Choice.ID: Preview] = [:]
+    private var cachedWindows: (byPID: [pid_t: [SCWindow]], expiresAt: ContinuousClock.Instant)?
     private var refreshTask: Task<Void, Never>?
 
     override init(frame frameRect: NSRect) {
@@ -96,6 +98,7 @@ final class WindowPreviewGrid: NSScrollView, NSCollectionViewDataSource {
 
     func resetPreviews() {
         previews.removeAll()
+        cachedWindows = nil
         for card in visibleCards { card.showPreview(nil) }
     }
 
@@ -122,6 +125,19 @@ final class WindowPreviewGrid: NSScrollView, NSCollectionViewDataSource {
         collection.visibleItems().compactMap { $0 as? WindowPreviewCard }
     }
 
+    private func shareableWindowsByPID() async -> [pid_t: [SCWindow]] {
+        let now = clock.now
+        if let cachedWindows, cachedWindows.expiresAt > now {
+            return cachedWindows.byPID
+        }
+        let content = try? await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
+        let grouped = Dictionary(grouping: content?.windows.filter { $0.windowLayer == 0 } ?? []) {
+            $0.owningApplication?.processID ?? 0
+        }
+        cachedWindows = (grouped, clock.now.advanced(by: .milliseconds(1500)))
+        return grouped
+    }
+
     private func refreshVisiblePreviews() async {
         let now = clock.now
         let visible = collection.visibleRect
@@ -131,26 +147,46 @@ final class WindowPreviewGrid: NSScrollView, NSCollectionViewDataSource {
         guard !targets.isEmpty else { return }
         // Keep recent thumbnails when searching or switching halves, then let them expire.
         previews = previews.filter { $0.value.refreshAfter.advanced(by: .seconds(12)) > now }
-        let content = try? await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: false)
-        let windows = Dictionary(grouping: content?.windows.filter { $0.windowLayer == 0 } ?? []) {
-            $0.owningApplication?.processID ?? 0
+        let windows = await shareableWindowsByPID()
+        let activeTargets = targets.filter { target in
+            visibleCards.contains { $0.choice?.id == target.id }
         }
-        for choice in targets {
-            guard !Task.isCancelled else { return }
-            guard visibleCards.contains(where: { $0.choice?.id == choice.id }) else { continue }
-            let image: NSImage?
-            if let window = Self.match(choice, in: windows[choice.pid] ?? []) {
-                image = await Self.thumbnail(of: window)
-            } else {
-                image = nil
+        guard !activeTargets.isEmpty, !Task.isCancelled else { return }
+
+        // Capture CGImage (Sendable) off the main actor, then construct NSImage on MainActor.
+        await withTaskGroup(of: (WindowPlacement.Choice.ID, CGImage?).self) { group in
+            var index = 0
+            let initial = min(Self.maxConcurrentCaptures, activeTargets.count)
+            for _ in 0..<initial {
+                let choice = activeTargets[index]
+                index += 1
+                let matched = Self.match(choice, in: windows[choice.pid] ?? [])
+                let id = choice.id
+                group.addTask {
+                    guard !Task.isCancelled, let matched else { return (id, nil) }
+                    return (id, await Self.thumbnailCGImage(of: matched))
+                }
             }
-            guard !Task.isCancelled else { return }
-            previews[choice.id] = Preview(image: image, refreshAfter: clock.now.advanced(by: .seconds(3)))
-            visibleCards.first { $0.choice?.id == choice.id }?.showPreview(image)
+            for await (id, cgImage) in group {
+                guard !Task.isCancelled else { break }
+                let image = cgImage.map { NSImage(cgImage: $0, size: .zero) }
+                previews[id] = Preview(image: image, refreshAfter: clock.now.advanced(by: .seconds(3)))
+                visibleCards.first { $0.choice?.id == id }?.showPreview(image)
+                if index < activeTargets.count, !Task.isCancelled {
+                    let choice = activeTargets[index]
+                    index += 1
+                    let matched = Self.match(choice, in: windows[choice.pid] ?? [])
+                    let nextID = choice.id
+                    group.addTask {
+                        guard !Task.isCancelled, let matched else { return (nextID, nil) }
+                        return (nextID, await Self.thumbnailCGImage(of: matched))
+                    }
+                }
+            }
         }
     }
 
-    private static func match(_ choice: WindowPlacement.Choice, in windows: [SCWindow]) -> SCWindow? {
+    nonisolated private static func match(_ choice: WindowPlacement.Choice, in windows: [SCWindow]) -> SCWindow? {
         if let id = choice.windowID { return windows.first { $0.windowID == id } }
         guard let frame = choice.frame else { return nil }
         // Accessibility and ScreenCaptureKit enumerate windows separately. Avoid guessing when windows overlap.
@@ -162,7 +198,7 @@ final class WindowPreviewGrid: NSScrollView, NSCollectionViewDataSource {
         return only
     }
 
-    private static func thumbnail(of window: SCWindow) async -> NSImage? {
+    nonisolated private static func thumbnailCGImage(of window: SCWindow) async -> CGImage? {
         let filter = SCContentFilter(desktopIndependentWindow: window)
         let size = filter.contentRect.size
         guard size.width > 0, size.height > 0 else { return nil }
@@ -174,8 +210,7 @@ final class WindowPreviewGrid: NSScrollView, NSCollectionViewDataSource {
         config.ignoreShadowsSingleWindow = true
         config.ignoreGlobalClipSingleWindow = true
         config.scalesToFit = true
-        guard let image = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config) else { return nil }
-        return NSImage(cgImage: image, size: .zero)
+        return try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
     }
 }
 

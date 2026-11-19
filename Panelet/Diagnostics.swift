@@ -56,6 +56,52 @@ private extension Array {
     func adding(_ other: [Element]) -> [Element] { self + other }
 }
 
+/// Bounded ring-style line buffer that computes O(1) incremental `NSTextStorage`
+/// mutations instead of re-splitting and re-laying out the entire log view on every line.
+struct BoundedLogBuffer {
+    struct Mutation: Equatable {
+        let prefixUTF16CountToRemove: Int
+        let appendedText: String
+    }
+
+    let capacity: Int
+    private(set) var lines: [String] = []
+
+    init(capacity: Int = 500) {
+        self.capacity = max(1, capacity)
+    }
+
+    mutating func append(_ message: String) -> Mutation {
+        let incoming = message.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        guard !incoming.isEmpty else { return Mutation(prefixUTF16CountToRemove: 0, appendedText: "") }
+        let keptIncoming = incoming.count > capacity ? Array(incoming.suffix(capacity)) : incoming
+        let overflow = max(0, lines.count + keptIncoming.count - capacity)
+
+        if overflow >= lines.count, !lines.isEmpty {
+            let removedUTF16 = text.utf16.count
+            lines = keptIncoming
+            return Mutation(prefixUTF16CountToRemove: removedUTF16, appendedText: keptIncoming.joined(separator: "\n"))
+        }
+
+        var removedUTF16 = 0
+        if overflow > 0 {
+            for idx in 0..<overflow {
+                removedUTF16 += lines[idx].utf16.count + 1
+            }
+            lines.removeFirst(overflow)
+        }
+        let wasEmpty = lines.isEmpty
+        let chunk = keptIncoming.joined(separator: "\n")
+        lines.append(contentsOf: keptIncoming)
+        let appended = wasEmpty ? chunk : "\n" + chunk
+        return Mutation(prefixUTF16CountToRemove: removedUTF16, appendedText: appended)
+    }
+
+    var text: String {
+        lines.joined(separator: "\n")
+    }
+}
+
 /// Deliberately built from an allowlist. Raw logs may contain document/window names.
 enum DiagnosticReport {
     static func make(environment: EnvironmentCheck.Report, displays: [PhysicalScreen],
@@ -80,7 +126,7 @@ final class DisplayIdentifiers {
         dismissal?.cancel()
         windows.forEach { $0.orderOut(nil) }
         windows = screens.sorted { $0.id < $1.id }.enumerated().map { index, screen in
-            let frame = cocoaRect(screen.bounds)
+            let frame = ScreenCoordinates.cocoaFrame(forQuartz: screen.bounds)
             let badge = NSPanel(contentRect: CGRect(x: frame.midX - 180, y: frame.midY - 70, width: 360, height: 140),
                                 styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
             badge.isReleasedWhenClosed = false

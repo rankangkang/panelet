@@ -94,6 +94,77 @@ struct ProductBehaviorTests {
         assert(DisplayConfiguration.Rendering.clarity.scale(native: 2) == 2)
         assert(DisplayConfiguration.Rendering.smooth.frameRate(native: 240) == 120)
         assert(DisplayConfiguration.Rendering.clarity.frameRate(native: 0) == 60)
+        assert(DisplayConfiguration.Rendering.highRefresh.scale(native: 2) == 2)
+        assert(DisplayConfiguration.Rendering.highRefresh.scale(native: 1) == 1)
+        assert(DisplayConfiguration.Rendering.highRefresh.frameRate(native: 120, lowPower: true) == 120)
+        assert(DisplayConfiguration.Rendering.highRefresh.frameRate(native: 240, lowPower: false) == 120)
+        assert(DisplayConfiguration.Rendering.highRefresh.frameRate(native: 60, lowPower: false) == 60)
+
+        var logBuffer = BoundedLogBuffer(capacity: 3)
+        let m1 = logBuffer.append("第一行")
+        assert(m1.prefixUTF16CountToRemove == 0 && m1.appendedText == "第一行" && logBuffer.text == "第一行")
+        let m2 = logBuffer.append("Line 2")
+        assert(m2.prefixUTF16CountToRemove == 0 && m2.appendedText == "\nLine 2" && logBuffer.text == "第一行\nLine 2")
+        let m3 = logBuffer.append("Line 3")
+        assert(m3.prefixUTF16CountToRemove == 0 && logBuffer.lines.count == 3)
+        let m4 = logBuffer.append("Line 4")
+        assert(m4.prefixUTF16CountToRemove == ("第一行".utf16.count + 1) && m4.appendedText == "\nLine 4")
+        assert(logBuffer.text == "Line 2\nLine 3\nLine 4")
+
+        // Multi-line messages must enforce a strict 500 physical-line cap and keep incremental UTF-16 edits exact.
+        var multiLineBuffer = BoundedLogBuffer(capacity: 500)
+        let simulatedStorage = NSMutableString()
+        var rawTranscript = ""
+        for idx in 0..<500 {
+            let entry = "环境检查 #\(idx)\n必要接口检查通过\n权限状态请查看设置"
+            rawTranscript = rawTranscript.isEmpty ? entry : (rawTranscript + "\n" + entry)
+            let mutation = multiLineBuffer.append(entry)
+            if mutation.prefixUTF16CountToRemove > 0 {
+                simulatedStorage.deleteCharacters(in: NSRange(location: 0, length: mutation.prefixUTF16CountToRemove))
+            }
+            simulatedStorage.append(mutation.appendedText)
+        }
+        let expected500 = rawTranscript.split(separator: "\n", omittingEmptySubsequences: false).suffix(500).joined(separator: "\n")
+        assert(multiLineBuffer.lines.count == 500, "Must cap at 500 physical lines, not 500 messages")
+        assert(multiLineBuffer.text == expected500)
+        assert((simulatedStorage as String) == expected500)
+
+        // Constrained ordinary window restore: unmoved windows must fail, positioned windows with grid/min-size deltas pass.
+        let fullDisplay = CGRect(x: 0, y: 0, width: 2048, height: 1152)
+        let visibleDisplay = CGRect(x: 0, y: 25, width: 2048, height: 1059)
+        let desiredRight = CGRect(x: 1024, y: 30, width: 1024, height: 1054)
+        let stuckOnLeft = CGRect(x: 0, y: 30, width: 1024, height: 1054)
+        assert(!PlacementGeometry.settledConstrainedRestore(
+            desired: desiredRight, actual: stuckOnLeft, previousAttempt: stuckOnLeft,
+            displayBounds: fullDisplay, visibleBounds: visibleDisplay
+        ), "A window that refused to move to desired.origin must never be marked restored")
+
+        let gridSnapped = CGRect(x: 1024, y: 30, width: 1018, height: 1044)
+        assert(!PlacementGeometry.settledConstrainedRestore(
+            desired: desiredRight, actual: gridSnapped, previousAttempt: nil,
+            displayBounds: fullDisplay, visibleBounds: visibleDisplay
+        ), "First constrained observation must retry once to confirm stability")
+        assert(PlacementGeometry.settledConstrainedRestore(
+            desired: desiredRight, actual: gridSnapped, previousAttempt: gridSnapped,
+            displayBounds: fullDisplay, visibleBounds: visibleDisplay
+        ), "Positioned window with stable character-grid size delta should be accepted")
+
+        let edgeDesired = CGRect(x: 1548, y: 100, width: 500, height: 600)
+        let minWidthPushed = CGRect(x: 1368, y: 100, width: 680, height: 600)
+        assert(PlacementGeometry.settledConstrainedRestore(
+            desired: edgeDesired, actual: minWidthPushed, previousAttempt: minWidthPushed,
+            displayBounds: fullDisplay, visibleBounds: visibleDisplay
+        ), "Window pushed left by display right edge due to min-width constraint should be accepted")
+
+        let overhanging = edgeDesired.offsetBy(dx: 180, dy: 0)
+        var tallerAtEdge = edgeDesired
+        tallerAtEdge.size.height += 20
+        for clamped in [edgeDesired, tallerAtEdge, minWidthPushed] {
+            assert(!PlacementGeometry.settledConstrainedRestore(
+                desired: overhanging, actual: clamped, previousAttempt: clamped,
+                displayBounds: fullDisplay, visibleBounds: visibleDisplay
+            ), "An already overhanging window that stays clamped must remain pending")
+        }
 
         let target = CGRect(x: 2560, y: 30, width: 1280, height: 1410)
         let others = [CGRect(x: 0, y: 0, width: 2560, height: 1440), CGRect(x: 3840, y: 0, width: 1280, height: 1440)]

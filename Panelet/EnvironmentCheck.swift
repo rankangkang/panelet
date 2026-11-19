@@ -50,10 +50,8 @@ enum EnvironmentCheck {
         ("CGVirtualDisplaySettings", ["init", "setHiDPI:", "setModes:"]),
         ("CGVirtualDisplayMode", ["initWithWidth:height:refreshRate:"])
     ]
-    static let requiredSymbols = ["SLSMainConnectionID", "SLSCopyManagedDisplaySpaces",
-        "SLSCopySpacesForWindows", "SLSProcessAssignToSpace"]
-    static let optionalSymbols = ["_AXUIElementGetWindow", "_AXUIElementCreateWithRemoteToken",
-        "GetProcessForPID", "_SLPSSetFrontProcessWithOptions"]
+    static let requiredSymbols = SystemBridge.requiredSymbols
+    static let optionalSymbols = SystemBridge.optionalSymbols
 
     static func inspect(
         hasClass: (String) -> Bool = { NSClassFromString($0) != nil },
@@ -61,7 +59,7 @@ enum EnvironmentCheck {
             guard let type = NSClassFromString(name) else { return false }
             return class_getInstanceMethod(type, NSSelectorFromString(selector)) != nil
         },
-        hasSymbol: (String) -> Bool = { dlsym(UnsafeMutableRawPointer(bitPattern: -2), $0) != nil }
+        hasSymbol: (String) -> Bool = SystemBridge.hasSymbol
     ) -> Report {
         var missing: [String] = []
         for (name, selectors) in methods {

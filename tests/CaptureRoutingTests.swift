@@ -205,6 +205,13 @@ struct CaptureRoutingTests {
             "value": ["parameters": [51, 21, standard.rawValue]]]])
         assert(keys.handle(keyCode: 20, flags: standard, down: true, repeated: false) == .pass)
         assert(keys.handle(keyCode: 21, flags: standard, down: true, repeated: false) == .capture(.clipboard))
+        // Regression: a dropped keyUp or disabling screenshots while a key is held must never swallow future normal typing.
+        assert(keys.handle(keyCode: 21, flags: [], down: true, repeated: false) == .pass)
+        assert(keys.handle(keyCode: 21, flags: standard, down: true, repeated: false) == .capture(.clipboard))
+        keys.enabled = false
+        assert(keys.handle(keyCode: 21, flags: [], down: false, repeated: false) == .pass)
+        keys.enabled = true
+        assert(keys.handle(keyCode: 21, flags: [], down: true, repeated: false) == .pass)
         let parked = MouseRouter.Parking(physical: physical, desktop: left.union(right), displayID: 1,
                                          mirrors: [.init(id: 60, frame: physical)])
         var synchronousHits = 0
@@ -304,6 +311,33 @@ struct CaptureRoutingTests {
         assert(!waiting.discardSuppressedPixPinEvent(.mouseMoved))
         assert(waiting.discardSuppressedPixPinEvent(.leftMouseUp))
         assert(waiting.pressedButtons.isEmpty && waiting.gesturePanel == nil)
+
+        // Regression: merging the main display while a window still needs recovery must clear
+        // parked regions on the same router. Use simulated cursor input to exercise the handoff.
+        let mainPanel = CGRect(x: 0, y: 0, width: 2048, height: 1152)
+        let rightMonitor = CGRect(x: 2048, y: -360, width: 1296, height: 2304)
+        let leftMonitor = CGRect(x: -1296, y: -400, width: 1296, height: 2304)
+        let liveRouter = MouseRouter()
+        let cursorOnMain = CGPoint(x: 900, y: 400)
+        let splitDestination = liveRouter.updateRoute(
+            parked: [.init(physical: mainPanel, desktop: CGRect(x: 2048, y: 0, width: 2048, height: 1152), displayID: 3)],
+            screens: [rightMonitor, leftMonitor], cursor: cursorOnMain, anyButtonHeld: false
+        )
+        assert(splitDestination == CGPoint(x: 2948, y: 400))
+        var splitSnapshot = liveRouter.routeSnapshot()
+        splitSnapshot.lastPoint = CGPoint(x: 2100, y: 200)
+        assert(splitSnapshot.destination(for: CGPoint(x: 1900, y: 200)) == CGPoint(x: 2048, y: 200),
+               "Active parked panel must clamp cursor before merge")
+
+        let mergedDestination = liveRouter.updateRoute(parked: [], screens: [leftMonitor, mainPanel, rightMonitor],
+                                                       cursor: cursorOnMain, anyButtonHeld: false)
+        assert(mergedDestination == nil)
+        var mergedSnapshot = liveRouter.routeSnapshot()
+        assert(mergedSnapshot.parked.isEmpty && mergedSnapshot.gesturePanel == nil)
+        mergedSnapshot.lastPoint = CGPoint(x: 2100, y: 200)
+        assert(mergedSnapshot.destination(for: CGPoint(x: 1900, y: 200)) == nil,
+               "Cursor crossing from right monitor back onto merged main display must never be clamped")
+
         print("CaptureRouting: real-window picking, capture controls, recording shields and whole-screen shortcuts passed")
     }
 }

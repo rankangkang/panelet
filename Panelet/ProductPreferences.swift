@@ -11,11 +11,18 @@ struct DisplayConfiguration: Codable, Equatable {
         var fraction: Double { switch self { case .equal: return 0.5; case .firstLarger: return 2.0 / 3; case .secondLarger: return 1.0 / 3 } }
     }
     enum Rendering: String, Codable, CaseIterable {
-        case automatic, clarity, smooth
-        var title: String { switch self { case .automatic: return L("自动"); case .clarity: return L("清晰优先"); case .smooth: return L("流畅优先") } }
+        case automatic, clarity, highRefresh, smooth
+        var title: String {
+            switch self {
+            case .automatic: return L("自动")
+            case .clarity: return L("清晰优先")
+            case .highRefresh: return L("高清高刷")
+            case .smooth: return L("流畅优先")
+            }
+        }
         func scale(native: CGFloat) -> Int { self == .smooth ? 1 : (native >= 1.5 ? 2 : 1) }
         func frameRate(native: Double, lowPower: Bool = ProcessInfo.processInfo.isLowPowerModeEnabled) -> Double {
-            let limit: Double = self == .smooth ? 120 : (self == .automatic && lowPower ? 30 : 60)
+            let limit: Double = (self == .smooth || self == .highRefresh) ? 120 : (self == .automatic && lowPower ? 30 : 60)
             return min(native > 1 ? native : 60, limit)
         }
     }

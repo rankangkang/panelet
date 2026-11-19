@@ -5,7 +5,7 @@ import Carbon
 /// App-level accessibility notifications for changes to windows outside Panelet.
 @MainActor
 final class CaptureWindowEvents {
-    private let onChange: () -> Void
+    private let onChange: (_ needsRescue: Bool) -> Void
     private let registrationQueue = DispatchQueue(label: "dev.cmkk.panelet.window-notifications", qos: .utility)
     private var applications: NSKeyValueObservation?
     private var workspaceObservers: [NSObjectProtocol] = []
@@ -13,7 +13,7 @@ final class CaptureWindowEvents {
     private var observers: [pid_t: AXObserver] = [:]
     private var generation: UInt64 = 0
 
-    init(onChange: @escaping () -> Void) { self.onChange = onChange }
+    init(onChange: @escaping (_ needsRescue: Bool) -> Void) { self.onChange = onChange }
 
     func start() {
         guard applications == nil else { return }
@@ -21,9 +21,15 @@ final class CaptureWindowEvents {
         applications = workspace.observe(\.runningApplications, options: [.new]) { [weak self] _, _ in
             Task { @MainActor in self?.updateApplications() }
         }
-        for name in [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification,
-                     NSWorkspace.didActivateApplicationNotification, NSWorkspace.activeSpaceDidChangeNotification,
-                     NSWorkspace.didHideApplicationNotification, NSWorkspace.didUnhideApplicationNotification] {
+        let notifications: [(Notification.Name, Bool)] = [
+            (NSWorkspace.didLaunchApplicationNotification, true),
+            (NSWorkspace.didTerminateApplicationNotification, false),
+            (NSWorkspace.didActivateApplicationNotification, true),
+            (NSWorkspace.activeSpaceDidChangeNotification, true),
+            (NSWorkspace.didHideApplicationNotification, false),
+            (NSWorkspace.didUnhideApplicationNotification, true),
+        ]
+        for (name, needsRescue) in notifications {
             workspaceObservers.append(workspace.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
                     guard let self else { return }
@@ -31,7 +37,7 @@ final class CaptureWindowEvents {
                         || name == NSWorkspace.didActivateApplicationNotification {
                         self.updateApplications()
                     }
-                    self.onChange()
+                    self.onChange(needsRescue)
                 }
             })
         }
@@ -65,7 +71,7 @@ final class CaptureWindowEvents {
             }
         }
         watching = pids
-        onChange()
+        onChange(!added.isEmpty)
         let generation = self.generation
         registrationQueue.async { [self] in
             for pid in added {
@@ -75,7 +81,7 @@ final class CaptureWindowEvents {
                     self.observers[pid] = observer
                     CFRunLoopAddSource(CFRunLoopGetMain(), AXObserverGetRunLoopSource(observer), .commonModes)
                     // A window can open before the new process finishes registration.
-                    self.onChange()
+                    self.onChange(true)
                 }
             }
         }
@@ -83,10 +89,12 @@ final class CaptureWindowEvents {
 
     private nonisolated static func makeObserver(pid: pid_t, context: UnsafeMutableRawPointer) -> AXObserver? {
         var observer: AXObserver?
-        guard AXObserverCreate(pid, { _, _, _, context in
+        guard AXObserverCreate(pid, { _, _, notification, context in
             guard let context else { return }
+            let name = notification as String
+            let needsRescue = name == kAXWindowCreatedNotification || name == kAXWindowDeminiaturizedNotification
             MainActor.assumeIsolated {
-                Unmanaged<CaptureWindowEvents>.fromOpaque(context).takeUnretainedValue().onChange()
+                Unmanaged<CaptureWindowEvents>.fromOpaque(context).takeUnretainedValue().onChange(needsRescue)
             }
         }, &observer) == .success, let observer else { return nil }
 
@@ -389,29 +397,68 @@ final class WindowPlacement {
             $0.frame.height >= 50 && (bounds.contains(CGPoint(x: $0.frame.midX, y: $0.frame.midY))
                 || !fullSpaces.isDisjoint(with: DesktopSpaces.spaces(for: $0.id) ?? []))
         }
-        var appWindows: [pid_t: [Window]] = [:]
+        var appWindowsByID: [pid_t: [CGWindowID: Window]] = [:]
+        var unlistedByPID: [pid_t: [CGWindowID: Window]] = [:]
+        let recordsByPID = Dictionary(grouping: records, by: \.pid)
         for record in records {
             try Task.checkCancellation()
-            guard NSRunningApplication(processIdentifier: record.pid)?.activationPolicy == .regular,
+            guard let app = NSRunningApplication(processIdentifier: record.pid), app.activationPolicy == .regular,
                   !selected.contains(where: { $0.windowID == record.id }),
                   !reserved.contains(where: { $0.matches(number: record.id, element: nil) }) else { continue }
-            if appWindows[record.pid] == nil {
-                appWindows[record.pid] = await Task.detached { Window.accessibleWindows(for: record.pid) }.value
+            let pid = record.pid
+            if appWindowsByID[pid] == nil {
+                appWindowsByID[pid] = await Task.detached(priority: .userInitiated) {
+                    var indexed: [CGWindowID: Window] = [:]
+                    for window in Window.accessibleWindows(for: pid) {
+                        if let id = window.number, indexed[id] == nil {
+                            indexed[id] = window
+                        }
+                    }
+                    return indexed
+                }.value
             }
-            let cached = appWindows[record.pid] ?? []
-            let window = await Task.detached(priority: .userInitiated) {
-                cached.first { $0.number == record.id } ?? Window.findUnlistedWindow(record)
-            }.value
-            if window == nil, !record.title.isEmpty,
-               !fullSpaces.isDisjoint(with: DesktopSpaces.spaces(for: record.id) ?? []) {
-                throw DemoError(L("无法控制原屏上的全屏窗口「%@」，已停止拆分。请先打开该窗口后重试。", String(describing: record.title)))
+            let cachedByID = appWindowsByID[pid] ?? [:]
+            var window = cachedByID[record.id]
+            if window == nil {
+                if unlistedByPID[pid] == nil {
+                    let missingIDs = Set((recordsByPID[pid] ?? []).map(\.id))
+                        .subtracting(cachedByID.keys)
+                    unlistedByPID[pid] = await Task.detached(priority: .userInitiated) {
+                        Window.findUnlistedWindows(pid: pid, matching: missingIDs)
+                    }.value
+                }
+                window = unlistedByPID[pid]?[record.id]
+            }
+            if window == nil, !record.title.isEmpty {
+                let isOnFullSpace = await Task.detached(priority: .userInitiated) {
+                    !fullSpaces.isDisjoint(with: DesktopSpaces.spaces(for: record.id) ?? [])
+                }.value
+                if isOnFullSpace {
+                    // Wake apps (such as Electron/Chromium) whose inactive full-screen Space windows were still unreachable.
+                    NSApp.yieldActivation(to: app)
+                    app.activate(options: [.activateAllWindows])
+                    Window.reveal(record.id, in: app)
+                    for _ in 0..<8 {
+                        try Task.checkCancellation()
+                        if let revealed = await Task.detached(priority: .userInitiated, operation: {
+                            Window.find(record) ?? Window.findUnlistedWindow(record)
+                        }).value {
+                            window = revealed
+                            break
+                        }
+                        try await Task.sleep(for: .milliseconds(100))
+                    }
+                    if window == nil {
+                        throw DemoError(L("无法控制原屏上的全屏窗口「%@」，已停止拆分。请先打开该窗口后重试。", String(describing: record.title)))
+                    }
+                }
             }
             guard let window, window.isFullScreen,
                   !selected.contains(where: { $0.element == window.element }),
                   !reserved.contains(where: { $0.matches(number: record.id, element: window.element) }) else { continue }
             let saved = SavedWindow(window: window, id: record.id, pid: record.pid,
                                     original: nil, display: source, slot: nil, fullScreenDisplay: source,
-                                    launchDate: NSRunningApplication(processIdentifier: record.pid)?.launchDate, recoveryFrame: record.frame)
+                                    launchDate: app.launchDate, recoveryFrame: record.frame)
             let index = windows.firstIndex { $0.id == record.id && $0.pid == record.pid } ?? windows.endIndex
             if index == windows.endIndex { windows.append(saved) }
             else { windows[index] = saved }
@@ -486,7 +533,7 @@ final class WindowPlacement {
             guard let screen = NSScreen.screens.first(where: { $0.displayID == half.virtualID }) else {
                 throw DemoError(L("%@ 的显示器不可用。", String(describing: half.name)))
             }
-            let usable = cocoaRect(screen.visibleFrame)
+            let usable = screen.quartzVisibleFrame
             var window = saved.window
             if let id = saved.id, let app = NSRunningApplication(processIdentifier: saved.pid) {
                 guard let info = Self.liveWindows()[id], info.pid == saved.pid else {
@@ -517,7 +564,7 @@ final class WindowPlacement {
             if let actual = window.frame, !usable.insetBy(dx: -2, dy: -2).contains(actual) {
                 // Some apps reject AXSize while still supporting native full screen. Position
                 // their center on the target instead of rejecting them before the OS can size them.
-                let otherDisplays = NSScreen.screens.filter { $0.displayID != half.virtualID }.map { cocoaRect($0.frame) }
+                let otherDisplays = NSScreen.screens.filter { $0.displayID != half.virtualID }.map(\.quartzFrame)
                 for _ in 0..<4 {
                     try Task.checkCancellation()
                     if let frame = window.frame, PlacementGeometry.belongs(frame, to: usable, otherDisplays: otherDisplays) { break }
@@ -714,10 +761,10 @@ final class WindowPlacement {
             }), let display = target.displayID else { return .waitingForDisplay }
             guard let info = available[record.number] else { return .retry }
 
-            let bounds = cocoaRect(target.frame)
+            let bounds = target.quartzFrame
             let translated = record.frame(on: bounds)
             let desired = bounds.size == record.displayBounds.size
-                ? translated : fit(translated, inside: cocoaRect(target.visibleFrame))
+                ? translated : fit(translated, inside: target.quartzVisibleFrame)
             let wasHidden = app.isHidden
             let choice = Choice(id: .window(record.number), element: nil, pid: record.pid,
                                 appName: app.localizedName ?? L("窗口"), title: info.title, frame: info.frame, status: nil)
@@ -913,7 +960,7 @@ final class WindowPlacement {
                 translated = current.offsetBy(dx: half.virtualBounds.minX - hidden.minX - half.localRect.minX,
                                               dy: half.virtualBounds.minY - hidden.minY - half.localRect.minY)
             }
-            moves.append((match.window, Self.fit(translated, inside: cocoaRect(screen.visibleFrame)), panel))
+            moves.append((match.window, Self.fit(translated, inside: screen.quartzVisibleFrame), panel))
         }
         guard !moves.isEmpty else { return }
         do {
@@ -1035,16 +1082,17 @@ final class WindowPlacement {
             guard let only else { return true }
             return saved.id.map { only.contains($0) } == true
         }
-        let work = targets.compactMap { saved -> (Int, SavedWindow, CGRect, CGRect)? in
+        let work = targets.compactMap { saved -> (Int, SavedWindow, CGRect, CGRect, CGRect)? in
             let preferred = saved.slot == nil ? ordinary : nil
             guard let original = saved.original,
                   let target = preferred ?? destination(saved.display.id) ?? destination(nil) else { return nil }
-            let bounds = cocoaRect(target.frame)
+            let bounds = target.quartzFrame
+            let visibleBounds = target.quartzVisibleFrame
             let originalBounds = saved.display.bounds
             let translated = original.offsetBy(dx: bounds.minX - originalBounds.minX, dy: bounds.minY - originalBounds.minY)
-            let desired = preferred == nil && target.displayID == saved.display.id && bounds.size == originalBounds.size
-                ? translated : Self.fit(translated, inside: cocoaRect(target.visibleFrame))
-            return (saved.slot ?? -1, saved, bounds, desired)
+            let sameDisplayGeometry = target.displayID == saved.display.id && bounds.size == originalBounds.size
+            let desired = sameDisplayGeometry ? translated : Self.fit(translated, inside: visibleBounds)
+            return (saved.slot ?? -1, saved, bounds, visibleBounds, desired)
         }
         let migrationDisplay = ordinaryOnly ? ordinary?.displayID : nil
         // AX calls can wait for another app to respond; keep the mirrors drawing during that wait.
@@ -1053,11 +1101,12 @@ final class WindowPlacement {
             var restored = 0
             var settled: [Int: ContinuousClock.Instant] = [:]
             var replacementWindows: [CGWindowID: Window] = [:]
+            var ordinaryFrames: [CGWindowID: CGRect] = [:]
             let migrationSpace = migrationDisplay.flatMap { DesktopSpaces()?.desktop(on: $0) }
             let deadline = ContinuousClock.now + timeout
             repeat {
                 var live = migrationDisplay == nil ? nil : Self.liveWindows()
-                pending = pending.filter { slot, saved, bounds, desired in
+                pending = pending.filter { slot, saved, bounds, visibleBounds, desired in
                     guard NSRunningApplication(processIdentifier: saved.pid)?.isTerminated == false else { return false }
                     if migrationDisplay != nil, saved.fullScreenDisplay == nil,
                        let id = saved.id, let info = live?[id], info.pid == saved.pid, Self.near(info.frame, desired),
@@ -1085,7 +1134,24 @@ final class WindowPlacement {
                         } else {
                             window.place(desired, from: frame)
                         }
-                        guard let actual = window.frame, Self.near(desired, actual) else { return true }
+                        guard let actual = window.frame else { return true }
+                        if !Self.near(desired, actual) {
+                            // Accept constrained size deviations only after confirming the window's
+                            // position has genuinely reached `desired` (or its clamped boundary).
+                            if slot < 0, let id = saved.id {
+                                let previous = ordinaryFrames[id]
+                                ordinaryFrames[id] = actual
+                                guard PlacementGeometry.settledConstrainedRestore(
+                                    desired: desired,
+                                    actual: actual,
+                                    previousAttempt: previous,
+                                    displayBounds: bounds,
+                                    visibleBounds: visibleBounds
+                                ) else { return true }
+                            } else {
+                                return true
+                            }
+                        }
                     }
                     if slot >= 0 {
                         let now = ContinuousClock.now
@@ -1327,12 +1393,6 @@ final class WindowPlacement {
         private static let frameAttributes = [kAXPositionAttribute, kAXSizeAttribute]
         private static let pickerAttributes = [kAXRoleAttribute, kAXMinimizedAttribute, fullScreenAttribute,
                                                kAXPositionAttribute, kAXSizeAttribute, kAXTitleAttribute]
-        private static let getWindowNumber = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "_AXUIElementGetWindow").map {
-            unsafeBitCast($0, to: (@convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError).self)
-        }
-        private static let windowFromToken = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "_AXUIElementCreateWithRemoteToken").map {
-            unsafeBitCast($0, to: (@convention(c) (CFData) -> Unmanaged<AXUIElement>?).self)
-        }
 
         static func accessibleWindows(for pid: pid_t) -> [Window] {
             let app = AXUIElementCreateApplication(pid)
@@ -1351,9 +1411,7 @@ final class WindowPlacement {
         }
 
         var number: CGWindowID? {
-            var id: CGWindowID = 0
-            guard Self.getWindowNumber?(element, &id) == .success, id != 0 else { return nil }
-            return id
+            SystemBridge.Accessibility.windowID(of: element)
         }
 
         static func find(_ record: WindowInfo) -> Window? {
@@ -1367,36 +1425,37 @@ final class WindowPlacement {
         }
 
         static func findUnlistedWindow(_ record: WindowInfo) -> Window? {
-            guard let windowFromToken, getWindowNumber != nil else { return nil }
-            // shortcut: A bounded AX lookup for the exact selected window, used when macOS omits it from AXWindows.
-            // The AppKit token contains the PID, a reserved word, the "coco" tag, and an element ID.
-            var token = Data(repeating: 0, count: 20)
-            withUnsafeBytes(of: record.pid.littleEndian) { token.replaceSubrange(0..<4, with: $0) }
-            withUnsafeBytes(of: UInt32(0x636f636f).littleEndian) { token.replaceSubrange(8..<12, with: $0) }
+            findUnlistedWindows(pid: record.pid, matching: [record.id], timeout: .milliseconds(500))[record.id]
+        }
+
+        static func findUnlistedWindows(
+            pid: pid_t,
+            matching targetIDs: Set<CGWindowID>,
+            timeout: Duration = .milliseconds(800)
+        ) -> [CGWindowID: Window] {
+            guard !targetIDs.isEmpty, SystemBridge.Accessibility.supportsRemoteTokenLookup else { return [:] }
+            // Single-pass remote AX token scan per process so multiple full-screen Spaces
+            // in long-lived Electron/AppKit apps resolve in one sweep.
+            var found: [CGWindowID: Window] = [:]
+            var token = Data()
             let clock = ContinuousClock()
-            let deadline = clock.now + .milliseconds(250)
-            for id in UInt64(0)..<8192 {
+            let deadline = clock.now + timeout
+            for id in UInt64(0)..<32_768 {
                 guard !Task.isCancelled, clock.now < deadline else { break }
-                withUnsafeBytes(of: id.littleEndian) { token.replaceSubrange(12..<20, with: $0) }
-                guard let element = windowFromToken(token as CFData)?.takeRetainedValue() else { continue }
-                AXUIElementSetMessagingTimeout(element, 0.05)
-                let window = Window(element: element)
-                guard window.number == record.id, window.pickerDetails != nil else { continue }
+                guard let element = SystemBridge.Accessibility.element(pid: pid, remoteElementID: id, buffer: &token),
+                      let windowID = SystemBridge.Accessibility.windowID(of: element),
+                      targetIDs.contains(windowID), found[windowID] == nil else { continue }
                 AXUIElementSetMessagingTimeout(element, 0.25)
-                return window
+                let window = Window(element: element)
+                guard window.pickerDetails != nil else { continue }
+                found[windowID] = window
+                if found.count == targetIDs.count { break }
             }
-            return nil
+            return found
         }
 
         static func reveal(_ number: CGWindowID, in app: NSRunningApplication) {
-            let symbols = UnsafeMutableRawPointer(bitPattern: -2)
-            if let pidSymbol = dlsym(symbols, "GetProcessForPID"),
-               let frontSymbol = dlsym(symbols, "_SLPSSetFrontProcessWithOptions") {
-                let getProcess = unsafeBitCast(pidSymbol, to: (@convention(c) (pid_t, UnsafeMutablePointer<ProcessSerialNumber>) -> OSStatus).self)
-                let setFront = unsafeBitCast(frontSymbol, to: (@convention(c) (UnsafeMutablePointer<ProcessSerialNumber>, CGWindowID, UInt32) -> CGError).self)
-                var process = ProcessSerialNumber()
-                if getProcess(app.processIdentifier, &process) == noErr, setFront(&process, number, 0x200) == .success { return }
-            }
+            if SystemBridge.Accessibility.focusSpecificWindow(number, pid: app.processIdentifier) { return }
             app.activate()
         }
 
@@ -1535,15 +1594,10 @@ final class WindowPlacement {
 
 /// AX frame changes alone may leave a background window on its old Space.
 private struct DesktopSpaces {
-    private static let symbols = UnsafeMutableRawPointer(bitPattern: -2)
-    private static let connection = load("SLSMainConnectionID", as: (@convention(c) () -> Int32).self)?() ?? 0
-    private static let readDisplays = load("SLSCopyManagedDisplaySpaces", as: (@convention(c) (Int32) -> Unmanaged<CFArray>?).self)
-    private static let readWindow = load("SLSCopySpacesForWindows", as: (@convention(c) (Int32, UInt32, CFArray) -> Unmanaged<CFArray>?).self)
-    private static let moveProcess = load("SLSProcessAssignToSpace", as: (@convention(c) (Int32, pid_t, UInt64) -> Int32).self)
     private let displays: [[String: Any]]
 
     init?() {
-        guard Self.connection != 0, let displays = Self.readDisplays?(Self.connection)?.takeRetainedValue() as? [[String: Any]] else { return nil }
+        guard let displays = SystemBridge.SkyLight.managedDisplaySpaces() else { return nil }
         self.displays = displays
     }
 
@@ -1581,15 +1635,10 @@ private struct DesktopSpaces {
     }
 
     static func spaces(for window: CGWindowID) -> [UInt64]? {
-        guard connection != 0, let values = readWindow?(connection, 7, [NSNumber(value: window)] as CFArray)?.takeRetainedValue() as? [NSNumber] else { return nil }
-        return values.map(\.uint64Value)
+        SystemBridge.SkyLight.spaces(for: window)
     }
 
     static func moveApp(_ pid: pid_t, to space: UInt64) {
-        _ = moveProcess?(connection, pid, space)
-    }
-
-    private static func load<T>(_ name: String, as type: T.Type) -> T? {
-        dlsym(symbols, name).map { unsafeBitCast($0, to: type) }
+        SystemBridge.SkyLight.moveApplication(pid, toSpace: space)
     }
 }

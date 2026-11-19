@@ -4,14 +4,29 @@ import ScreenCaptureKit
 
 @MainActor
 final class SplitSessions {
+    private final class DisplayCallbackBox: @unchecked Sendable {
+        weak var owner: SplitSessions?
+        init(_ owner: SplitSessions) { self.owner = owner }
+    }
+
+    private nonisolated static let displayReconfigurationCallback: CGDisplayReconfigurationCallBack = { _, flags, userInfo in
+        guard !flags.contains(.beginConfigurationFlag), let userInfo else { return }
+        let box = Unmanaged<DisplayCallbackBox>.fromOpaque(userInfo).takeUnretainedValue()
+        DispatchQueue.main.async { [weak box] in
+            MainActor.assumeIsolated {
+                box?.owner?.handleScreenParametersChanged()
+            }
+        }
+    }
+
     private(set) var sessions: [CGDirectDisplayID: Session] = [:]
     private(set) var transition: Session?
-    private var originalScreens: [CGDirectDisplayID: PhysicalScreen] = [:]
-    private var originalDisplayUUIDs: [CGDirectDisplayID: String] = [:]
-    private var recoveryRegions: [CGDirectDisplayID: (physicalID: CGDirectDisplayID, offset: CGPoint)] = [:]
+    private var topology = DisplayTopology()
     private var lastCheckpoint: RecoveryJournal?
     private var standby: [CGDirectDisplayID: [HalfScreen]] = [:]
     private var router: MouseRouter?
+    private var healthTimer: Timer?
+    private nonisolated(unsafe) var displayCallbackBox: DisplayCallbackBox?
     private let captureOverlayQueue = DispatchQueue(label: "dev.cmkk.panelet.capture-overlays", qos: .userInitiated)
     private let popupValidation = CaptureOverlays.PopupValidation()
     private var captureOverlayTimer: Timer?
@@ -41,8 +56,8 @@ final class SplitSessions {
     private var sessionInactive = false
     private var wakeReadyAt = ContinuousClock.now
     fileprivate var monitoringAllowed: Bool { !sleeping && !screensSleeping && !sessionInactive && ContinuousClock.now >= wakeReadyAt }
-    private lazy var captureWindowEvents = CaptureWindowEvents { [weak self] in
-        self?.requestCaptureOverlayUpdate(rescue: true)
+    private lazy var captureWindowEvents = CaptureWindowEvents { [weak self] needsRescue in
+        self?.requestCaptureOverlayUpdate(rescue: needsRescue)
     }
     var onChange: ((Session) -> Void)?
 
@@ -97,11 +112,44 @@ final class SplitSessions {
             forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                guard let self else { return }
-                if self.busy { try? self.updateRoutes() }
-                else { self.checkActive() }
-                self.requestCaptureOverlayUpdate(rescue: true)
+                self?.handleScreenParametersChanged()
             }
+        }
+        let callbackBox = DisplayCallbackBox(self)
+        displayCallbackBox = callbackBox
+        CGDisplayRegisterReconfigurationCallback(
+            Self.displayReconfigurationCallback,
+            Unmanaged.passUnretained(callbackBox).toOpaque()
+        )
+    }
+
+    deinit {
+        if let box = displayCallbackBox {
+            CGDisplayRemoveReconfigurationCallback(
+                Self.displayReconfigurationCallback,
+                Unmanaged.passUnretained(box).toOpaque()
+            )
+        }
+    }
+
+    private func handleScreenParametersChanged() {
+        if busy { try? updateRoutes() }
+        else { checkActive() }
+        requestCaptureOverlayUpdate(rescue: true)
+    }
+
+    private func updateHealthTimer() {
+        let shouldRun = (!active.isEmpty || !failedSessions.isEmpty) && !sleeping && !screensSleeping && !sessionInactive
+        if shouldRun {
+            guard healthTimer == nil else { return }
+            let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+                MainActor.assumeIsolated { self?.checkActive() }
+            }
+            healthTimer = timer
+            RunLoop.main.add(timer, forMode: .common)
+        } else {
+            healthTimer?.invalidate()
+            healthTimer = nil
         }
     }
 
@@ -128,7 +176,7 @@ final class SplitSessions {
                 try await Session.wait(steps: 18, error: L("系统尚未恢复原显示器排列，请重试。")) {
                     layout.allSatisfy { id, bounds in
                         CGDisplayBounds(id) == bounds && NSScreen.screens.contains {
-                            $0.displayID == id && cocoaRect($0.frame) == bounds
+                            $0.displayID == id && $0.quartzFrame == bounds
                         }
                     }
                 }
@@ -162,16 +210,9 @@ final class SplitSessions {
             if lastCheckpoint != nil { try RecoveryJournal.clear(); lastCheckpoint = nil }
             return
         }
-        let displays = originalDisplayUUIDs.compactMap { (id, uuid) in
-            originalScreens[id].map { RecoveryJournal.Display(uuid: uuid, bounds: $0.bounds) }
-        }.sorted { $0.uuid < $1.uuid }
+        let displays = topology.checkpointDisplays()
         func target(for saved: PhysicalScreen) -> WindowPlacement.RecoveryTarget? {
-            let region = recoveryRegions[saved.id]
-            let id = region?.physicalID ?? saved.id
-            guard let uuid = originalDisplayUUIDs[id], let original = originalScreens[id] else { return nil }
-            let offset = region?.offset ?? .zero
-            return (RecoveryJournal.Display(uuid: uuid, bounds: original.bounds),
-                    CGPoint(x: original.bounds.minX + offset.x, y: original.bounds.minY + offset.y))
+            topology.recoveryTarget(for: saved.id)
         }
         // A selected window's state at the start of the pair takes precedence over its old desktop placement.
         var windows: [CGWindowID: RecoveryJournal.Window] = [:]
@@ -204,15 +245,13 @@ final class SplitSessions {
     }
 
     func logicalBounds(for id: CGDirectDisplayID) -> CGRect? {
-        guard let screen = originalScreens[id] else { return nil }
-        guard let anchor = originalScreens[CGMainDisplayID()] else { return screen.bounds }
-        return screen.bounds.offsetBy(dx: -anchor.bounds.minX, dy: -anchor.bounds.minY)
+        topology.logicalBounds(for: id, mainID: CGMainDisplayID())
     }
 
     func hostScreen(at point: CGPoint?) -> NSScreen? {
         let parked = parkedIDs.union(standby.values.flatMap { $0.map(\.virtualID) })
         let usable = NSScreen.screens.filter { screen in screen.displayID.map { !parked.contains($0) } ?? false }
-        return usable.first { screen in point.map { cocoaRect(screen.frame).contains($0) } ?? false }
+        return usable.first { screen in point.map { screen.quartzFrame.contains($0) } ?? false }
             ?? usable.first { $0.displayID == CGMainDisplayID() }
             ?? usable.max { $0.visibleFrame.width * $0.visibleFrame.height < $1.visibleFrame.width * $1.visibleFrame.height }
     }
@@ -238,10 +277,7 @@ final class SplitSessions {
         }
         let physical = DisplayScanner.physicalScreens()
         guard var screen = physical.first(where: { $0.id == id }) else { return }
-        for original in physical where originalScreens[original.id] == nil {
-            originalScreens[original.id] = original
-            originalDisplayUUIDs[original.id] = RecoveryJournal.uuid(original.id)
-        }
+        topology.recordBaseline(from: physical)
         if let configuration { screen.configuration = configuration }
         let reserved = sessions.values.flatMap(\.managedWindows)
         let session = Session(screen: screen, pair: pair, coordinator: self)
@@ -254,7 +290,7 @@ final class SplitSessions {
         DisplayScanner.physicalScreens().flatMap { screen -> [PhysicalScreen] in
             guard let session = sessions[screen.id], session.hasHalves else { return [screen] }
             return session.halves.map { half in
-                recoveryRegions[half.virtualID] = (screen.id, half.localRect.origin)
+                topology.recordVirtualRegion(virtualID: half.virtualID, physicalID: screen.id, offset: half.localRect.origin)
                 return PhysicalScreen(id: half.virtualID, name: half.name, bounds: half.virtualBounds,
                                scale: screen.scale, refreshRate: screen.refreshRate, isBuiltin: false)
             }
@@ -262,7 +298,7 @@ final class SplitSessions {
     }
 
     func endQuick(_ id: CGDirectDisplayID) {
-        guard !busy, let session = sessions[id], session.active, session.hasQuick else { return }
+        guard !busy, let session = sessions[id], session.active || session.needsRecovery, session.hasQuick else { return }
         transition = session
         session.endQuick()
     }
@@ -286,9 +322,13 @@ final class SplitSessions {
     }
 
     func checkActive() {
-        guard !busy, monitoringAllowed, let first = active.first(where: { !$0.needsRecovery }) else { return }
+        guard !busy, monitoringAllowed else { return }
         if let id = failedSessions.keys.first, let error = failedSessions.removeValue(forKey: id), let session = sessions[id] {
             fail(session, error: error)
+            return
+        }
+        guard let first = active.first(where: { !$0.needsRecovery }) else {
+            updateHealthTimer()
             return
         }
         if let problem = Permissions.splitProblem {
@@ -335,6 +375,7 @@ final class SplitSessions {
         guard sessions[session.targetID] === session, session.canJoin else { return }
         if !monitoringAllowed || (transition != nil && transition !== session) {
             failedSessions[session.targetID] = error
+            updateHealthTimer()
             return
         }
         transition = session
@@ -376,16 +417,18 @@ final class SplitSessions {
         if session.idle && !session.needsRecovery { sessions[session.targetID] = nil }
         if session.idle || session.active { transition = nil }
         layoutChangedAt.removeAll()
-        if sessions.isEmpty {
+        let hasRoutedDisplays = sessions.values.contains { $0.isParkingPhysical && $0.hasHalves } || !standby.isEmpty
+        if !hasRoutedDisplays {
             stopRouting()
             routedLayout.removeAll()
             routedParking.removeAll()
-            originalScreens.removeAll()
-            originalDisplayUUIDs.removeAll()
-            recoveryRegions.removeAll()
-        } else if !busy {
+        }
+        if sessions.isEmpty {
+            topology.reset()
+        } else if !busy && hasRoutedDisplays {
             requestCaptureOverlayUpdate(rescue: true)
         }
+        updateHealthTimer()
         updateRecoveryCheckpoint()
         onChange?(session)
         if !busy, monitoringAllowed, let id = failedSessions.keys.first, let error = failedSessions.removeValue(forKey: id),
@@ -414,25 +457,18 @@ final class SplitSessions {
     }
 
     fileprivate func layout() -> [CGDirectDisplayID: CGRect] {
-        let physical = Dictionary(uniqueKeysWithValues: DisplayScanner.physicalScreens().map { ($0.id, logicalBounds(for: $0.id) ?? $0.bounds) })
-        let halves = Dictionary(uniqueKeysWithValues: sessions.values.filter { $0.isParkingPhysical && $0.hasHalves }.map { session in
+        let activeHalves = Dictionary(uniqueKeysWithValues: sessions.values.filter { $0.isParkingPhysical && $0.hasHalves }.map { session in
             (session.targetID, Dictionary(uniqueKeysWithValues: session.halves.map { ($0.virtualID, $0.localRect) }))
         })
-        var layout = DisplayScanner.splitDisplayFrames(physical: physical, main: CGMainDisplayID(), halves: halves)
-        let rightmost = layout.values.max {
-            if $0.maxX != $1.maxX { return $0.maxX < $1.maxX }
-            return $0.minY < $1.minY
+        let standbyHalves = standby.sorted(by: { $0.key < $1.key }).flatMap { id, halves in
+            halves.map { DisplayTopology.StandbyHalf(physicalID: id, virtualID: $0.virtualID, pointSize: $0.pointSize) }
         }
-        var occupied = Array(layout.values)
-        for (id, halves) in standby.sorted(by: { $0.key < $1.key }) {
-            var anchor = layout[id] ?? rightmost ?? .zero
-            for half in halves {
-                anchor = DisplayScanner.parkingFrame(size: half.pointSize, beside: anchor, avoiding: occupied)
-                layout[half.virtualID] = anchor
-                occupied.append(anchor)
-            }
-        }
-        return layout
+        return topology.arrangedFrames(
+            currentPhysical: DisplayScanner.physicalScreens(),
+            mainID: CGMainDisplayID(),
+            activeHalves: activeHalves,
+            standbyHalves: standbyHalves
+        )
     }
 
     fileprivate func windowDestination(for id: CGDirectDisplayID?, joining: Session?, beforeJoin: Bool = false) -> NSScreen? {
@@ -475,7 +511,11 @@ final class SplitSessions {
                 && session.halves.allSatisfy { layout[$0.virtualID] != nil }
         }
         guard !split.isEmpty else {
-            if !busy { stopRouting() }
+            if busy {
+                router?.update(parked: [], screens: Array(layout.values))
+            } else {
+                stopRouting()
+            }
             routedLayout.removeAll()
             routedParking.removeAll()
             return
@@ -546,6 +586,7 @@ final class SplitSessions {
     }
 
     private func captureAvailabilityChanged() {
+        updateHealthTimer()
         captureOverlayTask?.cancel()
         captureOverlayTask = nil
         if sleeping || screensSleeping || sessionInactive {
@@ -702,6 +743,8 @@ final class SplitSessions {
     }
 
     private func stopRouting() {
+        healthTimer?.invalidate()
+        healthTimer = nil
         captureOverlayTimer?.invalidate()
         captureOverlayTimer = nil
         captureOverlayTask?.cancel()
@@ -726,6 +769,51 @@ final class SplitSessions {
 final class Session {
     private enum Phase { case idle, preparing, split, joining }
 
+    private struct LifecycleTasks {
+        var setup: Task<Void, Never>?
+        var windowPreparation: Task<Void, Error>?
+        var fullScreen: Task<Void, Error>?
+        var deadline: Task<Void, Never>?
+        var rescue: Task<Void, Never>?
+        var exitCheck: Task<Void, Never>?
+
+        mutating func completeSetup() {
+            deadline?.cancel()
+            deadline = nil
+            setup = nil
+        }
+
+        mutating func cancelMonitoring() {
+            // Keep the task references until pending AX requests finish; never overlap probes.
+            rescue?.cancel()
+            exitCheck?.cancel()
+        }
+
+        mutating func cancelAndTakeForTeardown() -> (
+            rescuing: Task<Void, Never>?,
+            preparingWindows: Task<Void, Error>?,
+            fullScreen: Task<Void, Error>?,
+            preparing: Task<Void, Never>?
+        ) {
+            let rescuing = rescue
+            rescuing?.cancel()
+            exitCheck?.cancel()
+            exitCheck = nil
+            let preparingWindows = windowPreparation
+            preparingWindows?.cancel()
+            windowPreparation = nil
+            let fullScreenTask = fullScreen
+            fullScreenTask?.cancel()
+            fullScreen = nil
+            let preparing = setup
+            preparing?.cancel()
+            setup = nil
+            deadline?.cancel()
+            deadline = nil
+            return (rescuing, preparingWindows, fullScreenTask, preparing)
+        }
+    }
+
     private(set) var status = L("未拆分")
     private let screen: PhysicalScreen
     enum Mode { case desktop, quick }
@@ -733,8 +821,7 @@ final class Session {
     private var pair: WindowPlacement.Pair?
     private var quickPlacement: WindowPlacement?
     private var exitPolicy = QuickExitPolicy()
-    private var exitCheck: Task<Void, Never>?
-    private var rescueTask: Task<Void, Never>?
+    private var tasks = LifecycleTasks()
     private var parkedDisplayChanges: ParkedDisplayChanges?
     private var lastRescue = ContinuousClock.now
     var hasQuick: Bool { pair != nil }
@@ -789,10 +876,6 @@ final class Session {
     fileprivate private(set) var halves: [HalfScreen] = []
     private var placement: WindowPlacement?
     private var expectedLayout: [CGDirectDisplayID: CGRect] = [:]
-    private var setup: Task<Void, Never>?
-    private var windowPreparation: Task<Void, Error>?
-    private var fullScreenTask: Task<Void, Error>?
-    private var deadline: Task<Void, Never>?
     private var touchedLayout = false
 
     init(screen: PhysicalScreen, pair: WindowPlacement.Pair?, coordinator: SplitSessions) {
@@ -826,22 +909,22 @@ final class Session {
         }
         publish(L("正在扫描窗口…"), phase: .preparing)
 
-        deadline = Task { [weak self] in
+        tasks.deadline = Task { [weak self] in
             do {
                 try await Task.sleep(for: .seconds(45))
                 if let self { self.coordinator.fail(self, error: DemoError(L("准备分屏超时。"))) }
             } catch {}
         }
-        setup = Task {
+        tasks.setup = Task {
             do {
                 try Task.checkCancellation()
                 if let placement {
                     try await time(.windowScan) { try await placement.scanDesktopWindows() }
                     let task = Task { try await time(.windowPreparation) { try await placement.prepareSelection() } }
-                    windowPreparation = task
+                    tasks.windowPreparation = task
                     try await task.value
                     try Task.checkCancellation()
-                    windowPreparation = nil
+                    tasks.windowPreparation = nil
                 }
                 var ordinary: [(Session, Set<CGWindowID>)] = []
                 for other in coordinator.active {
@@ -867,9 +950,7 @@ final class Session {
                         }
                     }
                 }
-                deadline?.cancel()
-                deadline = nil
-                setup = nil
+                tasks.completeSetup()
                 if pair != nil { exitPolicy.arm() }
                 let status = pair == nil ? L("已拆分，%@半屏可各自全屏", String(describing: screen.splitLayout.direction)) : L("已拆分，%@半屏已分别全屏", String(describing: screen.splitLayout.direction))
                 publish(status, phase: .split)
@@ -886,7 +967,7 @@ final class Session {
         for (index, half) in halves.enumerated() { half.showNumber("\(number).\(index + 1)") }
     }
 
-    fileprivate var checkingHiddenWindows: Bool { rescueTask != nil }
+    fileprivate var checkingHiddenWindows: Bool { tasks.rescue != nil }
     fileprivate var observesParkedDisplay: Bool { parkedDisplayChanges?.isRunning == true }
     fileprivate func resumeParkedObservation() { parkedDisplayChanges?.start() }
     fileprivate var hiddenWindowCheckAvailable: Bool { active && !needsRecovery && placement != nil && !checkingHiddenWindows }
@@ -896,10 +977,10 @@ final class Session {
         guard hiddenWindowCheckAvailable, let placement else { return }
         lastRescue = .now
         let protected = coordinator.active.flatMap(\.managedWindows)
-        rescueTask = Task { [weak self] in
+        tasks.rescue = Task { [weak self] in
             guard let self else { return }
             defer {
-                self.rescueTask = nil
+                self.tasks.rescue = nil
                 self.coordinator.retryCaptureWindowRescue()
             }
             await placement.rescueHiddenWindows(windows, to: self.halves, protecting: protected) {
@@ -910,19 +991,17 @@ final class Session {
     }
 
     fileprivate func resetQuickMonitoring() {
-        rescueTask?.cancel()
-        exitCheck?.cancel()
-        // Keep the task reference until the pending AX request finishes; never overlap probes.
+        tasks.cancelMonitoring()
         if hasQuick && active && !needsRecovery { exitPolicy.arm() }
     }
 
     fileprivate func checkQuickExit() {
-        guard active, hasQuick, !needsRecovery, exitCheck == nil,
+        guard active, hasQuick, !needsRecovery, tasks.exitCheck == nil,
               let selected = quickPlacement ?? placement else { return }
-        exitCheck = Task { [weak self] in
+        tasks.exitCheck = Task { [weak self] in
             let sample = await selected.selectedFullScreenState()
             guard let self else { return }
-            defer { self.exitCheck = nil }
+            defer { self.tasks.exitCheck = nil }
             guard !Task.isCancelled, self.active, !self.coordinator.busy, self.coordinator.monitoringAllowed else { return }
             if self.exitPolicy.observe(sample, at: ProcessInfo.processInfo.systemUptime) {
                 self.coordinator.endQuick(self.targetID)
@@ -945,7 +1024,7 @@ final class Session {
         }
         self.pair = pair
         publish(L("正在准备快捷%@分屏…", String(describing: screen.splitLayout.direction)), phase: .preparing)
-        deadline = Task { [weak self] in
+        tasks.deadline = Task { [weak self] in
             do {
                 try await Task.sleep(for: .seconds(20))
                 guard let self, self.preparing else { return }
@@ -953,7 +1032,7 @@ final class Session {
                 self.finish(status: L("快捷分屏超时，已还原窗口"), quickOnly: true)
             } catch {}
         }
-        setup = Task {
+        tasks.setup = Task {
             do {
                 guard let quickPlacement else { return }
                 try await time(.windowPreparation) { try await quickPlacement.prepareSelection() }
@@ -962,9 +1041,7 @@ final class Session {
                 try await time(.windowMigration) { _ = try await quickPlacement.migrate(to: halves) }
                 try await time(.fullScreen) { try await quickPlacement.enterSelectedFullScreen(on: halves) }
                 try Task.checkCancellation()
-                deadline?.cancel()
-                deadline = nil
-                setup = nil
+                tasks.completeSetup()
                 exitPolicy.arm()
                 publish(L("快捷%@分屏中 · 退出任一全屏即还原", String(describing: screen.splitLayout.direction)), phase: .split)
                 showRegionNumbers()
@@ -1051,7 +1128,7 @@ final class Session {
             if pair != nil {
                 try Task.checkCancellation()
                 publish(L("正在让%@半屏的窗口进入全屏…", String(describing: screen.splitLayout.direction)), phase: .preparing)
-                fullScreenTask = Task { try await time(.fullScreen) { try await placement.enterSelectedFullScreen(on: activeHalves) } }
+                tasks.fullScreen = Task { try await time(.fullScreen) { try await placement.enterSelectedFullScreen(on: activeHalves) } }
             }
         }
         try await capturing
@@ -1060,10 +1137,10 @@ final class Session {
         }
         endStage(.firstFrame, started: firstFrame, ended: firstFramesAt)
 
-        if let task = fullScreenTask {
+        if let task = tasks.fullScreen {
             try await task.value
             try Task.checkCancellation()
-            fullScreenTask = nil
+            tasks.fullScreen = nil
         }
         await time(.windowMigration) { await placeOrdinaryWindows(protecting: coordinator.active.flatMap(\.managedWindows)) }
         try await Self.wait(steps: 9, error: L("全屏切换后显示器排列发生变化。")) {
@@ -1124,32 +1201,18 @@ final class Session {
     private func finish(status: String, joining: Bool = false, quickOnly: Bool = false) {
         guard canJoin else { return }
         needsRecovery = false
-        let rescuing = rescueTask
-        rescuing?.cancel()
-        exitCheck?.cancel()
-        exitCheck = nil
         exitPolicy = QuickExitPolicy()
-        let preparingWindows = windowPreparation
-        preparingWindows?.cancel()
-        windowPreparation = nil
-        let transition = fullScreenTask
-        transition?.cancel()
-        fullScreenTask = nil
-        let preparing = setup
-        preparing?.cancel()
-        deadline?.cancel()
-        setup = nil
-        deadline = nil
+        let activeTasks = tasks.cancelAndTakeForTeardown()
         let recoveries = quickOnly ? [] : coordinator.stopRecovering(halves)
         publish(L("正在恢复显示器和窗口…"), phase: .joining)
         DemoLog.shared.line(quickOnly ? L("正在结束 %@ 的快捷组合，保留桌面拆分。", String(describing: name)) : L("正在合并 %@。", String(describing: name)))
 
         Task {
-            if let rescuing { await rescuing.value }
+            if let rescuing = activeTasks.rescuing { await rescuing.value }
             for recovery in recoveries { await recovery.value }
-            if let preparingWindows { _ = await preparingWindows.result }
-            if let transition { _ = await transition.result }
-            if let preparing { await preparing.value }
+            if let preparingWindows = activeTasks.preparingWindows { _ = await preparingWindows.result }
+            if let fullScreenTransition = activeTasks.fullScreen { _ = await fullScreenTransition.result }
+            if let preparing = activeTasks.preparing { await preparing.value }
             if let quickPlacement {
                 let destination: (CGDirectDisplayID?) -> NSScreen? = { [self] id in
                     if let id, let existing = NSScreen.screens.first(where: { $0.displayID == id }) { return existing }
@@ -1183,9 +1246,9 @@ final class Session {
                     if mode == .desktop { await placement.preserveDesktopChanges(on: halves) }
                     coordinator.updateRecoveryCheckpoint()
                 }
-                guard await placement.leaveFullScreen(on: halves, includeSelected: transition != nil || !halves.isEmpty) else {
+                guard await placement.leaveFullScreen(on: halves, includeSelected: activeTasks.fullScreen != nil || !halves.isEmpty) else {
                     needsRecovery = true
-                    publish(L("窗口尚未退出全屏，已保留桌面。请从菜单选择“重试恢复窗口…”。"), phase: .idle)
+                    publish(L("窗口尚未退出全屏，已保留桌面。请从菜单选择“重试恢复窗口…”。"), phase: halves.isEmpty ? .idle : .split)
                     return
                 }
                 if joining {
@@ -1242,7 +1305,7 @@ final class Session {
                     for _ in 0..<10 {
                         let screens = NSScreen.screens
                         if Set(screens.compactMap(\.displayID)) == Set(layout.keys), screens.allSatisfy({ screen in
-                            screen.displayID.map { CGDisplayBounds($0) } == cocoaRect(screen.frame)
+                            screen.displayID.map { CGDisplayBounds($0) } == screen.quartzFrame
                         }) { break }
                         try? await Task.sleep(for: .milliseconds(100))
                     }

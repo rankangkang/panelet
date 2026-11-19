@@ -886,16 +886,9 @@ private final class DisplayArrangementView: NSView {
 
     override func layout() {
         super.layout()
-        let desktop = tiles.reduce(CGRect.null) { $0.union($1.screen.bounds) }
-        let area = bounds.insetBy(dx: 9, dy: 7)
-        guard desktop.width > 0, desktop.height > 0, area.width > 0, area.height > 0 else { return }
-        let scale = min(area.width / desktop.width, area.height / desktop.height)
-        let origin = CGPoint(x: area.midX - desktop.width * scale / 2, y: area.midY - desktop.height * scale / 2)
-        for tile in tiles {
+        let frames = DisplayScanner.arrangementFrames(tiles.map(\.screen.bounds), in: bounds.insetBy(dx: 9, dy: 7))
+        for (tile, frame) in zip(tiles, frames) where !frame.isEmpty {
             let screen = tile.screen.bounds
-            let frame = CGRect(x: origin.x + (screen.minX - desktop.minX) * scale,
-                               y: origin.y + (screen.minY - desktop.minY) * scale,
-                               width: screen.width * scale, height: screen.height * scale)
             tile.view.frame = frame.insetBy(dx: min(3, frame.width / 10), dy: min(3, frame.height / 10))
             let size = tile.view.bounds.size
             for (index, button) in tile.halves.enumerated() {

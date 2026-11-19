@@ -165,7 +165,7 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func placeWindow() throws {
         guard hasFrame else { throw DemoError(L("%@ 还没有画面。", String(describing: name))) }
-        let frame = cocoaRect(physicalRect)
+        let frame = ScreenCoordinates.cocoaFrame(forQuartz: physicalRect)
         let mirror = MirrorWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
         mirror.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.mainMenuWindow)) + 1)
         mirror.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
@@ -191,7 +191,7 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func updateWindowPosition() throws {
         guard let mirror = window else { return }
-        let frame = cocoaRect(physicalRect)
+        let frame = ScreenCoordinates.cocoaFrame(forQuartz: physicalRect)
         if mirror.frame != frame { mirror.setFrame(frame, display: true) }
         guard mirror.screen?.displayID == physicalID, mirror.frame == frame else {
             throw DemoError(L("%@ 的画面窗口无法定位到显示器。", String(describing: name)))
@@ -209,6 +209,8 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         let modeRate = CGDisplayCopyDisplayMode(virtualID)?.refreshRate ?? 0
         let rate = modeRate > 1 ? modeRate : refreshRate
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(rate.rounded()))
+        configuration.queueDepth = 3
+        configuration.colorSpaceName = CGColorSpace.sRGB
         configuration.capturesAudio = false
         configuration.showsCursor = true
         configuration.pixelFormat = kCVPixelFormatType_32BGRA
@@ -466,9 +468,10 @@ final class ParkedDisplayChanges: NSObject, SCStreamOutput, SCStreamDelegate {
                 let filter = SCContentFilter(display: display, excludingWindows: excluded)
                 if #available(macOS 14.2, *) { filter.includeMenuBar = false }
                 let configuration = SCStreamConfiguration()
-                configuration.width = 96
-                configuration.height = 96
-                configuration.minimumFrameInterval = CMTime(value: 1, timescale: 2)
+                configuration.width = 64
+                configuration.height = 64
+                configuration.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+                configuration.queueDepth = 2
                 configuration.showsCursor = false
                 let stream = SCStream(filter: filter, configuration: configuration, delegate: self)
                 try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: Self.queue)

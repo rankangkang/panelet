@@ -46,12 +46,17 @@ enum PhysicalScreenScreenshot {
     enum KeyResult: Equatable { case pass, consume, capture(Destination) }
 
     struct KeyState {
-        var enabled = false
+        var enabled = false {
+            didSet {
+                if !enabled { consumed.removeAll() }
+            }
+        }
         var shortcuts = Shortcuts(entries: [:])
         private var consumed: Set<Int64> = []
 
         mutating func handle(keyCode: Int64, flags: CGEventFlags, down: Bool, repeated: Bool) -> KeyResult {
             guard down else { return consumed.remove(keyCode) == nil ? .pass : .consume }
+            if !repeated { consumed.remove(keyCode) }
             if consumed.contains(keyCode) { return .consume }
             guard enabled, !repeated else { return .pass }
 
@@ -74,18 +79,21 @@ enum PhysicalScreenScreenshot {
         queue.async {
             // Keep Apple's capture format, destination, and presentation settings.
             // The Clipboard variant takes the main physical panel.
-            let physical = DisplayScanner.activeDisplayIDs().filter { CGDisplayVendorNumber($0) != DemoDisplay.vendorID }
+            let active = DisplayScanner.activeDisplayIDs()
+            let physical = active.filter { CGDisplayVendorNumber($0) != DemoDisplay.vendorID }
+            var processes: [Process] = []
             for (index, display) in physical.enumerated() {
-                guard let screen = DisplayScanner.activeDisplayIDs().firstIndex(of: display) else { continue }
+                guard let screen = active.firstIndex(of: display) else { continue }
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: "/usr/sbin/screencapture")
                 var arguments = ["-p", "-D", "\(screen + 1)"]
                 if destination == .clipboard { arguments.append("-c") }
                 if index > 0 { arguments.append("-x") }
                 process.arguments = arguments
-                if (try? process.run()) != nil { process.waitUntilExit() }
+                if (try? process.run()) != nil { processes.append(process) }
                 if destination == .clipboard { break }
             }
+            for process in processes { process.waitUntilExit() }
         }
     }
 }

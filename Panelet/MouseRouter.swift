@@ -308,33 +308,55 @@ final class MouseRouter {
         source?.localEventsSuppressionInterval = 0
         return source
     }()
+    private struct RunLoopState {
+        var loop: CFRunLoop?
+        var stopped = false
+    }
+
     private let screenshotKeys = OSAllocatedUnfairLock(initialState: PhysicalScreenScreenshot.KeyState())
+    private let runLoopState = OSAllocatedUnfairLock(initialState: RunLoopState())
+    private let captureApps = CaptureAppMonitor()
     private var tap: CFMachPort?
     private var motionTap: CFMachPort?
-    private var runLoop: CFRunLoop?
 
     private static func isRecent(_ timestamp: CGEventTimestamp, at now: UInt64) -> Bool {
         timestamp <= now && now - timestamp <= 45_000_000
     }
 
+    func routeSnapshot() -> Route {
+        routing.withLock { $0 }
+    }
+
     func update(parked: [Parking], screens: [CGRect]) {
         let point = CGEvent(source: nil)?.location ?? .zero
-        let destination = routing.withLock { route -> CGPoint? in
+        let anyButtonHeld = Self.isAnyMouseButtonPressed()
+        if let destination = updateRoute(parked: parked, screens: screens, cursor: point, anyButtonHeld: anyButtonHeld) {
+            CGWarpMouseCursorPosition(destination)
+        }
+    }
+
+    func updateRoute(parked: [Parking], screens: [CGRect], cursor: CGPoint, anyButtonHeld: Bool) -> CGPoint? {
+        routing.withLock { route in
             route.recordInput(DispatchTime.now().uptimeNanoseconds)
             route.invalidateHover()
             route.parked = parked
             route.screens = screens
             let displayIDs = Set(parked.compactMap(\.displayID))
+            if parked.isEmpty || !anyButtonHeld {
+                route.resetGesture()
+            } else if let gesture = route.gesturePanel, !displayIDs.contains(gesture) {
+                route.gesturePanel = nil
+                route.pixPinQueuedUntil = nil
+            }
             route.capture.displays.formIntersection(displayIDs)
             route.capture.pixPinDisplays.formIntersection(displayIDs)
             route.capture.controls = route.capture.controls.filter { displayIDs.contains($0.key) }
             route.capture.nativeWindows = route.capture.nativeWindows.filter { displayIDs.contains($0.key) }
-            let parking = parked.first { $0.physical.contains(point) && !route.allows($0, at: point, hovering: true) }
-            let destination = parking?.pointOnDesktop(point)
-            route.lastPoint = destination ?? point
+            let parking = parked.first { $0.physical.contains(cursor) && !route.allows($0, at: cursor, hovering: true) }
+            let destination = parking?.pointOnDesktop(cursor)
+            route.lastPoint = destination ?? cursor
             return destination
         }
-        if let destination { CGWarpMouseCursorPosition(destination) }
     }
 
     func setCaptureRouting(_ capture: CaptureRouting) {
@@ -372,12 +394,13 @@ final class MouseRouter {
 
         // An ordinary hit on the current surface requires no event-tap wakeup.
         if let hit, request.destination(hit: hit) != request.source,
-           routing.withLock({ $0.acceptsHover(request) }), let runLoop {
-            CFRunLoopPerformBlock(runLoop, CFRunLoopMode.defaultMode.rawValue) { [weak self] in
+           routing.withLock({ $0.acceptsHover(request) }),
+           let loop = runLoopState.withLock({ $0.stopped ? nil : $0.loop }) {
+            CFRunLoopPerformBlock(loop, CFRunLoopMode.defaultMode.rawValue) { [weak self] in
                 self?.moveCursor(from: request.source, to: request.destination(hit: hit),
                                  revision: request.revision, timestamp: request.started)
             }
-            CFRunLoopWakeUp(runLoop)
+            CFRunLoopWakeUp(loop)
         }
         let next = routing.withLock { route -> UInt64? in
             guard route.hoverPending != nil else {
@@ -389,6 +412,12 @@ final class MouseRouter {
         if let next { submitHover(at: next) }
     }
 
+    private static func isAnyMouseButtonPressed() -> Bool {
+        [CGMouseButton.left, .right, .center].contains {
+            CGEventSource.buttonState(.combinedSessionState, button: $0)
+        }
+    }
+
     @discardableResult
     private func moveCursor(from source: CGPoint, to destination: CGPoint, revision: UInt64,
                             timestamp: CGEventTimestamp) -> Bool {
@@ -396,9 +425,7 @@ final class MouseRouter {
               Self.isRecent(timestamp, at: DispatchTime.now().uptimeNanoseconds) else { return false }
         guard let point = CGEvent(source: nil)?.location,
               abs(point.x - source.x) <= 1, abs(point.y - source.y) <= 1,
-              ![CGMouseButton.left, .right, .center].contains(where: {
-                  CGEventSource.buttonState(.combinedSessionState, button: $0)
-              }) else { return false }
+              !Self.isAnyMouseButtonPressed() else { return false }
         let applied = routing.withLock { route -> Bool in
             guard route.acceptsMove(revision: revision),
                   Self.isRecent(timestamp, at: DispatchTime.now().uptimeNanoseconds),
@@ -422,7 +449,10 @@ final class MouseRouter {
         let point = event.location
         let timestamp = event.timestamp
         let now = DispatchTime.now().uptimeNanoseconds
-        let motion = routing.withLock { route in
+        let motion = routing.withLock { route -> (destination: CGPoint?, revision: UInt64, hoverStart: UInt64?)? in
+            if (!route.pressedButtons.isEmpty || route.gesturePanel != nil), !Self.isAnyMouseButtonPressed() {
+                route.resetGesture()
+            }
             let delta = route.capture.pixPinDisplays.isEmpty ? .zero : Self.mouseDelta(event)
             return route.observeMotion(at: point, delta: delta, timestamp: timestamp, now: now)
         }
@@ -540,16 +570,31 @@ final class MouseRouter {
         }
         tap = interaction.port
         motionTap = motion?.port
+        captureApps.start()
+        runLoopState.withLock { state in
+            state.loop = nil
+            state.stopped = false
+        }
         let ready = DispatchSemaphore(value: 0)
         let thread = Thread { [self] in
             let loop = CFRunLoopGetCurrent()
-            runLoop = loop
             CFRunLoopAddSource(loop, interaction.source, .defaultMode)
             if let motion { CFRunLoopAddSource(loop, motion.source, .defaultMode) }
+            let shouldRun = runLoopState.withLock { state -> Bool in
+                guard !state.stopped else { return false }
+                state.loop = loop
+                return true
+            }
             ready.signal()
-            withExtendedLifetime(self) { CFRunLoopRun() }
+            guard shouldRun else { return }
+            withExtendedLifetime(self) {
+                while !runLoopState.withLock({ $0.stopped }) {
+                    let status = CFRunLoopRunInMode(.defaultMode, 60, false)
+                    if status == .finished || status == .stopped { break }
+                }
+            }
         }
-        thread.name = L("竖屏分屏鼠标监听")
+        thread.name = "dev.cmkk.panelet.mouse-router"
         thread.qualityOfService = .userInteractive
         thread.start()
         ready.wait()
@@ -560,16 +605,26 @@ final class MouseRouter {
     }
 
     func stop() {
+        captureApps.stop()
         routing.withLock { route in
             route.liveHitTest = nil
             route.resetGesture()
             route.recordInput(DispatchTime.now().uptimeNanoseconds)
         }
+        let activeLoop = runLoopState.withLock { state -> CFRunLoop? in
+            state.stopped = true
+            let loop = state.loop
+            state.loop = nil
+            return loop
+        }
         for tap in [tap, motionTap].compactMap({ $0 }) {
             CGEvent.tapEnable(tap: tap, enable: false)
             CFMachPortInvalidate(tap)
         }
-        if let runLoop { CFRunLoopStop(runLoop) }
+        if let activeLoop {
+            CFRunLoopStop(activeLoop)
+            CFRunLoopWakeUp(activeLoop)
+        }
     }
 
     private func handlesScreenshot(_ type: CGEventType, _ event: CGEvent) -> Bool {
@@ -587,6 +642,8 @@ final class MouseRouter {
     }
 
     private func handlePixPinPress(_ event: CGEvent, timestamp: CGEventTimestamp) -> Bool? {
+        let runningPIDs = captureApps.activeSelectorPIDs
+        guard !runningPIDs.isEmpty else { return nil }
         let deadline = DispatchTime.now() + .milliseconds(100)
         let point = event.location
         guard let panel = routing.withLock({ route -> Parking? in
@@ -596,7 +653,7 @@ final class MouseRouter {
             } : nil
         }), let display = panel.displayID else { return nil }
         let mapped = panel.physical.contains(point) ? point : panel.pointOnPhysical(point)
-        guard let selector = WindowServerHitTest.pixPinSelectorWindow(at: mapped, panel: panel),
+        guard let selector = WindowServerHitTest.pixPinSelectorWindow(at: mapped, panel: panel, candidatePIDs: runningPIDs),
               routing.withLock({ $0.reservePixPinPress(on: panel) }) else { return nil }
 
         let ready = DispatchSemaphore(value: 0)
@@ -644,6 +701,9 @@ final class MouseRouter {
         }
         let (destination, work) = routing.withLock { route -> (CGPoint?, UInt64?) in
             let moving = type == .mouseMoved
+            if moving, (!route.pressedButtons.isEmpty || route.gesturePanel != nil), !Self.isAnyMouseButtonPressed() {
+                route.resetGesture()
+            }
             let delta = moving && !route.capture.pixPinDisplays.isEmpty ? Self.mouseDelta(event) : .zero
             let destination = route.destination(for: event.location, button: button,
                                                 passiveMotion: moving, delta: delta, timestamp: timestamp)
@@ -679,8 +739,22 @@ enum CaptureOverlays {
         var screenshotUIVisible = false
     }
 
-    fileprivate static let pixPinBundleIdentifier = "com.depthpicture.PixPin"
-    fileprivate static let pixPinLayer = Int(CGWindowLevelForKey(.popUpMenuWindow))
+    struct ToolProfile: Equatable, Sendable {
+        let bundleIdentifier: String
+        let minimumLayer: Int
+        let maxScreenPadding: CGFloat
+    }
+
+    static let pixPinProfile = ToolProfile(
+        bundleIdentifier: "com.depthpicture.PixPin",
+        minimumLayer: Int(CGWindowLevelForKey(.popUpMenuWindow)),
+        maxScreenPadding: 16
+    )
+
+    static let toolProfiles: [ToolProfile] = [pixPinProfile]
+
+    fileprivate static let pixPinBundleIdentifier = pixPinProfile.bundleIdentifier
+    fileprivate static let pixPinLayer = pixPinProfile.minimumLayer
 
     private struct PixPinGroup: Hashable {
         let pid: pid_t
@@ -740,8 +814,12 @@ enum CaptureOverlays {
                         canInteract: (pid_t, CGRect) -> Bool) -> Inspection {
         var windows = visible
         popupValidation.retainVisible(visible)
-        let pixPinPIDs = Set(NSRunningApplication.runningApplications(withBundleIdentifier: pixPinBundleIdentifier)
-            .map(\.processIdentifier))
+        let pixPinPIDs = Set(
+            toolProfiles.flatMap { profile in
+                NSRunningApplication.runningApplications(withBundleIdentifier: profile.bundleIdentifier)
+                    .map(\.processIdentifier)
+            }
+        )
         let apple = windows.filter { $0[kCGWindowOwnerName as String] as? String == "screencapture" }
         if apple.contains(where: { $0[kCGWindowName as String] as? String == "touchshield" }),
            !apple.contains(where: { $0[kCGWindowName as String] as? String == "windowselection" }),
@@ -891,67 +969,142 @@ enum CaptureOverlays {
     }
 }
 
+/// Tracks running third-party screenshot selector apps via KVO on `NSWorkspace.runningApplications`
+/// (which covers `LSUIElement=1` accessory apps like PixPin that emit no launch notifications)
+/// so the real-time `CGEventTap` callback never queries AppKit or WindowServer on ordinary clicks.
+final class CaptureAppMonitor: @unchecked Sendable {
+    private struct State {
+        var pids: Set<pid_t> = []
+        var observation: NSKeyValueObservation?
+        var generation: UInt64 = 0
+    }
+
+    private let state = OSAllocatedUnfairLock(initialState: State())
+    private let bundleIDs: Set<String>
+
+    init(bundleIDs: Set<String> = Set(CaptureOverlays.toolProfiles.map(\.bundleIdentifier))) {
+        self.bundleIDs = bundleIDs
+    }
+
+    var activeSelectorPIDs: Set<pid_t> {
+        state.withLock { $0.pids }
+    }
+
+    func start() {
+        let initial = scanRunningPIDs()
+        let generation = state.withLock { state -> UInt64? in
+            guard state.observation == nil else { return nil }
+            state.generation &+= 1
+            state.pids = initial
+            return state.generation
+        }
+        guard let generation else { return }
+
+        let installObserver = { [weak self] in
+            guard let self else { return }
+            let observation = NSWorkspace.shared.observe(\.runningApplications, options: [.new]) { [weak self] _, _ in
+                self?.refresh(for: generation)
+            }
+            let latest = self.scanRunningPIDs()
+            let staleObservation = self.state.withLock { state -> NSKeyValueObservation? in
+                guard state.generation == generation, state.observation == nil else { return observation }
+                state.observation = observation
+                state.pids = latest
+                return nil
+            }
+            staleObservation?.invalidate()
+        }
+
+        if Thread.isMainThread {
+            installObserver()
+        } else {
+            DispatchQueue.main.async(execute: installObserver)
+        }
+    }
+
+    func stop() {
+        let observation = state.withLock { state -> NSKeyValueObservation? in
+            state.generation &+= 1
+            state.pids.removeAll()
+            let active = state.observation
+            state.observation = nil
+            return active
+        }
+        observation?.invalidate()
+    }
+
+    private func refresh(for generation: UInt64) {
+        let latest = scanRunningPIDs()
+        state.withLock { state in
+            guard state.generation == generation else { return }
+            state.pids = latest
+        }
+    }
+
+    private func scanRunningPIDs() -> Set<pid_t> {
+        var pids = Set<pid_t>()
+        for id in bundleIDs {
+            for app in NSRunningApplication.runningApplications(withBundleIdentifier: id) where !app.isTerminated {
+                pids.insert(app.processIdentifier)
+            }
+        }
+        return pids
+    }
+}
+
 /// Physical overlay hit testing and PixPin selector discovery.
 /// Snapshot routing remains available when the native symbols are unavailable.
 enum WindowServerHitTest {
-    private typealias Find = @convention(c) (Int32, Int32, Int32, Int32, UnsafePointer<CGPoint>,
-        UnsafeMutablePointer<CGPoint>, UnsafeMutablePointer<CGWindowID>, UnsafeMutablePointer<Int32>) -> Int32
-    private static let find: Find? = {
-        guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "SLSFindWindowAndOwner") else { return nil }
-        return unsafeBitCast(symbol, to: Find.self)
-    }()
-    private static let connection: Int32 = {
-        guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "SLSMainConnectionID") else { return 0 }
-        return unsafeBitCast(symbol, to: (@convention(c) () -> Int32).self)()
-    }()
+    static var supportsLiveRouting: Bool { SystemBridge.SkyLight.supportsLiveRouting }
 
-    private typealias Level = @convention(c) (Int32, CGWindowID, UnsafeMutablePointer<Int32>) -> Int32
-    private static let level: Level? = {
-        guard let symbol = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "SLSGetWindowLevel") else { return nil }
-        return unsafeBitCast(symbol, to: Level.self)
-    }()
-    static var supportsLiveRouting: Bool { isAvailable && level != nil }
-
-    static func pixPinSelectorWindow(at point: CGPoint, panel: MouseRouter.Parking) -> CGWindowID? {
+    static func pixPinSelectorWindow(at point: CGPoint, panel: MouseRouter.Parking,
+                                     candidatePIDs: Set<pid_t>? = nil) -> CGWindowID? {
         guard panel.mirrors.count == 2 else { return nil }
-        let running = NSRunningApplication.runningApplications(withBundleIdentifier: CaptureOverlays.pixPinBundleIdentifier)
-        guard !running.isEmpty else { return nil }
-        guard let mirror = panel.mirrors.first(where: { $0.frame.contains(point) }),
-              let windows = CGWindowListCopyWindowInfo([.optionOnScreenAboveWindow, .excludeDesktopElements], mirror.id)
-                    as? [[String: Any]] else { return nil }
+        let pids = candidatePIDs ?? Set(
+            NSRunningApplication.runningApplications(withBundleIdentifier: CaptureOverlays.pixPinBundleIdentifier)
+                .map(\.processIdentifier)
+        )
+        guard !pids.isEmpty,
+              let mirror = panel.mirrors.first(where: { $0.frame.contains(point) }) else { return nil }
+        // Fast path: if SkyLight hit-testing already resolves to a non-mirror window that does NOT
+        // belong to an ordinary desktop below, we still only query windows ordered above the mirror.
+        // Note: When a selector just appeared (<60ms), WindowServer hit-testing may temporarily
+        // still return `mirror.id`; querying `.optionOnScreenAboveWindow` only when `pids` is non-empty
+        // preserves early first-drag reliability while keeping the common path zero-IPC when idle.
+        guard let windows = CGWindowListCopyWindowInfo([.optionOnScreenAboveWindow, .excludeDesktopElements], mirror.id)
+                as? [[String: Any]], !windows.isEmpty else { return nil }
+        // Short-circuit before geometry parsing when none of the windows above the mirror belong to candidatePIDs.
+        guard windows.contains(where: { entry in
+            guard let pid = entry[kCGWindowOwnerPID as String] as? pid_t else { return false }
+            return pids.contains(pid)
+        }) else { return nil }
         let screens = [panel.physical] + panel.mirrors.map {
             CGRect(origin: panel.pointOnDesktop($0.frame.origin), size: $0.frame.size)
         }
-        for app in running {
-            if let window = CaptureOverlays.pixPinSelectorWindows(windows, pid: app.processIdentifier, screens: screens)?.first,
+        for pid in pids {
+            if let window = CaptureOverlays.pixPinSelectorWindows(windows, pid: pid, screens: screens)?.first,
                window != kCGNullWindowID {
                 return window
             }
         }
         return nil
     }
+
     private static let mirrorLayer = CGWindowLevelForKey(.mainMenuWindow) + 1
+
     static func aboveMirror(at point: CGPoint, mirror: MouseRouter.NativeWindow) -> Bool? {
-        guard let level, supportsLiveRouting else { return nil }
+        guard supportsLiveRouting else { return nil }
         guard let hit = window(at: point), hit != mirror.id else { return false }
-        var hitLevel: Int32 = 0
-        guard level(connection, hit, &hitLevel) == 0 else { return nil }
+        guard let hitLevel = SystemBridge.SkyLight.level(of: hit) else { return nil }
         if hitLevel != mirrorLayer { return hitLevel > mirrorLayer }
         guard let above = CGWindowListCopyWindowInfo([.optionOnScreenAboveWindow, .excludeDesktopElements], mirror.id)
                 as? [[String: Any]] else { return nil }
         return above.contains { ($0[kCGWindowNumber as String] as? CGWindowID) == hit }
     }
 
-    static var isAvailable: Bool { find != nil && connection != 0 }
+    static var isAvailable: Bool { SystemBridge.SkyLight.supportsHitTesting }
 
     static func window(at point: CGPoint) -> CGWindowID? {
-        guard let find, connection != 0 else { return nil }
-        var screenPoint = point
-        var windowPoint = CGPoint.zero
-        var window: CGWindowID = 0
-        var owner: Int32 = 0
-        guard find(connection, 0, 1, 0, &screenPoint, &windowPoint, &window, &owner) == 0,
-              window != kCGNullWindowID else { return nil }
-        return window
+        SystemBridge.SkyLight.window(at: point)
     }
 }
