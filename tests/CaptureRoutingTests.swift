@@ -172,6 +172,12 @@ struct CaptureRoutingTests {
         let highPopup = window("Custom", 22, shielding + 50, popup, id: 63)
         assert(CaptureOverlays.inspect([highPopup] + mirrors, on: [popupTarget], pixPinPIDs: [],
                                      nativeHitTesting: true).routing.nativeWindows[1]?.first?.id == 63)
+        let statusDot = window("Window Server", 665, Int(CGWindowLevelForKey(.cursorWindow)) + 5,
+                               CGRect(x: 1200, y: 1, width: 29, height: 28), id: 69, name: "StatusIndicator")
+        let statusInspection = CaptureOverlays.inspect([statusDot] + mirrors, on: [popupTarget], pixPinPIDs: [],
+                                                       nativeHitTesting: true)
+        assert(statusInspection.routing.nativeWindows.isEmpty && statusInspection.routing.controls.isEmpty,
+               "WindowServer StatusIndicator must never pull the cursor onto the parked physical panel")
         let fullOverlay = window("Custom", 22, pixPinLevel, physical, id: 64)
         let fullNative = CaptureOverlays.inspect([fullOverlay] + mirrors, on: [popupTarget], pixPinPIDs: [],
                                                 nativeHitTesting: true).routing

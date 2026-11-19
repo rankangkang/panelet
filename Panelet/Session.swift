@@ -142,7 +142,7 @@ final class SplitSessions {
         let shouldRun = (!active.isEmpty || !failedSessions.isEmpty) && !sleeping && !screensSleeping && !sessionInactive
         if shouldRun {
             guard healthTimer == nil else { return }
-            let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            let timer = Timer(timeInterval: 2.5, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated { self?.checkActive() }
             }
             healthTimer = timer
@@ -535,7 +535,9 @@ final class SplitSessions {
                   let first = session.halves.first, let upper = layout[first.virtualID] else { return nil }
             let desktop = CGRect(origin: upper.origin, size: physical.size)
             let mirrors = session.halves.compactMap { half in
-                half.mirrorWindowID.map { MouseRouter.NativeWindow(id: $0, frame: half.physicalRect) }
+                half.mirrorWindowID.map {
+                    MouseRouter.NativeWindow(id: $0, frame: half.physicalRect, level: half.mirrorWindowLevel)
+                }
             }
             return MouseRouter.Parking(physical: physical, desktop: desktop, displayID: session.targetID, mirrors: mirrors)
         } + hidden
@@ -601,7 +603,7 @@ final class SplitSessions {
 
     private func refreshScreenshotShortcuts() {
         guard router != nil, monitoringAllowed, .now >= nextScreenshotShortcutRead else { return }
-        nextScreenshotShortcutRead = .now + .seconds(1)
+        nextScreenshotShortcutRead = .now + .seconds(30)
         let revision = captureOverlayRevision
         captureOverlayQueue.async { [weak self] in
             let shortcuts = PhysicalScreenScreenshot.Shortcuts.current()
@@ -636,6 +638,7 @@ final class SplitSessions {
         }
         // Rescue needs windows behind the mirrors as well.
         let anchor = rescueTargets.isEmpty ? captureOverlayAnchor : nil
+        let cachedSelectorPIDs = router?.activeSelectorPIDs
         refreshScreenshotShortcuts()
         captureOverlayQueue.async { [weak self, popupValidation] in
             let mirrors = Set(targets.flatMap(\.mirrorWindows))
@@ -643,6 +646,7 @@ final class SplitSessions {
             let visible = snapshot?.windows
             let inspection = visible.map {
                 CaptureOverlays.inspect(visible: $0, on: targets, popupValidation: popupValidation,
+                                        selectorPIDs: cachedSelectorPIDs,
                                         canInteract: WindowPlacement.isInteractivePopup)
             }
             let nextAnchor = snapshot?.backmostMirror
@@ -1094,7 +1098,10 @@ final class Session {
             }
         }
         for half in halves {
-            half.onFrame = { [weak coordinator] in coordinator?.requestCaptureOverlayUpdate() }
+            // Only fall back to frame-driven overlay polling when live Accessibility/SkyLight routing is unavailable.
+            if !WindowServerHitTest.supportsLiveRouting {
+                half.onFrame = { [weak coordinator] in coordinator?.requestCaptureOverlayUpdate() }
+            }
             half.onFailure = { [weak self, weak half] error in
                 guard let self, let half else { return }
                 self.coordinator.recoverCapture(half, in: self,

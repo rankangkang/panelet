@@ -91,6 +91,22 @@ struct SplitLayoutTests {
         topology.reset()
         assert(topology.isEmpty)
 
+        let rightPortrait = CGRect(x: 2048, y: -360, width: 1296, height: 2304)
+        let portraitHalves: [CGDirectDisplayID: CGRect] = [
+            334: CGRect(x: 0, y: 0, width: 1296, height: 1152),
+            335: CGRect(x: 0, y: 1152, width: 1296, height: 1152),
+        ]
+        let portraitSplit = DisplayScanner.splitDisplayFrames(
+            physical: [3: CGRect(x: 0, y: 0, width: 2048, height: 1152), 2: rightPortrait],
+            main: 3,
+            halves: [2: portraitHalves]
+        )
+        let lowerHalf = portraitSplit[335]!
+        let parkedPhysical = portraitSplit[2]!
+        let sharedBottomSpan = min(lowerHalf.maxX, parkedPhysical.maxX) - max(lowerHalf.minX, parkedPhysical.minX)
+        assert(parkedPhysical.intersection(lowerHalf).isEmpty && sharedBottomSpan <= 1,
+               "Parked physical display must overlap at most 1pt with the bottom edge so pointer cannot slip through")
+
         print("SplitLayout: split geometry, coordinate wrappers, topology parking and restoration passed")
     }
 }

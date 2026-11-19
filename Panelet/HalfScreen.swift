@@ -88,7 +88,7 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         self.scale = scale
         self.display = display
         self.virtualID = display.displayID
-        self.captureQueue = DispatchQueue(label: "dev.cmkk.vertical-split.capture.\(name)")
+        self.captureQueue = DispatchQueue(label: "dev.cmkk.panelet.capture.\(name)", qos: .userInteractive)
         super.init()
         mirrorLayer.actions = ["contents": NSNull()]
     }
@@ -163,11 +163,17 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         CGDisplayCopyDisplayMode(virtualID).map { !matches($0) } ?? false
     }
 
+    var mirrorWindowLevel: Int32 {
+        Int32(window?.level.rawValue ?? (Int(CGWindowLevelForKey(.statusWindow)) + 1))
+    }
+
     func placeWindow() throws {
         guard hasFrame else { throw DemoError(L("%@ 还没有画面。", String(describing: name))) }
         let frame = ScreenCoordinates.cocoaFrame(forQuartz: physicalRect)
         let mirror = MirrorWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
-        mirror.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.mainMenuWindow)) + 1)
+        // Sit above status-bar item windows (level 25) on the parked physical panel so
+        // menu-bar icon updates never rise in front of the mirrors, while staying below popups (101+).
+        mirror.level = NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.statusWindow)) + 1)
         mirror.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
         mirror.ignoresMouseEvents = true
         mirror.isOpaque = true
@@ -209,7 +215,7 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         let modeRate = CGDisplayCopyDisplayMode(virtualID)?.refreshRate ?? 0
         let rate = modeRate > 1 ? modeRate : refreshRate
         configuration.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(rate.rounded()))
-        configuration.queueDepth = 3
+        configuration.queueDepth = 6
         configuration.colorSpaceName = CGColorSpace.sRGB
         configuration.capturesAudio = false
         configuration.showsCursor = true

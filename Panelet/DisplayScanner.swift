@@ -107,15 +107,24 @@ enum DisplayScanner {
     }
 
     static func parkingFrame(size: CGSize, beside desktop: CGRect, avoiding occupied: [CGRect]) -> CGRect {
-        let candidates = [CGPoint(x: desktop.minX, y: desktop.maxY),
-                          CGPoint(x: desktop.minX, y: desktop.minY - size.height),
-                          CGPoint(x: desktop.maxX, y: desktop.minY),
-                          CGPoint(x: desktop.minX - size.width, y: desktop.minY)]
+        // Overlap by only 1 point near a corner so WindowServer keeps the display topology
+        // connected while leaving virtually the entire visible edge as a solid hardware stop.
+        let candidates = [
+            CGPoint(x: max(desktop.minX, desktop.maxX - 1), y: desktop.maxY),
+            CGPoint(x: desktop.maxX, y: max(desktop.minY, desktop.maxY - 1)),
+            CGPoint(x: desktop.minX, y: desktop.maxY),
+            CGPoint(x: desktop.maxX, y: desktop.minY),
+            CGPoint(x: desktop.minX, y: desktop.minY - size.height),
+            CGPoint(x: desktop.minX - size.width, y: desktop.minY),
+        ]
         if let frame = candidates.map({ CGRect(origin: $0, size: size) }).first(where: { candidate in
             occupied.allSatisfy { $0.intersection(candidate).isEmpty }
         }) { return frame }
-        let edge = occupied.max { $0.maxX < $1.maxX } ?? desktop
-        return CGRect(origin: CGPoint(x: edge.maxX, y: edge.minY), size: size)
+        let edge = occupied.max {
+            if $0.maxX != $1.maxX { return $0.maxX < $1.maxX }
+            return $0.maxY < $1.maxY
+        } ?? desktop
+        return CGRect(origin: CGPoint(x: edge.maxX, y: max(edge.minY, edge.maxY - 1)), size: size)
     }
 
     static func physicalScreens() -> [PhysicalScreen] {

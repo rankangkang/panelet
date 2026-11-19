@@ -8,6 +8,7 @@ final class MouseRouter {
     struct NativeWindow: Equatable, Sendable {
         let id: CGWindowID
         let frame: CGRect
+        var level: Int32 = CGWindowLevelForKey(.mainMenuWindow) + 1
     }
 
     struct CaptureRouting: Equatable, Sendable {
@@ -323,6 +324,12 @@ final class MouseRouter {
         timestamp <= now && now - timestamp <= 45_000_000
     }
 
+    private static let hoverSettleNanoseconds: UInt64 = 40_000_000
+
+    var activeSelectorPIDs: Set<pid_t> {
+        captureApps.activeSelectorPIDs
+    }
+
     func routeSnapshot() -> Route {
         routing.withLock { $0 }
     }
@@ -374,22 +381,36 @@ final class MouseRouter {
     }
 
     private func submitHover(at earliest: UInt64) {
-        hoverQueue.asyncAfter(deadline: DispatchTime(uptimeNanoseconds: earliest)) { [weak self] in
+        let deadline = max(earliest, DispatchTime.now().uptimeNanoseconds + Self.hoverSettleNanoseconds)
+        hoverQueue.asyncAfter(deadline: DispatchTime(uptimeNanoseconds: deadline)) { [weak self] in
             self?.queryHover()
         }
     }
 
     private func queryHover() {
-        let request = routing.withLock { route -> HoverRequest? in
-            guard let request = route.hoverPending else {
+        let now = DispatchTime.now().uptimeNanoseconds
+        let outcome = routing.withLock { route -> (request: HoverRequest?, rescheduleAt: UInt64?) in
+            guard let pending = route.hoverPending else {
                 route.hoverScheduled = false
-                return nil
+                return (nil, nil)
+            }
+            // Wait until the pointer has settled so continuous motion does not contend
+            // with WindowServer's compositor lock on every 8ms tick.
+            let settleDeadline = pending.started + Self.hoverSettleNanoseconds
+            if now < settleDeadline {
+                return (nil, settleDeadline)
             }
             route.hoverPending = nil
-            route.hoverNextStart = DispatchTime.now().uptimeNanoseconds + 8_000_000
-            return request
+            route.hoverNextStart = now + Self.hoverSettleNanoseconds
+            return (pending, nil)
         }
-        guard let request else { return }
+        if let rescheduleAt = outcome.rescheduleAt {
+            hoverQueue.asyncAfter(deadline: DispatchTime(uptimeNanoseconds: rescheduleAt)) { [weak self] in
+                self?.queryHover()
+            }
+            return
+        }
+        guard let request = outcome.request else { return }
         let hit = WindowServerHitTest.aboveMirror(at: request.physical, mirror: request.mirror)
 
         // An ordinary hit on the current surface requires no event-tap wakeup.
@@ -398,18 +419,23 @@ final class MouseRouter {
            let loop = runLoopState.withLock({ $0.stopped ? nil : $0.loop }) {
             CFRunLoopPerformBlock(loop, CFRunLoopMode.defaultMode.rawValue) { [weak self] in
                 self?.moveCursor(from: request.source, to: request.destination(hit: hit),
-                                 revision: request.revision, timestamp: request.started)
+                                 revision: request.revision, timestamp: request.started,
+                                 enforceSourceProximity: true)
             }
             CFRunLoopWakeUp(loop)
         }
         let next = routing.withLock { route -> UInt64? in
-            guard route.hoverPending != nil else {
+            guard let pending = route.hoverPending else {
                 route.hoverScheduled = false
                 return nil
             }
-            return route.hoverNextStart
+            return max(route.hoverNextStart, pending.started + Self.hoverSettleNanoseconds)
         }
-        if let next { submitHover(at: next) }
+        if let next {
+            hoverQueue.asyncAfter(deadline: DispatchTime(uptimeNanoseconds: next)) { [weak self] in
+                self?.queryHover()
+            }
+        }
     }
 
     private static func isAnyMouseButtonPressed() -> Bool {
@@ -420,12 +446,16 @@ final class MouseRouter {
 
     @discardableResult
     private func moveCursor(from source: CGPoint, to destination: CGPoint, revision: UInt64,
-                            timestamp: CGEventTimestamp) -> Bool {
+                            timestamp: CGEventTimestamp, enforceSourceProximity: Bool) -> Bool {
         guard routing.withLock({ $0.acceptsMove(revision: revision) }),
               Self.isRecent(timestamp, at: DispatchTime.now().uptimeNanoseconds) else { return false }
-        guard let point = CGEvent(source: nil)?.location,
-              abs(point.x - source.x) <= 1, abs(point.y - source.y) <= 1,
-              !Self.isAnyMouseButtonPressed() else { return false }
+        if enforceSourceProximity {
+            guard let point = CGEvent(source: nil)?.location,
+                  abs(point.x - source.x) <= 1, abs(point.y - source.y) <= 1,
+                  !Self.isAnyMouseButtonPressed() else { return false }
+        } else {
+            guard !Self.isAnyMouseButtonPressed() else { return false }
+        }
         let applied = routing.withLock { route -> Bool in
             guard route.acceptsMove(revision: revision),
                   Self.isRecent(timestamp, at: DispatchTime.now().uptimeNanoseconds),
@@ -458,7 +488,8 @@ final class MouseRouter {
         }
         guard let motion else { return }
         if let destination = motion.destination {
-            guard moveCursor(from: point, to: destination, revision: motion.revision, timestamp: timestamp) else { return }
+            guard moveCursor(from: point, to: destination, revision: motion.revision, timestamp: timestamp,
+                             enforceSourceProximity: false) else { return }
             let work = routing.withLock { route -> UInt64? in
                 guard route.acceptsMove(revision: motion.revision) else { return nil }
                 return route.scheduleHover(at: destination, now: now)
@@ -811,10 +842,11 @@ enum CaptureOverlays {
     }
 
     static func inspect(visible: [[String: Any]], on targets: [Target], popupValidation: PopupValidation,
+                        selectorPIDs: Set<pid_t>? = nil,
                         canInteract: (pid_t, CGRect) -> Bool) -> Inspection {
         var windows = visible
         popupValidation.retainVisible(visible)
-        let pixPinPIDs = Set(
+        let pixPinPIDs = selectorPIDs ?? Set(
             toolProfiles.flatMap { profile in
                 NSRunningApplication.runningApplications(withBundleIdentifier: profile.bundleIdentifier)
                     .map(\.processIdentifier)
@@ -842,6 +874,7 @@ enum CaptureOverlays {
                         screenshotUIPIDs: Set<pid_t> = [], nativeHitTesting: Bool = false,
                         validatePopup: (CGWindowID, pid_t, CGRect) -> Bool = { _, _, _ in false }) -> Inspection {
         let shieldingLevel = Int(CGWindowLevelForKey(.screenSaverWindow))
+        let cursorLevel = Int(CGWindowLevelForKey(.cursorWindow))
         let aboveMenuBar = Int(CGWindowLevelForKey(.mainMenuWindow)) + 1
         var systemWindows: [(id: CGWindowID?, pid: pid_t, frame: CGRect, isTracking: Bool)] = []
         var windowPickerPIDs: Set<pid_t> = []
@@ -849,9 +882,11 @@ enum CaptureOverlays {
         var panelWindows: [PanelWindow] = []
         var pixPinSelectors: [PixPinGroup: [CGRect]] = [:]
         for window in windows {
-            guard let layer = window[kCGWindowLayer as String] as? Int,
+            guard let layer = window[kCGWindowLayer as String] as? Int, layer < cursorLevel,
                   let pid = window[kCGWindowOwnerPID as String] as? pid_t else { continue }
-            let apple = (window[kCGWindowOwnerName as String] as? String) == "screencapture"
+            let ownerName = window[kCGWindowOwnerName as String] as? String
+            if ownerName == "Window Server" { continue }
+            let apple = ownerName == "screencapture"
             let name = window[kCGWindowName as String] as? String
             if apple && name == "windowselection" {
                 windowPickerPIDs.insert(pid)
@@ -1090,13 +1125,14 @@ enum WindowServerHitTest {
         return nil
     }
 
-    private static let mirrorLayer = CGWindowLevelForKey(.mainMenuWindow) + 1
+    private static let cursorLayer = CGWindowLevelForKey(.cursorWindow)
 
     static func aboveMirror(at point: CGPoint, mirror: MouseRouter.NativeWindow) -> Bool? {
         guard supportsLiveRouting else { return nil }
         guard let hit = window(at: point), hit != mirror.id else { return false }
         guard let hitLevel = SystemBridge.SkyLight.level(of: hit) else { return nil }
-        if hitLevel != mirrorLayer { return hitLevel > mirrorLayer }
+        if hitLevel >= cursorLayer { return false }
+        if hitLevel != mirror.level { return hitLevel > mirror.level }
         guard let above = CGWindowListCopyWindowInfo([.optionOnScreenAboveWindow, .excludeDesktopElements], mirror.id)
                 as? [[String: Any]] else { return nil }
         return above.contains { ($0[kCGWindowNumber as String] as? CGWindowID) == hit }
