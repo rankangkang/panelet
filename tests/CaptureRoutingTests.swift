@@ -236,6 +236,17 @@ struct CaptureRoutingTests {
         assert(synchronousHits > 0 && !hover.acceptsHover(latest))
         assert(hover.scheduleHover(at: CGPoint(x: 950, y: 50), now: 300) == nil)
 
+        var scrolling = MouseRouter.Route(parked: [parked], screens: [left, right], capture: native, lastPoint: projectedPoint,
+                                          hitTest: { _ in fatalError("Scroll fell back to a synchronous hit test") },
+                                          liveHitTest: { _, _ in fatalError("Scroll blocked on WindowServer") })
+        _ = scrolling.scheduleHover(at: projectedPoint, now: 100)
+        assert(scrolling.destination(for: projectedPoint, passiveMotion: true, scrolling: true) == nil)
+        assert(scrolling.hoverPending?.source == projectedPoint, "Scrolling before hover settles must preserve the pending lookup")
+        assert(scrolling.destination(for: popupPoint, passiveMotion: true, scrolling: true) == nil,
+               "The wheel can arrive before the motion observer records that the pointer is over a native popup")
+        scrolling.liveHitTest = nil
+        assert(scrolling.destination(for: projectedPoint, passiveMotion: true, scrolling: true) == nil)
+
         let interactions = MouseRouter.mouseMask(observingMotion: true)
         assert(interactions & MouseRouter.motionMask == 0)
         assert(MouseRouter.mouseMask(observingMotion: false) == interactions | MouseRouter.motionMask)
@@ -298,6 +309,22 @@ struct CaptureRoutingTests {
         assert(pixPin.destination(for: leftEdge, button: .up(0)) == nil)
         assert(pixPin.destination(for: leftEdge, passiveMotion: true, delta: movingLeft) == CGPoint(x: 991, y: 270))
         assert(pixPin.destination(for: CGPoint(x: 1005, y: 270), passiveMotion: true) == CGPoint(x: 1005, y: 2270))
+
+        let neighbor = MouseRouter.Parking(physical: CGRect(x: 4000, y: 1800, width: 960, height: 1600),
+                                           desktop: detached.desktop.offsetBy(dx: detached.desktop.width, dy: 0), displayID: 9)
+        let above = detached.desktop.offsetBy(dx: 0, dy: -detached.desktop.height)
+        let below = detached.desktop.offsetBy(dx: 0, dy: detached.desktop.height)
+        pixPin.parked = [detached, neighbor]
+        pixPin.screens = [adjacent, detached.desktop, neighbor.desktop, above, below]
+        pixPin.capture.pixPinDisplays.insert(9)
+        pixPin.lastPoint = CGPoint(x: 1957, y: 2270)
+        assert(pixPin.destination(for: CGPoint(x: 1959, y: 2270), passiveMotion: true, delta: .init(dx: 7, dy: 0))
+            == CGPoint(x: 4004, y: 2270), "PixPin should enter the adjacent split's physical panel")
+        for (lastY, edgeY, deltaY, expectedY) in [(1804, 1800, -10, -206), (3396, 3399, 8, 1404)] {
+            pixPin.lastPoint = CGPoint(x: 1320, y: lastY)
+            assert(pixPin.destination(for: CGPoint(x: 1320, y: edgeY), passiveMotion: true, delta: .init(dx: 0, dy: deltaY))
+                == CGPoint(x: 1320, y: expectedY))
+        }
 
         let selectorWindows = [
             window("PixPin", 12, pixPinLevel, physical, id: 70),

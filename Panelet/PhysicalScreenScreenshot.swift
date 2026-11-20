@@ -22,6 +22,7 @@ enum PhysicalScreenScreenshot {
 
         static func current() -> Shortcuts {
             let domain = "com.apple.symbolichotkeys" as CFString
+            CFPreferencesAppSynchronize(domain)
             let entries = CFPreferencesCopyAppValue("AppleSymbolicHotKeys" as CFString, domain) as? [String: Any] ?? [:]
             return Shortcuts(entries: entries)
         }

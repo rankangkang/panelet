@@ -21,7 +21,6 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         var expectedWidth = 0
         var expectedHeight = 0
         var firstFrameDelivered = false
-        var hasOnFrame = false
         var presenting = false
         var pending: Frame?
         var tornDown = false
@@ -36,6 +35,7 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
     let virtualID: CGDirectDisplayID
     private let scale: Int
 
+    // The main actor owns geometry and attachment. Only presentQueue writes contents.
     private nonisolated(unsafe) let mirrorLayer = CALayer()
     private struct Measurements { var received = 0; var replaced = 0; var presented = 0; var maxQueueDelay = 0.0 }
     private nonisolated let measurements = OSAllocatedUnfairLock(initialState: Measurements())
@@ -60,12 +60,6 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
     private var firstFrame: (stream: ObjectIdentifier, time: TimeInterval)?
     private var tornDown = false
     var onFailure: ((Error) -> Void)?
-    var onFrame: (() -> Void)? {
-        didSet {
-            let hasHandler = (onFrame != nil)
-            renderState.withLock { $0.hasOnFrame = hasHandler }
-        }
-    }
 
     var firstFrameAt: TimeInterval? {
         guard let stream, let firstFrame, ObjectIdentifier(stream) == firstFrame.stream else { return nil }
@@ -109,7 +103,6 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         self.captureQueue = DispatchQueue(label: "dev.cmkk.panelet.capture.\(name)", qos: .userInteractive)
         self.presentQueue = DispatchQueue(label: "dev.cmkk.panelet.present.\(name)", qos: .userInteractive)
         super.init()
-        mirrorLayer.actions = NSDictionary(object: NSNull(), forKey: "contents" as NSString) as? [String: CAAction]
     }
 
     static func make(
@@ -204,18 +197,14 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         content.wantsLayer = true
         mirror.contentView = content
         guard let host = content.layer else { throw DemoError(L("%@ 无法建立画面窗口。", String(describing: name))) }
-        let bounds = content.bounds
-        let layerScale = CGFloat(scale)
-        renderState.withLockUnchecked { _ in
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            mirrorLayer.frame = bounds
-            mirrorLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
-            mirrorLayer.contentsGravity = .resize
-            mirrorLayer.contentsScale = layerScale
-            host.addSublayer(mirrorLayer)
-            CATransaction.commit()
-        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        mirrorLayer.frame = content.bounds
+        mirrorLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+        mirrorLayer.contentsGravity = .resize
+        mirrorLayer.contentsScale = CGFloat(scale)
+        host.addSublayer(mirrorLayer)
+        CATransaction.commit()
         window = mirror
         try updateWindowPosition()
         mirror.orderFrontRegardless()
@@ -259,13 +248,11 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         let streamID = ObjectIdentifier(stream)
         let expectedW = Int(pointSize.width) * scale
         let expectedH = Int(pointSize.height) * scale
-        let hasOnFrame = (onFrame != nil)
         renderState.withLock { state in
             state.streamID = streamID
             state.expectedWidth = expectedW
             state.expectedHeight = expectedH
             state.firstFrameDelivered = false
-            state.hasOnFrame = hasOnFrame
             state.pending = nil
         }
         measurements.withLock { $0.maxQueueDelay = 0 }
@@ -351,8 +338,6 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func park() {
         onFailure = nil
-        onFrame = nil
-        hideWindow()
         let activeStream = stream
         stream = nil
         captureStartedAt = nil
@@ -362,11 +347,11 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
             if isTornDown { state.tornDown = true }
             state.streamID = nil
             state.pending = nil
-            state.hasOnFrame = false
-            CATransaction.begin()
-            CATransaction.setDisableActions(true)
-            mirrorLayer.contents = nil
-            CATransaction.commit()
+        }
+        hideWindow()
+        presentQueue.async { [weak self] in
+            guard let self, self.renderState.withLock({ $0.streamID == nil }) else { return }
+            self.setMirrorContents(nil)
         }
         activeStream?.stopCapture { _ in }
     }
@@ -396,8 +381,7 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
     nonisolated func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .screen, let pixels = sampleBuffer.imageBuffer, Self.isUsefulFrame(sampleBuffer) else { return }
         let frame = Frame(pixels: pixels, streamID: ObjectIdentifier(stream), receivedAt: ProcessInfo.processInfo.systemUptime)
-        // Mailbox slot: coalesce intermediate frames on a dedicated interactive presenter queue
-        // so IOSurface swaps flush straight to WindowServer without waiting on MainActor / AppKit UpdateCycle.
+        // Coalesce intermediate frames while the presenter queue commits the latest surface.
         let (accepted, replaced, shouldSchedule) = renderState.withLock { state -> (Bool, Bool, Bool) in
             guard !state.tornDown, state.streamID == frame.streamID else { return (false, false, false) }
             let hadPending = (state.pending != nil)
@@ -425,59 +409,46 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
                     return nil
                 }
                 state.pending = nil
-                guard !state.tornDown, state.streamID == frame.streamID else { return nil }
                 return (frame, state.expectedWidth, state.expectedHeight)
             }
-            guard let next else {
-                let hasMore = renderState.withLock { state -> Bool in
-                    if state.pending == nil {
-                        state.presenting = false
-                        return false
-                    }
-                    return true
-                }
-                if hasMore { continue }
-                return
-            }
+            guard let next else { return }
             guard let surface = Self.surface(from: next.frame.pixels) else { continue }
             let width = IOSurfaceGetWidth(surface)
             let height = IOSurfaceGetHeight(surface)
             guard width == next.width, height == next.height else { continue }
 
-            let outcome = renderState.withLock { state -> (committed: Bool, becameFirst: Bool, notifyFrame: Bool) in
-                guard !state.tornDown, state.streamID == next.frame.streamID else { return (false, false, false) }
-                withExtendedLifetime(next.frame.pixels) {
-                    CATransaction.begin()
-                    CATransaction.setDisableActions(true)
-                    mirrorLayer.contents = surface
-                    CATransaction.commit()
-                    CATransaction.flush()
-                }
-                let becameFirst = !state.firstFrameDelivered
-                if becameFirst { state.firstFrameDelivered = true }
-                return (true, becameFirst, state.hasOnFrame)
+            let streamID = next.frame.streamID
+            guard renderState.withLock({ $0.streamID == streamID }) else { continue }
+            withExtendedLifetime(next.frame.pixels) { setMirrorContents(surface) }
+            let becameFirst = renderState.withLock { state in
+                guard state.streamID == streamID, !state.firstFrameDelivered else { return false }
+                state.firstFrameDelivered = true
+                return true
             }
-            guard outcome.committed else { continue }
             let delay = ProcessInfo.processInfo.systemUptime - next.frame.receivedAt
             measurements.withLock {
                 $0.presented += 1
                 $0.maxQueueDelay = max($0.maxQueueDelay, delay)
             }
-            if outcome.becameFirst || outcome.notifyFrame {
-                let streamID = next.frame.streamID
+            if becameFirst {
                 let firstTime = ProcessInfo.processInfo.systemUptime
                 DispatchQueue.main.async { [weak self] in
                     guard let self, let current = self.stream, ObjectIdentifier(current) == streamID, !self.tornDown else { return }
-                    if outcome.becameFirst, !self.hasFrame {
+                    if !self.hasFrame {
                         self.firstFrame = (streamID, firstTime)
                         DemoLog.shared.line(L("%@ 已收到 %@×%@ 像素首帧（%@×）。", String(describing: self.name), String(describing: width), String(describing: height), String(describing: self.scale)))
-                    }
-                    if outcome.notifyFrame {
-                        self.onFrame?()
                     }
                 }
             }
         }
+    }
+
+    nonisolated private func setMirrorContents(_ surface: IOSurface?) {
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        mirrorLayer.contents = surface
+        CATransaction.commit()
+        CATransaction.flush()
     }
 
     private func applyInitialMode(to display: CGVirtualDisplay) throws {
@@ -559,6 +530,7 @@ final class ParkedDisplayChanges: NSObject, SCStreamOutput, SCStreamDelegate {
     private let displayID: CGDirectDisplayID
     private let onChange: () -> Void
     private var startTask: Task<Void, Never>?
+    private var generation: UInt64 = 0
     private var stream: SCStream?
     private(set) var isRunning = false
     private static let queue = DispatchQueue(label: "dev.cmkk.panelet.parked-display", qos: .utility)
@@ -570,9 +542,10 @@ final class ParkedDisplayChanges: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func start() {
         guard startTask == nil, stream == nil else { return }
+        let generation = self.generation
         startTask = Task { [weak self] in
             guard let self else { return }
-            defer { self.startTask = nil }
+            defer { if self.generation == generation { self.startTask = nil } }
             do {
                 let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
                 try Task.checkCancellation()
@@ -607,13 +580,15 @@ final class ParkedDisplayChanges: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.isRunning = true
                 self.onChange()
             } catch {
-                self.stream = nil
+                if self.generation == generation { self.stream = nil }
             }
         }
     }
 
     func stop() {
+        generation &+= 1
         startTask?.cancel()
+        startTask = nil
         let activeStream = stream
         stream = nil
         isRunning = false

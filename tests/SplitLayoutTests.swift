@@ -103,9 +103,25 @@ struct SplitLayoutTests {
         )
         let lowerHalf = portraitSplit[335]!
         let parkedPhysical = portraitSplit[2]!
-        let sharedBottomSpan = min(lowerHalf.maxX, parkedPhysical.maxX) - max(lowerHalf.minX, parkedPhysical.minX)
-        assert(parkedPhysical.intersection(lowerHalf).isEmpty && sharedBottomSpan <= 1,
-               "Parked physical display must overlap at most 1pt with the bottom edge so pointer cannot slip through")
+        assert(parkedPhysical.intersection(lowerHalf).size == CGSize(width: 1, height: 0))
+
+        func checkParking(_ parked: CGRect, beside displays: [CGRect]) {
+            let contacts = displays.map { parked.intersection($0) }.filter { !$0.isNull }
+            assert(contacts.allSatisfy { $0.isEmpty && max($0.width, $0.height) <= 1 },
+                   "A parked display must not open a wide cursor crossing on a neighboring screen")
+            assert(contacts.contains { max($0.width, $0.height) == 1 }, "Parking must keep the display topology connected")
+        }
+        let leftPortrait = CGRect(x: -1296, y: -400, width: 1296, height: 2304)
+        let main = CGRect(x: 0, y: 0, width: 2048, height: 1152)
+        let leftHalves: [CGDirectDisplayID: CGRect] = [331: portraitHalves[334]!, 332: portraitHalves[335]!]
+        let doubleSplit = DisplayScanner.splitDisplayFrames(physical: [1: leftPortrait, 3: main, 2: rightPortrait],
+                                                           main: 3, halves: [1: leftHalves, 2: portraitHalves])
+        for id: CGDirectDisplayID in [1, 2] {
+            checkParking(doubleSplit[id]!, beside: doubleSplit.filter { $0.key != id }.map(\.value))
+        }
+        let alignedNeighbor = CGRect(x: 0, y: -400, width: 2048, height: 2304)
+        let aligned = [leftPortrait, alignedNeighbor]
+        checkParking(DisplayScanner.parkingFrame(size: leftPortrait.size, beside: leftPortrait, avoiding: aligned), beside: aligned)
 
         print("SplitLayout: split geometry, coordinate wrappers, topology parking and restoration passed")
     }

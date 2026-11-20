@@ -128,11 +128,12 @@ final class MouseRouter {
         }
 
         func allows(_ panel: Parking, at point: CGPoint, includeControls: Bool = true,
-                    hovering: Bool = false, retainPhysical: Bool = false) -> Bool {
+                    hovering: Bool = false, retainPhysical: Bool = false, scrolling: Bool = false) -> Bool {
             guard let display = panel.displayID else { return false }
             if capture.hasSelector(on: display) { return true }
             guard includeControls else { return false }
             if capture.controls[display]?.contains(where: { $0.contains(point) }) == true { return true }
+            if scrolling { return retainPhysical }
             if let liveHitTest, let mirror = panel.mirrors.first(where: { $0.frame.contains(point) }) {
                 if hovering { return retainPhysical }
                 if let answer = liveHitTest(point, mirror) { return answer }
@@ -165,11 +166,13 @@ final class MouseRouter {
             return destination
         }
 
-        mutating func destination(for point: CGPoint, button: ButtonChange? = nil, passiveMotion: Bool = false, delta: CGVector = .zero,
+        mutating func destination(for point: CGPoint, button: ButtonChange? = nil, passiveMotion: Bool = false,
+                                  scrolling: Bool = false, delta: CGVector = .zero,
                                   timestamp: CGEventTimestamp = 0) -> CGPoint? {
             recordInput(timestamp)
-            invalidateHover()
-            let destination = routePoint(point, delta: delta, hovering: passiveMotion, timestamp: timestamp)
+            let destination = routePoint(point, delta: delta, hovering: passiveMotion, timestamp: timestamp, scrolling: scrolling)
+            // A stationary wheel gesture must let the pending hover hit test finish.
+            if !scrolling || lastPoint != (destination ?? point) { invalidateHover() }
             lastPoint = destination ?? point
             switch button {
             case .down(let button):
@@ -229,7 +232,8 @@ final class MouseRouter {
             suppressPixPinGesture = false
         }
 
-        private func routePoint(_ point: CGPoint, delta: CGVector, hovering: Bool, timestamp: CGEventTimestamp) -> CGPoint? {
+        private func routePoint(_ point: CGPoint, delta: CGVector, hovering: Bool, timestamp: CGEventTimestamp,
+                                scrolling: Bool = false) -> CGPoint? {
             // Keep a press and its release on the same surface even if a popup opens,
             // closes, or moves while the button is held.
             if let gesturePanel, let panel = parked.first(where: { $0.displayID == gesturePanel }) {
@@ -249,8 +253,12 @@ final class MouseRouter {
                 return previousPanel.physical.contains(point) ? nil : Self.clamp(point, to: previousPanel.physical)
             }
             if let parking = parked.first(where: {
-                $0.physical.contains(point) && !allows($0, at: point, includeControls: mayEnterPanel,
-                           hovering: hovering, retainPhysical: previousPanel?.displayID == $0.displayID)
+                guard $0.physical.contains(point) else { return false }
+                let nativePopup = scrolling && $0.displayID.flatMap { capture.nativeWindows[$0] }?
+                    .contains(where: { $0.frame.contains(point) }) == true
+                let retainPhysical = nativePopup || previousPanel?.displayID == $0.displayID
+                return !allows($0, at: point, includeControls: mayEnterPanel,
+                               hovering: hovering, retainPhysical: retainPhysical, scrolling: scrolling)
             }) {
                 if let id = parking.displayID, previousPanel?.displayID == id {
                     destination = parking.pointOnDesktop(point)
@@ -259,7 +267,8 @@ final class MouseRouter {
                     destination = Self.clamp(point, to: previous)
                 }
             } else if let parking = parked.first(where: {
-                $0.desktop.contains(point) && allows($0, at: $0.pointOnPhysical(point), includeControls: mayEnterPanel, hovering: hovering)
+                $0.desktop.contains(point) && allows($0, at: $0.pointOnPhysical(point), includeControls: mayEnterPanel,
+                                                     hovering: hovering, scrolling: scrolling)
             }) {
                 // A drag reaching the edge of the physical panel must not jump to the far side
                 // when WindowServer crosses into one of its virtual displays.
@@ -317,15 +326,22 @@ final class MouseRouter {
     private let screenshotKeys = OSAllocatedUnfairLock(initialState: PhysicalScreenScreenshot.KeyState())
     private let runLoopState = OSAllocatedUnfairLock(initialState: RunLoopState())
     private let captureApps = CaptureAppMonitor()
-    var onPossibleCaptureShortcut: (() -> Void)?
+    private let onPossibleCaptureShortcut: (@MainActor @Sendable () -> Void)?
+    private var nextCaptureShortcutAt: UInt64 = 0 // Event tap thread only.
     private var tap: CFMachPort?
     private var motionTap: CFMachPort?
 
-    private static func isRecent(_ timestamp: CGEventTimestamp, at now: UInt64) -> Bool {
-        timestamp <= now && now - timestamp <= 45_000_000
+    init(onPossibleCaptureShortcut: (@MainActor @Sendable () -> Void)? = nil) {
+        self.onPossibleCaptureShortcut = onPossibleCaptureShortcut
     }
 
+    private static let eventFreshnessNanoseconds: UInt64 = 45_000_000
     private static let hoverSettleNanoseconds: UInt64 = 40_000_000
+
+    private static func isRecent(_ timestamp: CGEventTimestamp, at now: UInt64,
+                                 maxAge: UInt64 = eventFreshnessNanoseconds) -> Bool {
+        timestamp <= now && now - timestamp <= maxAge
+    }
 
     var activeSelectorPIDs: Set<pid_t> {
         captureApps.activeSelectorPIDs
@@ -448,8 +464,9 @@ final class MouseRouter {
     @discardableResult
     private func moveCursor(from source: CGPoint, to destination: CGPoint, revision: UInt64,
                             timestamp: CGEventTimestamp, enforceSourceProximity: Bool) -> Bool {
+        let maxAge = Self.eventFreshnessNanoseconds + (enforceSourceProximity ? Self.hoverSettleNanoseconds : 0)
         guard routing.withLock({ $0.acceptsMove(revision: revision) }),
-              Self.isRecent(timestamp, at: DispatchTime.now().uptimeNanoseconds) else { return false }
+              Self.isRecent(timestamp, at: DispatchTime.now().uptimeNanoseconds, maxAge: maxAge) else { return false }
         if enforceSourceProximity {
             guard let point = CGEvent(source: nil)?.location,
                   abs(point.x - source.x) <= 1, abs(point.y - source.y) <= 1,
@@ -459,7 +476,7 @@ final class MouseRouter {
         }
         let applied = routing.withLock { route -> Bool in
             guard route.acceptsMove(revision: revision),
-                  Self.isRecent(timestamp, at: DispatchTime.now().uptimeNanoseconds),
+                  Self.isRecent(timestamp, at: DispatchTime.now().uptimeNanoseconds, maxAge: maxAge),
                   CGWarpMouseCursorPosition(destination) == .success else { return false }
             route.lastPoint = destination
             return true
@@ -684,15 +701,19 @@ final class MouseRouter {
     }
 
     private func notifyCaptureShortcutIfNeeded(type: CGEventType, event: CGEvent) {
-        guard event.getIntegerValueField(.keyboardEventAutorepeat) == 0 else { return }
-        let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
-        let modifierMask: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate, .maskSecondaryFn]
-        let isEscape = keyCode == 53
-        let hasHotkeyModifier = !event.flags.intersection(modifierMask).isEmpty
-        guard isEscape || (type == .keyDown && hasHotkeyModifier) else { return }
-        guard isEscape || !captureApps.activeSelectorPIDs.isEmpty else { return }
-        guard let handler = onPossibleCaptureShortcut else { return }
-        DispatchQueue.main.async(execute: handler)
+        guard type == .keyDown, event.getIntegerValueField(.keyboardEventAutorepeat) == 0,
+              let handler = onPossibleCaptureShortcut else { return }
+        if event.getIntegerValueField(.keyboardEventKeycode) == 53 {
+            guard routing.withLock({ !$0.capture.displays.isEmpty || !$0.capture.pixPinDisplays.isEmpty
+                || !$0.capture.controls.isEmpty }) else { return }
+        } else {
+            let modifierMask: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate, .maskSecondaryFn]
+            let now = DispatchTime.now().uptimeNanoseconds
+            guard now >= nextCaptureShortcutAt, !event.flags.intersection(modifierMask).isEmpty,
+                  !captureApps.activeSelectorPIDs.isEmpty else { return }
+            nextCaptureShortcutAt = now + 500_000_000
+        }
+        DispatchQueue.main.async { handler() }
     }
 
     private func handlePixPinPress(_ event: CGEvent, timestamp: CGEventTimestamp) -> Bool? {
@@ -755,14 +776,16 @@ final class MouseRouter {
         }
         let (destination, work) = routing.withLock { route -> (CGPoint?, UInt64?) in
             let moving = type == .mouseMoved
+            let scrolling = type == .scrollWheel
+            let previousPoint = route.lastPoint
             let passive = Self.isPassiveRoutingEvent(type)
             if moving, (!route.pressedButtons.isEmpty || route.gesturePanel != nil), !Self.isAnyMouseButtonPressed() {
                 route.resetGesture()
             }
             let delta = moving && !route.capture.pixPinDisplays.isEmpty ? Self.mouseDelta(event) : .zero
             let destination = route.destination(for: event.location, button: button,
-                                                passiveMotion: passive, delta: delta, timestamp: timestamp)
-            let work = moving
+                                                passiveMotion: passive, scrolling: scrolling, delta: delta, timestamp: timestamp)
+            let work = (moving || (scrolling && route.lastPoint != previousPoint))
                 ? route.scheduleHover(at: route.lastPoint, now: DispatchTime.now().uptimeNanoseconds) : nil
             return (destination, work)
         }

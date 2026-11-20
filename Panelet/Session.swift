@@ -31,11 +31,13 @@ final class SplitSessions {
     private let popupValidation = CaptureOverlays.PopupValidation()
     private var captureOverlayTimer: Timer?
     private var captureOverlayTask: Task<Void, Never>?
+    private var captureShortcutFollowUp: Task<Void, Never>?
     private var captureOverlayPending = false
     private var captureOverlayImmediate = false
     private var captureRescuePending = false
     private var captureUIVisible = false
     private var nextCaptureOverlayCheck = ContinuousClock.now
+    private var nextFastCaptureOverlayCheck = ContinuousClock.now
     private var nextUnobservedRescue = ContinuousClock.now
     private var captureOverlayQueryInFlight = false
     private var captureOverlayRevision: UInt64 = 0
@@ -53,7 +55,7 @@ final class SplitSessions {
     private var journalBackoff = RecoveryBackoff()
     private var journalCanAutoRetry = false
     private var autoRecoveryTask: Task<Void, Never>?
-    private(set) var autoRetryingRecovery = false
+    var autoRetryingRecovery: Bool { autoRecoveryTask != nil }
     private var changingDisplays = false
     private var screenObserver: NSObjectProtocol?
     private var powerObservers: [NSObjectProtocol] = []
@@ -61,7 +63,7 @@ final class SplitSessions {
     private var screensSleeping = false
     private var sessionInactive = false
     private var inactiveSince: ContinuousClock.Instant?
-    private var wakeRefreshTask: Task<Void, Never>?
+    private var staleCaptureWakeTime: ContinuousClock.Instant?
     private var wakeReadyAt = ContinuousClock.now
     fileprivate var monitoringAllowed: Bool { !sleeping && !screensSleeping && !sessionInactive && ContinuousClock.now >= wakeReadyAt }
     private lazy var captureWindowEvents = CaptureWindowEvents { [weak self] needsRescue in
@@ -164,6 +166,7 @@ final class SplitSessions {
 
     func recoverPreviousSession() async {
         guard sessions.isEmpty, !recovering else { return }
+        cancelPendingAutoRecovery()
         recovering = true
         defer {
             recovering = false
@@ -223,9 +226,7 @@ final class SplitSessions {
     }
 
     func resetAutoRecovery() {
-        autoRecoveryTask?.cancel()
-        autoRecoveryTask = nil
-        autoRetryingRecovery = false
+        cancelPendingAutoRecovery()
         sessionBackoffs.removeAll()
         journalBackoff.reset()
     }
@@ -330,18 +331,22 @@ final class SplitSessions {
 
     func endQuick(_ id: CGDirectDisplayID) {
         guard !busy, let session = sessions[id], session.active || session.needsRecovery, session.hasQuick else { return }
-        autoRecoveryTask?.cancel()
-        autoRecoveryTask = nil
+        cancelPendingAutoRecovery()
         transition = session
         session.endQuick()
     }
 
     func join(_ id: CGDirectDisplayID) {
         guard !busy, let session = sessions[id], session.active || session.needsRecovery else { return }
-        autoRecoveryTask?.cancel()
-        autoRecoveryTask = nil
+        cancelPendingAutoRecovery()
         transition = session
         session.join()
+    }
+
+    func retrySession(_ id: CGDirectDisplayID) {
+        guard let session = sessions[id], session.needsRecovery else { return }
+        if session.retryQuickOnly { endQuick(id) }
+        else { join(id) }
     }
 
     func cancelPreparation() { transition?.cancelPreparation() }
@@ -357,7 +362,7 @@ final class SplitSessions {
     }
 
     func checkActive() {
-        guard !busy, monitoringAllowed else { return }
+        guard !busy, !changingDisplays, monitoringAllowed else { return }
         if let id = failedSessions.keys.first, let error = failedSessions.removeValue(forKey: id), let session = sessions[id] {
             fail(session, error: error)
             return
@@ -391,6 +396,10 @@ final class SplitSessions {
             }
         }
         guard layoutChangedAt.isEmpty else { return }
+        if let wokeAt = staleCaptureWakeTime {
+            staleCaptureWakeTime = nil
+            refreshStaleCapturesAfterWake(wokeAt: wokeAt)
+        }
         if WindowServerHitTest.supportsLiveRouting, .now >= nextUnobservedRescue,
            active.contains(where: { !$0.needsRecovery && !$0.observesParkedDisplay }) {
             nextUnobservedRescue = .now + .seconds(4)
@@ -449,11 +458,11 @@ final class SplitSessions {
             let owned = session.managedWindows
             for other in active where other !== session { other.releaseWindows(owned) }
         }
-        if !session.needsRecovery {
-            sessionBackoffs[session.targetID] = nil
+        if session.idle || session.active {
+            if !session.needsRecovery { sessionBackoffs[session.targetID] = nil }
+            if transition === session { transition = nil }
         }
         if session.idle && !session.needsRecovery { sessions[session.targetID] = nil }
-        if session.idle || session.active { transition = nil }
         layoutChangedAt.removeAll()
         let hasRoutedDisplays = sessions.values.contains { $0.isParkingPhysical && $0.hasHalves } || !standby.isEmpty
         if !hasRoutedDisplays {
@@ -475,86 +484,48 @@ final class SplitSessions {
     }
 
     private func updateAutoRecoverySchedule() {
-        if busy { return }
-        if let session = sessions.values.sorted(by: { $0.targetID < $1.targetID }).first(where: \.needsRecovery) {
-            guard Permissions.splitProblem == nil else {
-                cancelPendingAutoRecovery()
-                return
-            }
-            if autoRecoveryTask != nil { return }
-            var backoff = sessionBackoffs[session.targetID] ?? RecoveryBackoff()
-            guard let delayMs = backoff.nextDelayMilliseconds() else {
-                autoRetryingRecovery = false
-                return
-            }
-            sessionBackoffs[session.targetID] = backoff
-            autoRetryingRecovery = true
-            let secondsText = String(format: "%.1f", Double(delayMs) / 1000.0)
-            DemoLog.shared.line(L("将在 %@ 秒后自动重试恢复窗口（第 %@/%@ 次）…", secondsText, String(backoff.attempt), String(backoff.maxAttempts)))
-            let targetID = session.targetID
-            autoRecoveryTask = Task { [weak self] in
-                do {
-                    try await Task.sleep(for: .milliseconds(delayMs))
-                    while let self, !Task.isCancelled, (self.sleeping || self.screensSleeping || self.sessionInactive) {
-                        try await Task.sleep(for: .milliseconds(250))
-                    }
-                } catch { return }
-                guard !Task.isCancelled, let self else { return }
-                self.autoRecoveryTask = nil
-                guard !self.busy, Permissions.splitProblem == nil,
-                      let pending = self.sessions[targetID], pending.needsRecovery else {
-                    self.updateAutoRecoverySchedule()
-                    self.onRecoveryStateChange?()
+        guard !busy, autoRecoveryTask == nil else { return }
+        let session = sessions.values
+            .filter { $0.needsRecovery && sessionBackoffs[$0.targetID]?.canRetry != false }
+            .min { $0.targetID < $1.targetID }
+        let targetID = session?.targetID
+        guard session != nil || (sessions.isEmpty && recoveryProblem != nil && journalCanAutoRetry),
+              Permissions.splitProblem == nil else { return }
+
+        var backoff = targetID.map { sessionBackoffs[$0] ?? RecoveryBackoff() } ?? journalBackoff
+        guard let delayMs = backoff.nextDelayMilliseconds() else { return }
+        let secondsText = String(format: "%.1f", Double(delayMs) / 1000.0)
+        DemoLog.shared.line(L("将在 %@ 秒后自动重试恢复窗口（第 %@/%@ 次）…", secondsText, String(backoff.attempt), String(backoff.maxAttempts)))
+        autoRecoveryTask = Task { [weak self, weak session] in
+            do {
+                try await Task.sleep(for: .milliseconds(delayMs))
+                while let self, !self.monitoringAllowed || self.changingDisplays {
+                    try await Task.sleep(for: .milliseconds(250))
+                }
+            } catch { return }
+            guard !Task.isCancelled, let self else { return }
+            self.autoRecoveryTask = nil
+            if !self.busy, Permissions.splitProblem == nil {
+                // Count the retry only when it starts, so a manual operation can cancel the wait.
+                if let session, let targetID, self.sessions[targetID] === session, session.needsRecovery {
+                    self.sessionBackoffs[targetID] = backoff
+                    self.retrySession(targetID)
                     return
                 }
-                if pending.active && pending.mode == .desktop && pending.hasQuick {
-                    self.endQuick(targetID)
-                } else {
-                    self.join(targetID)
-                }
-            }
-            return
-        }
-
-        if recoveryProblem != nil && journalCanAutoRetry && sessions.isEmpty {
-            guard Permissions.splitProblem == nil else {
-                cancelPendingAutoRecovery()
-                return
-            }
-            if autoRecoveryTask != nil { return }
-            guard let delayMs = journalBackoff.nextDelayMilliseconds() else {
-                autoRetryingRecovery = false
-                return
-            }
-            autoRetryingRecovery = true
-            let secondsText = String(format: "%.1f", Double(delayMs) / 1000.0)
-            DemoLog.shared.line(L("将在 %@ 秒后自动重试恢复窗口（第 %@/%@ 次）…", secondsText, String(journalBackoff.attempt), String(journalBackoff.maxAttempts)))
-            autoRecoveryTask = Task { [weak self] in
-                do {
-                    try await Task.sleep(for: .milliseconds(delayMs))
-                    while let self, !Task.isCancelled, (self.sleeping || self.screensSleeping || self.sessionInactive) {
-                        try await Task.sleep(for: .milliseconds(250))
-                    }
-                } catch { return }
-                guard !Task.isCancelled, let self else { return }
-                self.autoRecoveryTask = nil
-                guard !self.busy, self.recoveryProblem != nil, self.sessions.isEmpty else {
-                    self.updateAutoRecoverySchedule()
-                    self.onRecoveryStateChange?()
+                if targetID == nil, self.sessions.isEmpty, self.recoveryProblem != nil, self.journalCanAutoRetry {
+                    self.journalBackoff = backoff
+                    await self.recoverPreviousSession()
                     return
                 }
-                await self.recoverPreviousSession()
             }
-            return
+            self.updateAutoRecoverySchedule()
+            self.onRecoveryStateChange?()
         }
-
-        cancelPendingAutoRecovery()
     }
 
     private func cancelPendingAutoRecovery() {
         autoRecoveryTask?.cancel()
         autoRecoveryTask = nil
-        autoRetryingRecovery = false
     }
 
     fileprivate func stopRecovering(_ halves: [HalfScreen]) -> [Task<Void, Never>] {
@@ -665,14 +636,7 @@ final class SplitSessions {
         } + hidden
         guard layout != routedLayout || parking != routedParking || router?.isEnabled != true else { return }
         captureOverlayRevision &+= 1
-        let input = router ?? MouseRouter()
-        input.onPossibleCaptureShortcut = { [weak self] in
-            self?.requestCaptureOverlayUpdate(immediate: true)
-            Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .milliseconds(110))
-                self?.requestCaptureOverlayUpdate(immediate: true)
-            }
-        }
+        let input = router ?? MouseRouter { [weak self] in self?.captureShortcutDetected() }
         input.update(parked: parking, screens: layout.filter { !parked.contains($0.key) }.map(\.value))
         if router == nil {
             guard input.start() else { throw DemoError(L("鼠标事件监听启动失败。请检查辅助功能权限并重新启动。")) }
@@ -692,11 +656,23 @@ final class SplitSessions {
         requestCaptureOverlayUpdate(rescue: true)
     }
 
+    private func captureShortcutDetected() {
+        guard router != nil, monitoringAllowed else { return }
+        requestCaptureOverlayUpdate(immediate: true)
+        guard captureShortcutFollowUp == nil else { return }
+        captureShortcutFollowUp = Task { [weak self] in
+            do { try await Task.sleep(for: .milliseconds(110)) } catch { return }
+            guard !Task.isCancelled, let self else { return }
+            self.captureShortcutFollowUp = nil
+            self.requestCaptureOverlayUpdate(immediate: true)
+        }
+    }
+
     fileprivate func requestCaptureOverlayUpdate(rescue: Bool = false, immediate: Bool = false) {
         guard router != nil, WindowServerHitTest.supportsLiveRouting else { return }
         captureOverlayPending = true
         captureRescuePending = captureRescuePending || rescue
-        if immediate {
+        if immediate && !captureOverlayImmediate {
             captureOverlayImmediate = true
             captureOverlayTask?.cancel()
             captureOverlayTask = nil
@@ -714,7 +690,7 @@ final class SplitSessions {
               !sleeping, !screensSleeping, !sessionInactive else { return }
         let deadline: ContinuousClock.Instant
         if captureOverlayImmediate {
-            deadline = max(wakeReadyAt, .now + .milliseconds(25))
+            deadline = max(nextFastCaptureOverlayCheck, wakeReadyAt, .now + .milliseconds(25))
         } else {
             deadline = max(nextCaptureOverlayCheck, wakeReadyAt, .now + .milliseconds(40))
         }
@@ -730,33 +706,25 @@ final class SplitSessions {
         updateHealthTimer()
         captureOverlayTask?.cancel()
         captureOverlayTask = nil
-        wakeRefreshTask?.cancel()
-        wakeRefreshTask = nil
         if sleeping || screensSleeping || sessionInactive {
             if inactiveSince == nil { inactiveSince = .now }
+            captureShortcutFollowUp?.cancel()
+            captureShortcutFollowUp = nil
             for session in active { session.pauseParkedObservation() }
             captureUIVisible = false
             setCaptureRouting(.init())
             router?.configureScreenshots(enabled: false)
         } else {
-            let sleptLong = inactiveSince.map { $0.duration(to: .now) >= .seconds(300) } ?? false
+            if let inactiveSince, inactiveSince.duration(to: .now) >= .seconds(300) {
+                staleCaptureWakeTime = .now
+            }
             inactiveSince = nil
             for session in active { session.resumeParkedObservation() }
             requestCaptureOverlayUpdate(rescue: true)
-            if sleptLong {
-                let wokeAt = ContinuousClock.now
-                let deadline = wakeReadyAt
-                wakeRefreshTask = Task { [weak self] in
-                    do { try await ContinuousClock().sleep(until: deadline) } catch { return }
-                    guard !Task.isCancelled, let self, self.monitoringAllowed else { return }
-                    self.refreshStaleCapturesAfterWake(wokeAt: wokeAt)
-                }
-            }
         }
     }
 
     private func refreshStaleCapturesAfterWake(wokeAt: ContinuousClock.Instant) {
-        guard !busy, !changingDisplays, monitoringAllowed else { return }
         for session in active where !session.needsRecovery {
             for half in session.halves {
                 guard captureRecovery[half.virtualID] == nil,
@@ -769,12 +737,10 @@ final class SplitSessions {
     private func refreshScreenshotShortcuts() {
         guard router != nil, monitoringAllowed, .now >= nextScreenshotShortcutRead else { return }
         nextScreenshotShortcutRead = .now + .seconds(30)
-        let revision = captureOverlayRevision
         captureOverlayQueue.async { [weak self] in
             let shortcuts = PhysicalScreenScreenshot.Shortcuts.current()
             DispatchQueue.main.async { [weak self] in
-                guard let self, self.captureOverlayRevision == revision else { return }
-                self.router?.configureScreenshots(shortcuts: shortcuts)
+                self?.router?.configureScreenshots(shortcuts: shortcuts)
             }
         }
     }
@@ -791,7 +757,9 @@ final class SplitSessions {
         guard !captureOverlayQueryInFlight else { return }
         captureOverlayQueryInFlight = true
         captureOverlayImmediate = false
-        nextCaptureOverlayCheck = .now + .milliseconds(captureUIVisible ? 120 : 500)
+        let now = ContinuousClock.now
+        nextFastCaptureOverlayCheck = now + .milliseconds(120)
+        nextCaptureOverlayCheck = captureUIVisible ? nextFastCaptureOverlayCheck : now + .milliseconds(500)
         let revision = captureOverlayRevision
         let rescueTargets: Set<CGDirectDisplayID>
         if !busy && layoutChangedAt.isEmpty {
@@ -919,13 +887,16 @@ final class SplitSessions {
         captureOverlayTimer = nil
         captureOverlayTask?.cancel()
         captureOverlayTask = nil
-        wakeRefreshTask?.cancel()
-        wakeRefreshTask = nil
+        captureShortcutFollowUp?.cancel()
+        captureShortcutFollowUp = nil
+        staleCaptureWakeTime = nil
         captureWindowEvents.stop()
         captureOverlayPending = false
+        captureOverlayImmediate = false
         captureRescuePending = false
         captureUIVisible = false
         nextCaptureOverlayCheck = .now
+        nextFastCaptureOverlayCheck = .now
         nextUnobservedRescue = .now
         captureOverlayRevision &+= 1
         captureOverlayAnchor = nil
@@ -1005,6 +976,8 @@ final class Session {
     var captureStatistics: [String] { halves.map(\.statistics) }
     private(set) var failed = false
     private(set) var needsRecovery = false
+    fileprivate private(set) var retryQuickOnly = false
+    private var collectedWindowsForJoin = false
     var idle: Bool { phase == .idle }
     var active: Bool { phase == .split }
     var preparing: Bool { phase == .preparing }
@@ -1267,10 +1240,6 @@ final class Session {
             }
         }
         for half in halves {
-            // Only fall back to frame-driven overlay polling when live Accessibility/SkyLight routing is unavailable.
-            if !WindowServerHitTest.supportsLiveRouting {
-                half.onFrame = { [weak coordinator] in coordinator?.requestCaptureOverlayUpdate() }
-            }
             half.onFailure = { [weak self, weak half] error in
                 guard let self, let half else { return }
                 self.coordinator.recoverCapture(half, in: self,
@@ -1377,6 +1346,7 @@ final class Session {
     private func finish(status: String, joining: Bool = false, quickOnly: Bool = false) {
         guard canJoin else { return }
         needsRecovery = false
+        retryQuickOnly = quickOnly
         exitPolicy = QuickExitPolicy()
         let activeTasks = tasks.cancelAndTakeForTeardown()
         let recoveries = quickOnly ? [] : coordinator.stopRecovering(halves)
@@ -1419,9 +1389,11 @@ final class Session {
             }
             if let placement {
                 let protected = coordinator.active.flatMap(\.managedWindows)
-                if joining {
+                // Partially restored windows already reflect our earlier AX writes.
+                if joining, !halves.isEmpty, !collectedWindowsForJoin {
                     await placement.collectRemainingWindows(on: halves, reserved: protected)
                     if mode == .desktop { await placement.preserveDesktopChanges(on: halves) }
+                    collectedWindowsForJoin = true
                     coordinator.updateRecoveryCheckpoint()
                 }
                 guard await Self.leaveFullScreenWithBackoff(placement, on: halves, includeSelected: activeTasks.fullScreen != nil || !halves.isEmpty) else {

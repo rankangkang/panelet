@@ -47,6 +47,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private let languagePicker = NSPopUpButton()
     private var restoringAll = false
     private var restoreAttempts = Set<CGDirectDisplayID>()
+    private var restoreJournalAttempted = false
     private var reportWindow: NSWindow?
     private var reportText = ""
     private var helpWindow: NSWindow?
@@ -138,9 +139,11 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         splits.onRecoveryStateChange = { [weak self] in
             guard let self else { return }
             self.refresh()
-            if self.restoringAll && !self.splits.busy { self.continueRestoringAll() }
-            if self.closing && !self.splits.busy && !self.confirming { self.finishQuit() }
-            if !self.closing && !self.restoringAll && self.splits.recoveryProblem != nil && !self.splits.autoRetryingRecovery && self.operationsAvailable {
+            if self.restoringAll {
+                self.continueRestoringAll()
+            } else if self.closing, !self.splits.busy {
+                self.finishQuit()
+            } else if self.splits.recoveryProblem != nil, !self.splits.autoRetryingRecovery, self.operationsAvailable {
                 self.showAdvanced()
             }
         }
@@ -1137,9 +1140,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
         presentConfirmation(alert, action: relaunch ? L("合并并重新启动") : L("合并并退出")) { [weak self] in
             guard let self else { return }
             self.closing = true
+            self.restoringAll = false
             self.shouldRelaunch = relaunch
             self.quick.hide()
-            self.splits.resetAutoRecovery()
             self.quitDeadline?.cancel()
             self.quitDeadline = Task { [weak self] in
                 do { try await Task.sleep(for: .seconds(25)) } catch { return }
@@ -1198,8 +1201,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             return
         }
         guard let session = splits.sessions.values.first(where: \.needsRecovery) else { return }
-        if session.active && session.mode == .desktop && session.hasQuick { splits.endQuick(session.targetID) }
-        else { splits.join(session.targetID) }
+        splits.retrySession(session.targetID)
     }
 
     @objc private func askScreenRecording() {
@@ -1286,6 +1288,7 @@ private extension AppController {
             self.quick.hide()
             self.restoringAll = true
             self.restoreAttempts.removeAll()
+            self.restoreJournalAttempted = false
             self.splits.resetAutoRecovery()
             self.splits.cancelPreparation()
             self.continueRestoringAll()
@@ -1293,26 +1296,22 @@ private extension AppController {
     }
 
     func continueRestoringAll() {
-        guard restoringAll, !splits.busy else { return }
+        guard restoringAll, !splits.busy, !splits.autoRetryingRecovery else { return }
         if let session = splits.sessions.values.sorted(by: { $0.targetID < $1.targetID })
             .first(where: { !restoreAttempts.contains($0.targetID) && ($0.active || $0.needsRecovery) }) {
             restoreAttempts.insert(session.targetID)
             splits.join(session.targetID)
             return
         }
-        if splits.autoRetryingRecovery { return }
-        if splits.recoveryProblem != nil {
-            Task {
-                await splits.recoverPreviousSession()
-                if !splits.autoRetryingRecovery { finishRestoringAll() }
-            }
+        if splits.sessions.isEmpty, splits.recoveryProblem != nil, !restoreJournalAttempted {
+            restoreJournalAttempted = true
+            Task { await splits.recoverPreviousSession() }
         } else { finishRestoringAll() }
     }
 
     func finishRestoringAll() {
         restoringAll = false
-        let remaining = splits.sessions.values.filter(\.needsRecovery).count
-        DemoLog.shared.line(remaining == 0 && splits.recoveryProblem == nil
+        DemoLog.shared.line(splits.sessions.isEmpty && splits.recoveryProblem == nil
             ? L("已完成全部显示器恢复。")
             : L("仍有恢复项目未完成。已保留恢复记录，请在诊断页重试。"))
         refresh()

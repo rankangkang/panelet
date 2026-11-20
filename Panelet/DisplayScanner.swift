@@ -107,18 +107,26 @@ enum DisplayScanner {
     }
 
     static func parkingFrame(size: CGSize, beside desktop: CGRect, avoiding occupied: [CGRect]) -> CGRect {
-        // Overlap by only 1 point near a corner so WindowServer keeps the display topology
-        // connected while leaving virtually the entire visible edge as a solid hardware stop.
+        let left = desktop.minX - size.width + 1
+        let right = desktop.maxX - 1
+        let top = desktop.minY - size.height + 1
+        let bottom = desktop.maxY - 1
         let candidates = [
-            CGPoint(x: max(desktop.minX, desktop.maxX - 1), y: desktop.maxY),
-            CGPoint(x: desktop.maxX, y: max(desktop.minY, desktop.maxY - 1)),
-            CGPoint(x: desktop.minX, y: desktop.maxY),
-            CGPoint(x: desktop.maxX, y: desktop.minY),
-            CGPoint(x: desktop.minX, y: desktop.minY - size.height),
-            CGPoint(x: desktop.minX - size.width, y: desktop.minY),
+            CGPoint(x: right, y: desktop.maxY),
+            CGPoint(x: desktop.maxX, y: bottom),
+            CGPoint(x: left, y: desktop.maxY),
+            CGPoint(x: desktop.minX - size.width, y: bottom),
+            CGPoint(x: right, y: desktop.minY - size.height),
+            CGPoint(x: desktop.maxX, y: top),
+            CGPoint(x: left, y: desktop.minY - size.height),
+            CGPoint(x: desktop.minX - size.width, y: top),
         ]
+        // A corner of the anchor can still share an entire edge with a neighboring display.
         if let frame = candidates.map({ CGRect(origin: $0, size: size) }).first(where: { candidate in
-            occupied.allSatisfy { $0.intersection(candidate).isEmpty }
+            occupied.allSatisfy { other in
+                let intersection = other.intersection(candidate)
+                return intersection.isNull || (intersection.isEmpty && max(intersection.width, intersection.height) <= 1)
+            }
         }) { return frame }
         let edge = occupied.max {
             if $0.maxX != $1.maxX { return $0.maxX < $1.maxX }
