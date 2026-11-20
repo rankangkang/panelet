@@ -577,9 +577,13 @@ final class ParkedDisplayChanges: NSObject, SCStreamOutput, SCStreamDelegate {
                 let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
                 try Task.checkCancellation()
                 guard let display = content.displays.first(where: { $0.displayID == self.displayID }) else { return }
-                let mainMenuLayer = Int(CGWindowLevelForKey(.mainMenuWindow))
+                let menuBarLayers = Set([
+                    Int(CGWindowLevelForKey(.mainMenuWindow)),
+                    Int(CGWindowLevelForKey(.statusWindow)),
+                ])
                 let excluded = content.windows.filter {
-                    $0.windowLayer < 0 || $0.windowLayer >= mainMenuLayer
+                    $0.windowLayer < 0
+                        || menuBarLayers.contains($0.windowLayer)
                         || $0.owningApplication?.processID == getpid()
                         || $0.owningApplication?.bundleIdentifier == "com.apple.dock"
                         || $0.owningApplication?.applicationName == "Window Server"
@@ -589,7 +593,7 @@ final class ParkedDisplayChanges: NSObject, SCStreamOutput, SCStreamDelegate {
                 let configuration = SCStreamConfiguration()
                 configuration.width = 32
                 configuration.height = 32
-                configuration.minimumFrameInterval = CMTime(value: 2, timescale: 1)
+                configuration.minimumFrameInterval = CMTime(value: 1, timescale: 8)
                 configuration.queueDepth = 2
                 configuration.showsCursor = false
                 let stream = SCStream(filter: filter, configuration: configuration, delegate: self)

@@ -317,6 +317,7 @@ final class MouseRouter {
     private let screenshotKeys = OSAllocatedUnfairLock(initialState: PhysicalScreenScreenshot.KeyState())
     private let runLoopState = OSAllocatedUnfairLock(initialState: RunLoopState())
     private let captureApps = CaptureAppMonitor()
+    var onPossibleCaptureShortcut: (() -> Void)?
     private var tap: CFMachPort?
     private var motionTap: CFMachPort?
 
@@ -532,7 +533,7 @@ final class MouseRouter {
 
     static func isPassiveRoutingEvent(_ type: CGEventType) -> Bool {
         switch type {
-        case .mouseMoved, .scrollWheel, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
+        case .mouseMoved, .scrollWheel:
             return true
         default:
             return false
@@ -567,6 +568,7 @@ final class MouseRouter {
                         if route.liveHitTest != nil { route.invalidateHover() }
                     }
                     if router.handlesScreenshot(type, event) { return nil }
+                    router.notifyCaptureShortcutIfNeeded(type: type, event: event)
                 default:
                     if type == .mouseMoved && MouseRouter.isTrackingMove(event) {
                         if !router.acceptsHoverMotion(event) { return nil }
@@ -679,6 +681,18 @@ final class MouseRouter {
             PhysicalScreenScreenshot.capture(destination)
             return true
         }
+    }
+
+    private func notifyCaptureShortcutIfNeeded(type: CGEventType, event: CGEvent) {
+        guard event.getIntegerValueField(.keyboardEventAutorepeat) == 0 else { return }
+        let keyCode = event.getIntegerValueField(.keyboardEventKeycode)
+        let modifierMask: CGEventFlags = [.maskCommand, .maskControl, .maskAlternate, .maskSecondaryFn]
+        let isEscape = keyCode == 53
+        let hasHotkeyModifier = !event.flags.intersection(modifierMask).isEmpty
+        guard isEscape || (type == .keyDown && hasHotkeyModifier) else { return }
+        guard isEscape || !captureApps.activeSelectorPIDs.isEmpty else { return }
+        guard let handler = onPossibleCaptureShortcut else { return }
+        DispatchQueue.main.async(execute: handler)
     }
 
     private func handlePixPinPress(_ event: CGEvent, timestamp: CGEventTimestamp) -> Bool? {

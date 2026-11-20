@@ -670,11 +670,11 @@ final class WindowPlacement {
             // AppKit serializes Space transitions for windows of the same app.
             for (index, target) in targets.enumerated() {
                 try Task.checkCancellation()
-                let stableFor: Duration = index == targets.count - 1 ? .milliseconds(180) : .milliseconds(450)
+                let stableFor: Duration = index == targets.count - 1 ? .milliseconds(250) : .milliseconds(550)
                 // An in-flight transition must finish before a cancelled split restores the window.
                 if Self.isFullScreen(target.saved, on: target.half) || Self.requestFullScreen(target) {
                     let entered = await Task {
-                        await Self.waitForFullScreen([target], stableFor: stableFor, timeout: .milliseconds(1700))
+                        await Self.waitForFullScreen([target], stableFor: stableFor, timeout: .milliseconds(2800))
                     }.value
                     try Task.checkCancellation()
                     if entered { continue }
@@ -955,20 +955,23 @@ final class WindowPlacement {
     }
 
     nonisolated private static func exitFullScreen(_ window: Window, pid: pid_t? = nil, windowID: CGWindowID? = nil) async -> Bool {
-        // AppKit serializes Space transitions within each application, and heavy apps can take >2.4s under load.
+        // AppKit serializes Space transitions within each application. Never re-send `AXFullScreen = false`
+        // mid-animation (which can strand an orphan `_NSFullScreenTransitionOverlayWindow`), and allow
+        // enough settle time (~450ms) for AppKit to tear down its fullscreen transition snapshot window.
         var readySince: ContinuousClock.Instant?
         var lastFrame: CGRect?
+        let initialFrame = window.frame
         let resolvedPID: pid_t? = pid ?? {
             var owner: pid_t = 0
             return AXUIElementGetPid(window.element, &owner) == .success ? owner : nil
         }()
         let resolvedID = windowID ?? window.number
-        for attempt in 0..<48 {
+        for attempt in 0..<52 {
             let isFullScreen = window.fullScreen
             if isFullScreen == false, let frame = window.frame {
                 let now = ContinuousClock.now
                 if let lastFrame, near(frame, lastFrame), let readySince {
-                    if now - readySince >= .milliseconds(300) { return true }
+                    if now - readySince >= .milliseconds(450) { return true }
                 } else {
                     readySince = now
                 }
@@ -980,8 +983,9 @@ final class WindowPlacement {
             if isFullScreen == true {
                 if attempt == 0 {
                     window.setFullScreen(false)
-                } else if attempt == 10 || attempt == 24 {
-                    // Some background full-screen windows ignore silent AXFullScreen=false until revealed.
+                } else if attempt == 28,
+                          initialFrame.map({ current in window.frame.map { near($0, current) } == true }) ?? true {
+                    // Only wake and retry once after a full animation cycle (2.8s) if the window never moved at all.
                     if let resolvedPID, let app = NSRunningApplication(processIdentifier: resolvedPID), !app.isTerminated {
                         if let resolvedID { Window.reveal(resolvedID, in: app) }
                         else { app.activate() }
@@ -1483,8 +1487,9 @@ final class WindowPlacement {
             }
             let bounds = CGDisplayBounds(display)
             guard !bounds.isEmpty else { return false }
-            let deadline = ContinuousClock.now + .seconds(7)
+            let deadline = ContinuousClock.now + .seconds(8)
             var requestedAt: ContinuousClock.Instant?
+            var retriedRequest = false
             var readySince: ContinuousClock.Instant?
             while ContinuousClock.now < deadline, !Task.isCancelled {
                 if window.frame == nil, let number, let record = liveWindows()[number], record.pid == pid,
@@ -1494,19 +1499,37 @@ final class WindowPlacement {
                 let onTarget = frame.map { bounds.contains(CGPoint(x: $0.midX, y: $0.midY)) } ?? false
                 if fullScreen == true && onTarget {
                     let now = ContinuousClock.now
-                    if let readySince, now - readySince >= .milliseconds(300) { return true }
+                    // Give AppKit enough time (~550ms) to finish tearing down its fullscreen transition
+                    // snapshot window before starting another fullscreen transition in the same process.
+                    if let readySince, now - readySince >= .milliseconds(550) { return true }
                     if readySince == nil { readySince = now }
                 } else {
                     readySince = nil
                     if fullScreen == true {
-                        guard await exitFullScreen(window) else { return false }
+                        guard await exitFullScreen(window, pid: pid, windowID: number) else { return false }
+                        requestedAt = nil
                     } else if fullScreen == false, let frame {
-                        let desired = Self.fit(frame, inside: bounds)
-                        if frame != desired { window.place(desired, from: frame) }
                         let now = ContinuousClock.now
-                        if requestedAt == nil || now - requestedAt! >= .seconds(1) {
+                        if requestedAt == nil {
+                            let desired = Self.fit(frame, inside: bounds)
+                            if !Self.near(frame, desired) {
+                                window.place(desired, from: frame)
+                                try? await Task.sleep(for: .milliseconds(60))
+                            }
                             window.setFullScreen(true)
-                            requestedAt = now
+                            requestedAt = ContinuousClock.now
+                        } else if !retriedRequest, let firstRequest = requestedAt,
+                                  now - firstRequest >= .milliseconds(3200) {
+                            // Never mutate `frame` or re-send `setFullScreen(true)` mid-animation (at 1s),
+                            // which strands an orphan AppKit fullscreen snapshot window on the desktop Space.
+                            retriedRequest = true
+                            if let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated {
+                                if let number { Window.reveal(number, in: app) }
+                                else { app.activate(options: [.activateAllWindows]) }
+                            }
+                            let desired = Self.fit(frame, inside: bounds)
+                            if !Self.near(frame, desired) { window.place(desired, from: frame) }
+                            window.setFullScreen(true)
                         }
                     }
                 }
@@ -1675,7 +1698,7 @@ final class WindowPlacement {
             var token = Data()
             let clock = ContinuousClock()
             let deadline = clock.now + timeout
-            for id in UInt64(0)..<131_072 {
+            for id in UInt64(0)..<32_768 {
                 guard !Task.isCancelled, clock.now < deadline else { break }
                 guard let element = SystemBridge.Accessibility.element(pid: pid, remoteElementID: id, buffer: &token),
                       let windowID = SystemBridge.Accessibility.windowID(of: element),

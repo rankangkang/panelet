@@ -32,6 +32,7 @@ final class SplitSessions {
     private var captureOverlayTimer: Timer?
     private var captureOverlayTask: Task<Void, Never>?
     private var captureOverlayPending = false
+    private var captureOverlayImmediate = false
     private var captureRescuePending = false
     private var captureUIVisible = false
     private var nextCaptureOverlayCheck = ContinuousClock.now
@@ -665,6 +666,13 @@ final class SplitSessions {
         guard layout != routedLayout || parking != routedParking || router?.isEnabled != true else { return }
         captureOverlayRevision &+= 1
         let input = router ?? MouseRouter()
+        input.onPossibleCaptureShortcut = { [weak self] in
+            self?.requestCaptureOverlayUpdate(immediate: true)
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .milliseconds(110))
+                self?.requestCaptureOverlayUpdate(immediate: true)
+            }
+        }
         input.update(parked: parking, screens: layout.filter { !parked.contains($0.key) }.map(\.value))
         if router == nil {
             guard input.start() else { throw DemoError(L("鼠标事件监听启动失败。请检查辅助功能权限并重新启动。")) }
@@ -684,10 +692,15 @@ final class SplitSessions {
         requestCaptureOverlayUpdate(rescue: true)
     }
 
-    fileprivate func requestCaptureOverlayUpdate(rescue: Bool = false) {
+    fileprivate func requestCaptureOverlayUpdate(rescue: Bool = false, immediate: Bool = false) {
         guard router != nil, WindowServerHitTest.supportsLiveRouting else { return }
         captureOverlayPending = true
         captureRescuePending = captureRescuePending || rescue
+        if immediate {
+            captureOverlayImmediate = true
+            captureOverlayTask?.cancel()
+            captureOverlayTask = nil
+        }
         scheduleCaptureOverlayUpdate()
     }
 
@@ -699,7 +712,12 @@ final class SplitSessions {
     private func scheduleCaptureOverlayUpdate() {
         guard captureOverlayPending, captureOverlayTask == nil, !captureOverlayQueryInFlight, !changingDisplays,
               !sleeping, !screensSleeping, !sessionInactive else { return }
-        let deadline = max(nextCaptureOverlayCheck, wakeReadyAt, .now + .milliseconds(40))
+        let deadline: ContinuousClock.Instant
+        if captureOverlayImmediate {
+            deadline = max(wakeReadyAt, .now + .milliseconds(25))
+        } else {
+            deadline = max(nextCaptureOverlayCheck, wakeReadyAt, .now + .milliseconds(40))
+        }
         captureOverlayTask = Task { [weak self] in
             do { try await ContinuousClock().sleep(until: deadline) } catch { return }
             guard !Task.isCancelled, let self else { return }
@@ -772,7 +790,8 @@ final class SplitSessions {
         }
         guard !captureOverlayQueryInFlight else { return }
         captureOverlayQueryInFlight = true
-        nextCaptureOverlayCheck = .now + .milliseconds(500)
+        captureOverlayImmediate = false
+        nextCaptureOverlayCheck = .now + .milliseconds(captureUIVisible ? 120 : 500)
         let revision = captureOverlayRevision
         let rescueTargets: Set<CGDirectDisplayID>
         if !busy && layoutChangedAt.isEmpty {
@@ -1654,7 +1673,7 @@ final class Session {
         if active, !needsRecovery, hasHalves, WindowServerHitTest.supportsLiveRouting {
             if parkedDisplayChanges == nil {
                 parkedDisplayChanges = ParkedDisplayChanges(displayID: targetID) { [weak coordinator] in
-                    coordinator?.requestCaptureOverlayUpdate(rescue: true)
+                    coordinator?.requestCaptureOverlayUpdate(rescue: true, immediate: true)
                 }
             }
             resumeParkedObservation()
