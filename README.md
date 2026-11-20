@@ -1,37 +1,36 @@
 <p align="center">
-  <img src="branding/panelet/app-icon.png" width="112" alt="Panelet app icon">
+  <img src="branding/panelet/app-icon.png" width="96" height="96" alt="Panelet app icon">
 </p>
 
 <h1 align="center">Panelet</h1>
 
-<p align="center"><strong>One screen. More room.</strong></p>
-
-<p align="center">Split one Mac display into two independent desktops, each with its own menu bar and native full-screen Spaces.</p>
-
-<p align="center"><strong>English</strong> · <a href="README.zh-CN.md">简体中文</a></p>
-
 <p align="center">
-  <a href="#installation">Install</a> ·
-  <a href="#quick-start">Quick start</a> ·
-  <a href="#troubleshooting">Get help</a> ·
-  <a href="#contributing">Contribute</a> ·
-  <a href="#license">License</a>
+  Panelet splits one physical monitor into two independent virtual displays, arranged side by side or stacked vertically.<br>
+  Each display has its own menu bar, and macOS manages its desktops and native full-screen Spaces independently.
 </p>
 
-## Features
+<p align="center">macOS 14 or later · <a href="LICENSE">AGPL-3.0-only</a></p>
 
-- **Desktop splits.** Keep two workspaces on the same display. Open multiple windows in either region, drag them between regions, and use macOS full screen independently.
-- **Window Pair.** Temporarily place one full-screen window in each region. Search for windows, drag them into place, swap their positions, and save frequently used pairs.
-- **Per-display layouts.** Split multiple displays at once and save the direction, ratio, and rendering mode for each. By default, portrait displays split top to bottom and landscape displays split side by side. Choose a 1:1, 2:1, or 1:2 ratio.
-- **Desktop recovery.** Panelet restores the display arrangement and attempts to move windows back when a split ends. After an unexpected quit, it attempts recovery on the next launch if the display configuration matches.
+<p align="center">
+  <a href="#installation"><strong>Install from source</strong></a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#troubleshooting">Get help</a> ·
+  <a href="README.zh-CN.md">简体中文</a>
+</p>
+
+<p align="center">
+  <img src="docs/images/split-layouts.webp" width="880" alt="Horizontal and vertical monitors, each showing two virtual desktops.">
+</p>
+
+## Why I built Panelet
+
+I use two portrait monitors to read code. As I opened more projects, I found myself switching back and forth between editor windows. I wanted to split each monitor into a top and a bottom display so I could keep four projects in view across the two screens. macOS has no built-in way to do that, so I built Panelet.
 
 ## Installation
 
-- macOS 14 or later.
-- Xcode or Xcode Command Line Tools, and Python 3.
-- A valid Apple Development signing identity in your Keychain for the default first-time build.
+Build from source to try Panelet today. The first prebuilt installer is planned for [GitHub Releases](https://github.com/rankangkang/panelet/releases).
 
-Build from source, install, and open Panelet with the following commands.
+You'll need Xcode or Xcode Command Line Tools, Python 3, and a code-signing identity in your Keychain.
 
 ```sh
 git clone https://github.com/rankangkang/panelet.git
@@ -39,75 +38,86 @@ cd panelet
 ./build.sh --install
 ```
 
-Open the installed copy at `/Applications/Panelet.app` for everyday use and when granting permissions. If your Keychain has multiple valid signing identities, set `PANELET_SIGN_IDENTITY` to the certificate name or fingerprint on first install.
+The script installs and opens `/Applications/Panelet.app`. On first install it uses your Apple Development identity if there is exactly one available. To choose one for the first install, set `PANELET_SIGN_IDENTITY` to the certificate name or fingerprint.
 
-To update, get the new source and choose **Quit Panelet** from the menu bar. Follow the prompts to restore any active splits, then run `./build.sh --install` again. The update reuses the installed signing identity and bundle identifier `dev.cmkk.panelet` so macOS can keep your existing permissions.
-
-### First-time setup
-
-1. In **System Settings → Desktop & Dock**, turn on **Displays have separate Spaces**. If you just changed this setting, log out and back in when macOS prompts you.
-2. Open Panelet and follow **Getting Started** to grant **Screen Recording** and **Accessibility**. If Panelet is missing from a permissions list, use **+** to select `/Applications/Panelet.app`.
-3. Click **Restart and Continue** if prompted. Once permissions are ready, click **Finish Setup**. To try it right away, click **Try a Split…** and choose a display and layout. You can reopen the guide from **Getting Started…** in the menu bar.
+To update, get the latest source, choose **Quit Panelet** from the menu bar, and follow the prompts to restore any active splits. Run `./build.sh --install` again. By default the script reuses the installed signing identity and verifies the new app against the installed app's signing requirements to preserve macOS permissions.
 
 ## Quick start
 
-### Split a desktop
+### First launch
 
-From the Panelet menu bar icon, choose **Split Desktop** and select a display. The two desktops stay active until you merge the display. To change the layout, merge it first, then open **Settings… → Desktop Split** to adjust the direction and ratio and see the preview update.
+1. In **System Settings → Desktop & Dock**, turn on **Displays have separate Spaces**. If you just changed it, log out and back in when macOS prompts you.
+2. Open Panelet from **Applications** and follow **Getting Started** to grant **Screen Recording** and **Accessibility**. If Panelet is missing from either permissions list, use **+** to select `/Applications/Panelet.app`.
+3. Choose **Restart and Continue** if prompted. Once permissions are ready, choose **Try a Split…** to test a layout or continue with **Finish Setup**. You can reopen **Getting Started…** from the menu bar.
 
-### Pair two windows
+### Split Desktop
 
-Press **⌃⇧S** (Control–Shift–S) to open the window picker. Select a display and two windows, then click **Start Split** or press Return. Each window opens in a native full-screen Space.
+From the Panelet menu bar icon, choose **Split Desktop** and select a display. Keep several windows in each desktop, drag windows between them, or run an app in macOS full screen in either region. The desktops stay split until you merge them.
 
-The pair ends automatically when either window exits full screen or closes, or when either app quits. Any desktop split that was already active on that display stays in place.
+### Window Pair
+
+Press **⌃⇧S** (Control–Shift–S) to open the window picker. Choose a display and two windows, then press Return or click **Start Split**. Each window enters its own native full-screen Space. You can search, drag windows into place, swap them, and save combinations you use often.
+
+The pair ends when either window leaves full screen or closes, or when either app quits. An existing desktop split on that display stays active.
+
+### Layouts and shortcuts
+
+Panelet can split several displays at once. Portrait displays split top to bottom by default, and landscape displays split side by side. Merge a display before changing its direction, ratio (1:1, 2:1, or 1:2), or rendering mode in **Settings… → Desktop Split**.
 
 | Default shortcut | Action |
 | --- | --- |
 | **⌃⇧S** | Open the window picker |
-| **⌃⇧J** | Restore the split under the pointer or end its window pair |
+| **⌃⇧J** | End the window pair or merge the split desktop under the pointer |
 | **Esc** | Cancel a split while it is being prepared in the window picker |
 
-Customize the two global shortcuts in **Settings… → Shortcuts**. To restore every display at once, choose **Restore All Displays…** from the menu bar. You can change the interface language in **Settings… → General**.
+Customize the two global shortcuts in **Settings… → Shortcuts** and set the interface language in **Settings… → General**.
 
-## Compatibility and privacy
+## Permissions and compatibility
 
-Panelet uses the private macOS API `CGVirtualDisplay` to create two virtual displays, then uses ScreenCaptureKit to show both feeds on the physical display. macOS updates can affect virtual display behavior. Protected video or capture-restricted windows may appear black. Verify high refresh rates, HDR, and wide color on your hardware.
+| macOS permission | How Panelet uses it |
+| --- | --- |
+| Screen Recording | Compose the split desktops and show window previews |
+| Accessibility | Select, move, and restore windows and route the pointer across regions |
 
-Screen Recording lets Panelet compose the split desktops and preview windows. Panelet captures and processes screen images locally. Accessibility lets Panelet move and restore windows and route the pointer between regions. Preferences and saved pairs stay on your Mac. Saved pairs contain app identifiers and window titles for matching. You can preview and export a diagnostic report with selected environment and performance data.
+Panelet processes screen images on your Mac. Preferences and saved window pairs also stay local. Saved pairs keep app identifiers and matching window titles. You can preview diagnostics before copying or exporting them.
+
+Panelet uses the private macOS interface `CGVirtualDisplay` to create virtual displays and ScreenCaptureKit to present their images on the physical display. macOS updates can change the behavior of virtual displays. Protected video and capture-restricted windows may appear black. Check HDR, wide color, and high refresh rates on your hardware.
 
 ## Troubleshooting
 
-| Symptom | What to do |
+| If you see this | Try this |
 | --- | --- |
 | The split button is disabled | In **Settings… → Permissions**, check **Screen Recording**, **Accessibility**, and **Displays have separate Spaces**. |
-| A split fails to start or the picture looks wrong | Select **Check Environment…** from the menu bar to check whether the required macOS interfaces are available. |
+| A split fails to start or the picture looks wrong | Choose **Check Environment…** from the menu bar to check whether the required macOS interfaces are available. |
 | A display or window did not return to its previous position | Choose **Restore All Displays…** from the menu bar. If any windows still need recovery, choose **Retry Window Recovery…**. |
 
-Bug reports and feature requests are welcome. For a bug report, include the Panelet version or Git commit used to build it, the macOS version, your display setup, steps to reproduce, and what you expected versus what happened. You can attach a diagnostic report exported from **Settings… → Diagnostics → Preview Report…**. [GitHub Issues](https://github.com/rankangkang/panelet/issues)
+Panelet attempts to restore the display layout and window positions when a split ends. After an unexpected quit, it attempts recovery on the next launch if the display configuration matches.
+
+For a bug report, include the Panelet version or build commit, macOS version, display setup, and steps to reproduce. Describe what you expected and what happened. You can attach a report from **Settings… → Diagnostics → Preview Report…**. [Report a bug or suggest a feature](https://github.com/rankangkang/panelet/issues)
 
 ## Contributing
 
-Panelet is written in Swift with AppKit. Pull requests for bug fixes, documentation, and translations are welcome. Describe what your change fixes or improves and how you verified it.
+Panelet is written in Swift with AppKit. Pull requests for bug fixes, documentation, and translations are welcome. Tell us what changed and how you verified it.
 
 ```sh
 ./tests/run.sh
 ./build.sh
 ```
 
-`./tests/run.sh` runs logic tests and localization checks. `./build.sh` builds the app. You can also open `Panelet.xcodeproj` and build the Panelet scheme. Keep App Sandbox disabled so the app can create virtual displays. To test the interface or permissions, update with `./build.sh --install` and launch Panelet from Applications.
+The first command runs logic tests and localization checks. The second builds the app. You can also build the Panelet scheme in `Panelet.xcodeproj`. Keep App Sandbox disabled so Panelet can create virtual displays. For UI and permissions testing, update via `./build.sh --install` and open Panelet from **Applications**.
 
 <details>
-<summary>Inspecting displays and testing on a Mac</summary>
+<summary>Display diagnostics and manual acceptance checks</summary>
 
-Run this command to list detected displays with their orientation, scale, refresh rate, and position.
+List the detected displays, including orientation, scale, refresh rate, and position.
 
 ```sh
 /Applications/Panelet.app/Contents/MacOS/Panelet --list
 ```
 
-When changing split or recovery logic, check stacked and side-by-side layouts, exiting full screen from either window, starting and ending a window pair on an existing desktop split, and restoring one display while other splits are active. Use test windows when checking recovery failures.
+When changing split or recovery logic, check both split directions, exit full screen from either paired window, start and end a pair on an existing desktop split, and restore one display while others are split. Use test windows when checking recovery failures.
 
-The acceptance notes below are in Simplified Chinese.
+Manual acceptance notes are in Simplified Chinese.
 
 - [Splitting, recovery, and diagnostics](tests/acceptance-2026-11-14.md)
 - [First-time setup](tests/onboarding-acceptance-2026-11-14.md)
@@ -119,4 +129,4 @@ The acceptance notes below are in Simplified Chinese.
 
 Panelet is licensed under the GNU Affero General Public License, version 3 only (`AGPL-3.0-only`). [License text](LICENSE)
 
-The virtual display implementation draws on Telas. [Upstream project](https://github.com/eduardoworrel/telas) · [Third-party licenses and notices](THIRD_PARTY_NOTICES) · [Panelet branding](branding/panelet/README.md)
+The virtual-display interface declarations draw on Telas. [Telas](https://github.com/eduardoworrel/telas) · [Third-party notices](THIRD_PARTY_NOTICES) · [Panelet branding](branding/panelet/README.md)
