@@ -244,6 +244,13 @@ struct CaptureRoutingTests {
                                   .otherMouseDown, .otherMouseDragged, .otherMouseUp, .scrollWheel] {
             assert(interactions & (1 << type.rawValue) != 0)
         }
+        for passiveType: CGEventType in [.mouseMoved, .scrollWheel, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged] {
+            assert(MouseRouter.isPassiveRoutingEvent(passiveType),
+                   "\(passiveType.rawValue) must never synchronously block on WindowServer hit-testing")
+        }
+        for clickType: CGEventType in [.leftMouseDown, .rightMouseDown, .otherMouseDown] {
+            assert(!MouseRouter.isPassiveRoutingEvent(clickType))
+        }
 
         var observed = MouseRouter.Route(parked: [parked], screens: [left, right, other],
                                          liveHitTest: { _, _ in fatalError("Motion queried the window server") })

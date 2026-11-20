@@ -12,6 +12,8 @@ final class CaptureWindowEvents {
     private var watching = Set<pid_t>()
     private var observers: [pid_t: AXObserver] = [:]
     private var generation: UInt64 = 0
+    private var scanPending = false
+    private var scanInFlight = false
 
     init(onChange: @escaping (_ needsRescue: Bool) -> Void) { self.onChange = onChange }
 
@@ -19,7 +21,7 @@ final class CaptureWindowEvents {
         guard applications == nil else { return }
         let workspace = NSWorkspace.shared
         applications = workspace.observe(\.runningApplications, options: [.new]) { [weak self] _, _ in
-            Task { @MainActor in self?.updateApplications() }
+            Task { @MainActor in self?.scheduleApplicationScan() }
         }
         let notifications: [(Notification.Name, Bool)] = [
             (NSWorkspace.didLaunchApplicationNotification, true),
@@ -33,21 +35,22 @@ final class CaptureWindowEvents {
             workspaceObservers.append(workspace.notificationCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
                 MainActor.assumeIsolated {
                     guard let self else { return }
-                    if name == NSWorkspace.didLaunchApplicationNotification || name == NSWorkspace.didTerminateApplicationNotification
-                        || name == NSWorkspace.didActivateApplicationNotification {
-                        self.updateApplications()
+                    if name == NSWorkspace.didLaunchApplicationNotification || name == NSWorkspace.didTerminateApplicationNotification {
+                        self.scheduleApplicationScan()
                     }
                     self.onChange(needsRescue)
                 }
             })
         }
-        updateApplications()
+        scheduleApplicationScan()
     }
 
     func stop() {
         applications?.invalidate()
         applications = nil
         generation &+= 1
+        scanPending = false
+        scanInFlight = false
         workspaceObservers.forEach(NSWorkspace.shared.notificationCenter.removeObserver)
         workspaceObservers.removeAll()
         for observer in observers.values {
@@ -57,12 +60,39 @@ final class CaptureWindowEvents {
         watching.removeAll()
     }
 
-    private func updateApplications() {
+    private func scheduleApplicationScan() {
         guard applications != nil else { return }
-        let pids = Set(NSWorkspace.shared.runningApplications.compactMap { app -> pid_t? in
-            guard app.processIdentifier != getpid(), !app.isTerminated, app.activationPolicy != .prohibited else { return nil }
-            return app.processIdentifier
-        })
+        scanPending = true
+        guard !scanInFlight else { return }
+        scanInFlight = true
+        scanPending = false
+        let generation = self.generation
+        // Querying NSRunningApplication properties contacts LaunchServices synchronously via XPC;
+        // run it off the main thread so swap pressure or process churn never stalls frame/UI work.
+        registrationQueue.async { [weak self] in
+            let ownPID = getpid()
+            let pids = Set(NSWorkspace.shared.runningApplications.compactMap { app -> pid_t? in
+                let pid = app.processIdentifier
+                guard pid > 0, pid != ownPID, !app.isTerminated else { return nil }
+                let policy = app.activationPolicy
+                guard policy != .prohibited else { return nil }
+                if policy == .accessory, let bundle = app.bundleIdentifier, Self.isBackgroundHelperBundle(bundle) {
+                    return nil
+                }
+                return pid
+            })
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.generation == generation, self.applications != nil else { return }
+                self.scanInFlight = false
+                self.applyScannedApplications(pids, generation: generation)
+                if self.scanPending {
+                    self.scheduleApplicationScan()
+                }
+            }
+        }
+    }
+
+    private func applyScannedApplications(_ pids: Set<pid_t>, generation: UInt64) {
         guard pids != watching else { return }
         let added = pids.subtracting(watching)
         for pid in watching.subtracting(pids) {
@@ -72,7 +102,7 @@ final class CaptureWindowEvents {
         }
         watching = pids
         onChange(!added.isEmpty)
-        let generation = self.generation
+        guard !added.isEmpty else { return }
         registrationQueue.async { [self] in
             for pid in added {
                 guard let observer = Self.makeObserver(pid: pid, context: Unmanaged.passUnretained(self).toOpaque()) else { continue }
@@ -85,6 +115,14 @@ final class CaptureWindowEvents {
                 }
             }
         }
+    }
+
+    private nonisolated static func isBackgroundHelperBundle(_ bundleID: String) -> Bool {
+        let lower = bundleID.lowercased()
+        return lower.contains(".helper")
+            || lower.contains("webkit.networking")
+            || lower.contains("webkit.gpu")
+            || lower.contains("webkit.webcontent")
     }
 
     private nonisolated static func makeObserver(pid: pid_t, context: UnsafeMutableRawPointer) -> AXObserver? {
@@ -762,6 +800,14 @@ final class WindowPlacement {
             guard let info = available[record.number] else { return .retry }
 
             let bounds = target.quartzFrame
+            if record.fullScreen, !record.minimized, app.isHidden == record.hidden {
+                let fullSpaces = Set(DesktopSpaces()?.spaceIDs(in: display, fullScreenOnly: true) ?? [])
+                if isAlreadyFullScreenOnTarget(
+                    id: record.number, pid: record.pid, bounds: bounds, fullSpaces: fullSpaces, live: available
+                ) {
+                    return .restored
+                }
+            }
             let translated = record.frame(on: bounds)
             let desired = bounds.size == record.displayBounds.size
                 ? translated : fit(translated, inside: target.quartzVisibleFrame)
@@ -844,26 +890,60 @@ final class WindowPlacement {
     func leaveFullScreen(on halves: [HalfScreen], includeSelected: Bool) async -> Bool {
         let bounds = halves.map { $0.virtualBounds.insetBy(dx: -2, dy: -2) }
         return await Task.detached(priority: .userInitiated) { [windows] in
-            let live = Self.liveWindows()
+            var live = Self.liveWindows()
             var unresolved = false
-            let targets = windows.compactMap { saved -> (pid_t, Window)? in
-                if saved.fullScreenDisplay != nil && saved.original == nil { return nil }
-                guard let window = Self.resolve(saved, in: live) else {
-                    if let id = saved.id, live[id]?.pid == saved.pid { unresolved = true }
-                    return nil
+            var targets: [(pid: pid_t, id: CGWindowID?, window: Window)] = []
+
+            for saved in windows {
+                if saved.fullScreenDisplay != nil && saved.original == nil { continue }
+                var resolved = Self.resolve(saved, in: live)
+                // Inactive full-screen Spaces (especially Electron/Chromium) may omit the window
+                // from AX queries until its Space is revealed. Wake it before giving up.
+                if resolved == nil, let id = saved.id, live[id]?.pid == saved.pid,
+                   let app = NSRunningApplication(processIdentifier: saved.pid), !app.isTerminated {
+                    await MainActor.run {
+                        NSApp.yieldActivation(to: app)
+                        app.activate(options: [.activateAllWindows])
+                    }
+                    Window.reveal(id, in: app)
+                    for _ in 0..<8 {
+                        try? await Task.sleep(for: .milliseconds(100))
+                        live = Self.liveWindows()
+                        if let candidate = Self.resolve(saved, in: live) {
+                            resolved = candidate
+                            break
+                        }
+                    }
                 }
-                guard let fullScreen = window.fullScreen else { unresolved = true; return nil }
-                guard fullScreen else { return nil }
-                guard let frame = window.frame else { unresolved = true; return nil }
-                guard
-                      (includeSelected && saved.slot != nil) || bounds.contains(where: { $0.contains(frame) }) else { return nil }
-                return (saved.pid, window)
+                guard let window = resolved else {
+                    if let id = saved.id, live[id]?.pid == saved.pid { unresolved = true }
+                    continue
+                }
+                var fullScreen = window.fullScreen
+                if fullScreen == nil, let id = saved.id, let app = NSRunningApplication(processIdentifier: saved.pid) {
+                    Window.reveal(id, in: app)
+                    for _ in 0..<5 {
+                        try? await Task.sleep(for: .milliseconds(80))
+                        fullScreen = window.fullScreen
+                        if fullScreen != nil { break }
+                    }
+                }
+                guard let isFull = fullScreen else { unresolved = true; continue }
+                guard isFull else { continue }
+                guard let frame = window.frame else { unresolved = true; continue }
+                guard (includeSelected && saved.slot != nil) || bounds.contains(where: { $0.contains(frame) }) else { continue }
+                targets.append((saved.pid, saved.id, window))
             }
+
             return await withTaskGroup(of: Bool.self) { group in
-                for appWindows in Dictionary(grouping: targets, by: { $0.0 }).values {
+                for appWindows in Dictionary(grouping: targets, by: { $0.pid }).values {
                     group.addTask {
                         var success = true
-                        for (_, window) in appWindows { if !(await Self.exitFullScreen(window)) { success = false } }
+                        for item in appWindows {
+                            if !(await Self.exitFullScreen(item.window, pid: item.pid, windowID: item.id)) {
+                                success = false
+                            }
+                        }
                         return success
                     }
                 }
@@ -874,16 +954,21 @@ final class WindowPlacement {
         }.value
     }
 
-    nonisolated private static func exitFullScreen(_ window: Window) async -> Bool {
-        // AppKit serializes Space transitions within each application.
+    nonisolated private static func exitFullScreen(_ window: Window, pid: pid_t? = nil, windowID: CGWindowID? = nil) async -> Bool {
+        // AppKit serializes Space transitions within each application, and heavy apps can take >2.4s under load.
         var readySince: ContinuousClock.Instant?
         var lastFrame: CGRect?
-        for attempt in 0..<24 {
+        let resolvedPID: pid_t? = pid ?? {
+            var owner: pid_t = 0
+            return AXUIElementGetPid(window.element, &owner) == .success ? owner : nil
+        }()
+        let resolvedID = windowID ?? window.number
+        for attempt in 0..<48 {
             let isFullScreen = window.fullScreen
             if isFullScreen == false, let frame = window.frame {
                 let now = ContinuousClock.now
                 if let lastFrame, near(frame, lastFrame), let readySince {
-                    if now - readySince >= .milliseconds(400) { return true }
+                    if now - readySince >= .milliseconds(300) { return true }
                 } else {
                     readySince = now
                 }
@@ -892,8 +977,17 @@ final class WindowPlacement {
                 readySince = nil
                 lastFrame = nil
             }
-            if isFullScreen == true && attempt.isMultiple(of: 12) {
-                window.setFullScreen(false)
+            if isFullScreen == true {
+                if attempt == 0 {
+                    window.setFullScreen(false)
+                } else if attempt == 10 || attempt == 24 {
+                    // Some background full-screen windows ignore silent AXFullScreen=false until revealed.
+                    if let resolvedPID, let app = NSRunningApplication(processIdentifier: resolvedPID), !app.isTerminated {
+                        if let resolvedID { Window.reveal(resolvedID, in: app) }
+                        else { app.activate() }
+                    }
+                    window.setFullScreen(false)
+                }
             }
             try? await Task.sleep(for: .milliseconds(100))
         }
@@ -998,10 +1092,12 @@ final class WindowPlacement {
             var desktop = source
             let center = CGPoint(x: match.frame.midX, y: match.frame.midY)
             desktop.bounds = sourceBounds.first { $0.contains(center) } ?? source.bounds
+            let isFull = match.window.isFullScreen
             windows.append(SavedWindow(window: match.window, id: match.info.id, pid: match.info.pid,
-                                       original: match.frame, display: desktop, slot: nil,
-                                       fullScreenDisplay: match.window.isFullScreen ? source : nil,
-                                       launchDate: NSRunningApplication(processIdentifier: match.info.pid)?.launchDate))
+                                       original: isFull ? nil : match.frame, display: desktop, slot: nil,
+                                       fullScreenDisplay: isFull ? source : nil,
+                                       launchDate: NSRunningApplication(processIdentifier: match.info.pid)?.launchDate,
+                                       recoveryFrame: match.frame))
         }
     }
 
@@ -1018,6 +1114,19 @@ final class WindowPlacement {
                 guard saved.slot == nil else { return saved }
                 guard NSRunningApplication(processIdentifier: saved.pid)?.isTerminated == false else { return nil }
                 guard let window = Self.resolve(saved, in: live), let frame = window.frame else {
+                    if let id = saved.id, let info = live[id], info.pid == saved.pid {
+                        let infoCenter = CGPoint(x: info.frame.midX, y: info.frame.midY)
+                        if let index = bounds.firstIndex(where: { $0.contains(infoCenter) }) {
+                            var current = saved
+                            let origin = source.bounds.origin
+                            current.recoveryFrame = info.frame.offsetBy(
+                                dx: origin.x + offsets[index].x - bounds[index].minX,
+                                dy: origin.y + offsets[index].y - bounds[index].minY
+                            )
+                            current.display = source
+                            return current
+                        }
+                    }
                     // Preserve recovery data when an app is temporarily unresponsive.
                     if saved.window.exists == false, saved.id.map({ live[$0]?.pid != saved.pid }) ?? true { return nil }
                     return saved
@@ -1027,12 +1136,20 @@ final class WindowPlacement {
                 guard let index = bounds.firstIndex(where: { $0.contains(center) }) else { return nil }
                 var current = saved
                 let origin = source.bounds.origin
-                current.original = frame.offsetBy(dx: origin.x + offsets[index].x - bounds[index].minX,
-                                                   dy: origin.y + offsets[index].y - bounds[index].minY)
+                let mappedFrame = frame.offsetBy(dx: origin.x + offsets[index].x - bounds[index].minX,
+                                                 dy: origin.y + offsets[index].y - bounds[index].minY)
+                if window.isFullScreen {
+                    // Keep the pre-fullscreen normal window frame (`saved.original`) rather than
+                    // overwriting it with a virtual half-screen fullscreen rect.
+                    current.recoveryFrame = mappedFrame
+                    current.fullScreenDisplay = source
+                } else {
+                    current.original = mappedFrame
+                    current.fullScreenDisplay = nil
+                }
                 current.display = source
                 current.wasMinimized = window.isMinimized
                 current.wasInStageStrip = false
-                current.fullScreenDisplay = window.isFullScreen ? source : nil
                 return current
             }
         }.value
@@ -1082,7 +1199,7 @@ final class WindowPlacement {
             guard let only else { return true }
             return saved.id.map { only.contains($0) } == true
         }
-        let work = targets.compactMap { saved -> (Int, SavedWindow, CGRect, CGRect, CGRect)? in
+        let work = targets.compactMap { saved -> (Int, SavedWindow, CGDirectDisplayID?, CGRect, CGRect, CGRect)? in
             let preferred = saved.slot == nil ? ordinary : nil
             guard let original = saved.original,
                   let target = preferred ?? destination(saved.display.id) ?? destination(nil) else { return nil }
@@ -1092,7 +1209,7 @@ final class WindowPlacement {
             let translated = original.offsetBy(dx: bounds.minX - originalBounds.minX, dy: bounds.minY - originalBounds.minY)
             let sameDisplayGeometry = target.displayID == saved.display.id && bounds.size == originalBounds.size
             let desired = sameDisplayGeometry ? translated : Self.fit(translated, inside: visibleBounds)
-            return (saved.slot ?? -1, saved, bounds, visibleBounds, desired)
+            return (saved.slot ?? -1, saved, target.displayID, bounds, visibleBounds, desired)
         }
         let migrationDisplay = ordinaryOnly ? ordinary?.displayID : nil
         // AX calls can wait for another app to respond; keep the mirrors drawing during that wait.
@@ -1106,13 +1223,32 @@ final class WindowPlacement {
             let deadline = ContinuousClock.now + timeout
             repeat {
                 var live = migrationDisplay == nil ? nil : Self.liveWindows()
-                pending = pending.filter { slot, saved, bounds, visibleBounds, desired in
+                var fullSpacesByDisplay: [CGDirectDisplayID: Set<UInt64>] = [:]
+                pending = pending.filter { slot, saved, targetDisplayID, bounds, visibleBounds, desired in
                     guard NSRunningApplication(processIdentifier: saved.pid)?.isTerminated == false else { return false }
                     if migrationDisplay != nil, saved.fullScreenDisplay == nil,
                        let id = saved.id, let info = live?[id], info.pid == saved.pid, Self.near(info.frame, desired),
                        info.onScreen || (migrationSpace.map { DesktopSpaces.spaces(for: id)?.contains($0) == true } == true) {
                         restored += 1
                         return false
+                    }
+                    if migrationDisplay == nil, saved.slot == nil, saved.fullScreenDisplay != nil,
+                       let id = saved.id, let targetDisplayID {
+                        if live == nil { live = Self.liveWindows() }
+                        let fullSpaces: Set<UInt64>
+                        if let cached = fullSpacesByDisplay[targetDisplayID] {
+                            fullSpaces = cached
+                        } else {
+                            let loaded = Set(DesktopSpaces()?.spaceIDs(in: targetDisplayID, fullScreenOnly: true) ?? [])
+                            fullSpacesByDisplay[targetDisplayID] = loaded
+                            fullSpaces = loaded
+                        }
+                        if let live, Self.isAlreadyFullScreenOnTarget(
+                            id: id, pid: saved.pid, bounds: bounds, fullSpaces: fullSpaces, live: live
+                        ) {
+                            restored += 1
+                            return false
+                        }
                     }
                     var window = saved.id.flatMap { replacementWindows[$0] } ?? saved.window
                     var current = window.frame
@@ -1125,7 +1261,10 @@ final class WindowPlacement {
                         current = window.frame
                     }
                     guard let frame = current else { return true }
-                    if saved.slot == nil && window.isFullScreen { return false }
+                    if saved.slot == nil && window.isFullScreen {
+                        restored += 1
+                        return false
+                    }
                     if !Self.near(desired, frame) {
                         settled[slot] = nil
                         if frame.width > bounds.width || frame.height > bounds.height {
@@ -1170,29 +1309,86 @@ final class WindowPlacement {
 
     func recoverFrames(_ ids: Set<CGWindowID>, destination: (CGDirectDisplayID?) -> NSScreen?, ordinary: NSScreen?,
                        protecting: [Identity]) async -> (restored: Int, failed: Int, retry: Set<CGWindowID>) {
+        guard !ids.isEmpty else { return (0, 0, []) }
         let previous = NSWorkspace.shared.frontmostApplication
         let protected = Set(protecting.compactMap(\.pid))
-        var revealed: NSRunningApplication?
-        for saved in windows {
-            guard let id = saved.id, ids.contains(id), !protected.contains(saved.pid),
-                  let app = NSRunningApplication(processIdentifier: saved.pid), !app.isHidden else { continue }
-            Window.reveal(id, in: app)
-            revealed = app
+        var revealedAny = false
+        var totalRestored = 0
+        var remaining = ids
+
+        // Group by PID and restore each app immediately after revealing it so Stage Manager
+        // does not stash earlier apps back into the sidebar strip before their frames are placed.
+        let matching = windows.filter { saved in
+            guard let id = saved.id else { return false }
+            return ids.contains(id)
         }
-        let result = await restore(for: .seconds(2), destination: destination, ordinary: ordinary, only: ids)
-        if revealed?.isActive == true, let previous, previous.processIdentifier != getpid(), !previous.isTerminated { previous.activate() }
-        return result
+        for (pid, appSaved) in Dictionary(grouping: matching, by: \.pid) {
+            let appIDs = appSaved.compactMap(\.id).filter { remaining.contains($0) }
+            guard !appIDs.isEmpty else { continue }
+            for id in appIDs where remaining.contains(id) {
+                if !protected.contains(pid), let app = NSRunningApplication(processIdentifier: pid),
+                   !app.isTerminated, !app.isHidden {
+                    NSApp.yieldActivation(to: app)
+                    app.activate(options: [.activateAllWindows])
+                    Window.reveal(id, in: app)
+                    revealedAny = true
+                    try? await Task.sleep(for: .milliseconds(90))
+                }
+                let single: Set<CGWindowID> = [id]
+                let partial = await restore(for: .milliseconds(1250), destination: destination, ordinary: ordinary, only: single)
+                totalRestored += partial.restored
+                if partial.retry.isEmpty {
+                    remaining.remove(id)
+                }
+            }
+        }
+        if !remaining.isEmpty {
+            let sweep = await restore(for: .milliseconds(800), destination: destination, ordinary: ordinary, only: remaining)
+            totalRestored += sweep.restored
+            remaining = sweep.retry
+        }
+        if revealedAny, let previous, previous.processIdentifier != getpid(), !previous.isTerminated {
+            previous.activate()
+        }
+        return (totalRestored, remaining.count, remaining)
     }
 
     func restorePresentation(destination: (CGDirectDisplayID?) -> NSScreen?) async -> (failed: Int, minimizedToStage: Int) {
         var failures = 0
         var minimizedToStage = 0
         for saved in windows where saved.wasMinimized || saved.wasInStageStrip || saved.fullScreenDisplay != nil {
-            guard let window = Self.resolve(saved, in: Self.liveWindows()) else { continue }
+            guard NSRunningApplication(processIdentifier: saved.pid)?.isTerminated == false else { continue }
             if let display = saved.fullScreenDisplay {
-                guard let target = destination(display.id)?.displayID ?? destination(nil)?.displayID else { failures += 1; continue }
+                guard let targetScreen = destination(display.id) ?? destination(nil),
+                      let target = targetScreen.displayID else { failures += 1; continue }
+                let live = Self.liveWindows()
+                if let id = saved.id {
+                    let fullSpaces = Set(DesktopSpaces()?.spaceIDs(in: target, fullScreenOnly: true) ?? [])
+                    if Self.isAlreadyFullScreenOnTarget(
+                        id: id, pid: saved.pid, bounds: targetScreen.quartzFrame, fullSpaces: fullSpaces, live: live
+                    ) {
+                        continue
+                    }
+                    if live[id]?.pid != saved.pid { continue }
+                }
+                var resolved = Self.resolve(saved, in: live)
+                if resolved == nil, let id = saved.id,
+                   let app = NSRunningApplication(processIdentifier: saved.pid), !app.isTerminated {
+                    NSApp.yieldActivation(to: app)
+                    app.activate(options: [.activateAllWindows])
+                    Window.reveal(id, in: app)
+                    for _ in 0..<8 {
+                        try? await Task.sleep(for: .milliseconds(100))
+                        if let candidate = Self.resolve(saved, in: Self.liveWindows()) {
+                            resolved = candidate
+                            break
+                        }
+                    }
+                }
+                guard let window = resolved else { failures += 1; continue }
                 if !(await Self.restoreFullScreen(window, on: target)) { failures += 1 }
             } else {
+                guard let window = Self.resolve(saved, in: Self.liveWindows()) else { continue }
                 if !window.isMinimized && !Self.hasStageThumbnail(saved) {
                     if saved.wasInStageStrip { window.pressMinimizeButton() }
                     else { window.setMinimized(true) }
@@ -1219,17 +1415,56 @@ final class WindowPlacement {
         return (failures, minimizedToStage)
     }
 
+    nonisolated private static func isAlreadyFullScreenOnTarget(
+        id: CGWindowID,
+        pid: pid_t,
+        bounds: CGRect,
+        fullSpaces: Set<UInt64>,
+        live: [CGWindowID: WindowInfo]
+    ) -> Bool {
+        guard let info = live[id], info.pid == pid, !bounds.isEmpty else { return false }
+        let center = CGPoint(x: info.frame.midX, y: info.frame.midY)
+        guard bounds.contains(center) else { return false }
+        if !fullSpaces.isEmpty, let memberships = DesktopSpaces.spaces(for: id),
+           !fullSpaces.isDisjoint(with: memberships) {
+            return true
+        }
+        return abs(info.frame.width - bounds.width) <= 4 && abs(info.frame.height - bounds.height) <= 40
+    }
+
     private static func hasStageThumbnail(_ saved: SavedWindow) -> Bool {
-        guard let id = saved.id, let record = liveWindows()[id], record.pid == saved.pid else { return false }
+        guard let id = saved.id else { return false }
+        let entries = CGWindowListCopyWindowInfo([.excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        let records = Dictionary(uniqueKeysWithValues: windowInfo(from: entries, levels: [0]).map { ($0.id, $0) })
+        guard let record = records[id], record.pid == saved.pid else { return false }
+        let overlays = stageBlockingOverlays(in: entries)
+        if overlays.contains(where: { $0.insetBy(dx: -4, dy: -4).contains(CGPoint(x: record.frame.midX, y: record.frame.midY)) }) {
+            return true
+        }
         return isInStageStrip(record.frame, original: saved.original, on: CGDisplayBounds(saved.display.id))
     }
 
+    nonisolated private static func stageBlockingOverlays(in entries: [[String: Any]]) -> [CGRect] {
+        entries.compactMap { entry in
+            guard entry[kCGWindowOwnerName as String] as? String == "WindowManager",
+                  entry[kCGWindowName as String] as? String == "Gesture Blocking Overlay",
+                  let dict = entry[kCGWindowBounds as String] as? [String: Any],
+                  let rect = CGRect(dictionaryRepresentation: dict as CFDictionary),
+                  !rect.isEmpty else { return nil }
+            return rect
+        }
+    }
+
     nonisolated private static func isInStageStrip(_ frame: CGRect?, original: CGRect?, on display: CGRect) -> Bool {
-        // shortcut: Stage Manager exposes sidebar thumbnails as scaled WindowServer frames. Use the strip bounds until there is a window-state API.
-        guard let frame, let original, frame.width < min(150, original.width / 2), frame.height < min(180, original.height / 2),
+        // Stage Manager sidebar thumbnails on wide/vertical Retina displays can be up to ~240pt wide
+        // and inset up to ~320pt from the display edge.
+        guard let frame, let original,
+              frame.width < min(260, original.width * 0.48),
+              frame.height < min(260, original.height * 0.48),
               frame.midY > display.minY, frame.midY < display.maxY,
+              frame.midX >= display.minX, frame.midX <= display.maxX,
               UserDefaults(suiteName: "com.apple.WindowManager")?.bool(forKey: "GloballyEnabled") == true else { return false }
-        return abs(frame.minX - display.minX) < 40 || abs(frame.maxX - display.maxX) < 40
+        return abs(frame.minX - display.minX) < 350 || abs(frame.maxX - display.maxX) < 350
     }
 
     private nonisolated static func restoreFullScreen(_ original: Window, on display: CGDirectDisplayID) async -> Bool {
@@ -1440,7 +1675,7 @@ final class WindowPlacement {
             var token = Data()
             let clock = ContinuousClock()
             let deadline = clock.now + timeout
-            for id in UInt64(0)..<32_768 {
+            for id in UInt64(0)..<131_072 {
                 guard !Task.isCancelled, clock.now < deadline else { break }
                 guard let element = SystemBridge.Accessibility.element(pid: pid, remoteElementID: id, buffer: &token),
                       let windowID = SystemBridge.Accessibility.windowID(of: element),
@@ -1608,7 +1843,10 @@ private struct DesktopSpaces {
     func spaceIDs(in displayID: CGDirectDisplayID, fullScreenOnly: Bool = false) -> [UInt64] {
         guard let uuid = CGDisplayCreateUUIDFromDisplayID(displayID)?.takeRetainedValue() else { return [] }
         let identifier = CFUUIDCreateString(nil, uuid) as String
-        guard let display = displays.first(where: { $0["Display Identifier"] as? String == identifier }) else { return [] }
+        guard let display = displays.first(where: {
+            let name = $0["Display Identifier"] as? String
+            return name == identifier || (name == "Main" && displayID == CGMainDisplayID())
+        }) else { return [] }
         return (display["Spaces"] as? [[String: Any]] ?? []).compactMap {
             guard !fullScreenOnly || ($0["type"] as? NSNumber)?.intValue == 4 else { return nil }
             return ($0["id64"] as? NSNumber)?.uint64Value

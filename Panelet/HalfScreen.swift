@@ -16,6 +16,17 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         let receivedAt: TimeInterval
     }
 
+    private struct RenderState {
+        var streamID: ObjectIdentifier?
+        var expectedWidth = 0
+        var expectedHeight = 0
+        var firstFrameDelivered = false
+        var hasOnFrame = false
+        var presenting = false
+        var pending: Frame?
+        var tornDown = false
+    }
+
     let name: String
     let physicalID: CGDirectDisplayID
     /// Region inside the physical display, origin at the display's top-left, y down.
@@ -25,7 +36,7 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
     let virtualID: CGDirectDisplayID
     private let scale: Int
 
-    private let mirrorLayer = CALayer()
+    private nonisolated(unsafe) let mirrorLayer = CALayer()
     private struct Measurements { var received = 0; var replaced = 0; var presented = 0; var maxQueueDelay = 0.0 }
     private nonisolated let measurements = OSAllocatedUnfairLock(initialState: Measurements())
     var statistics: String {
@@ -37,17 +48,24 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
             && refreshRate == screen.configuration.rendering.frameRate(native: screen.refreshRate)
     }
     private let captureQueue: DispatchQueue
-    private nonisolated let pendingFrame = OSAllocatedUnfairLock<Frame?>(uncheckedState: nil)
+    private let presentQueue: DispatchQueue
+    private nonisolated let renderState = OSAllocatedUnfairLock(initialState: RenderState())
     private var display: CGVirtualDisplay?
     private var window: NSWindow?
     private var numberView: NSView?
     private var numberTask: Task<Void, Never>?
     private var stream: SCStream?
+    private(set) var captureStartedAt: ContinuousClock.Instant?
     private var streamFilter: (display: SCDisplay, excludedShields: Set<CGWindowID>)?
     private var firstFrame: (stream: ObjectIdentifier, time: TimeInterval)?
     private var tornDown = false
     var onFailure: ((Error) -> Void)?
-    var onFrame: (() -> Void)?
+    var onFrame: (() -> Void)? {
+        didSet {
+            let hasHandler = (onFrame != nil)
+            renderState.withLock { $0.hasOnFrame = hasHandler }
+        }
+    }
 
     var firstFrameAt: TimeInterval? {
         guard let stream, let firstFrame, ObjectIdentifier(stream) == firstFrame.stream else { return nil }
@@ -89,8 +107,9 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         self.display = display
         self.virtualID = display.displayID
         self.captureQueue = DispatchQueue(label: "dev.cmkk.panelet.capture.\(name)", qos: .userInteractive)
+        self.presentQueue = DispatchQueue(label: "dev.cmkk.panelet.present.\(name)", qos: .userInteractive)
         super.init()
-        mirrorLayer.actions = ["contents": NSNull()]
+        mirrorLayer.actions = NSDictionary(object: NSNull(), forKey: "contents" as NSString) as? [String: CAAction]
     }
 
     static func make(
@@ -185,11 +204,18 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         content.wantsLayer = true
         mirror.contentView = content
         guard let host = content.layer else { throw DemoError(L("%@ 无法建立画面窗口。", String(describing: name))) }
-        mirrorLayer.frame = content.bounds
-        mirrorLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
-        mirrorLayer.contentsGravity = .resize
-        mirrorLayer.contentsScale = CGFloat(scale)
-        host.addSublayer(mirrorLayer)
+        let bounds = content.bounds
+        let layerScale = CGFloat(scale)
+        renderState.withLockUnchecked { _ in
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            mirrorLayer.frame = bounds
+            mirrorLayer.autoresizingMask = [.layerWidthSizable, .layerHeightSizable]
+            mirrorLayer.contentsGravity = .resize
+            mirrorLayer.contentsScale = layerScale
+            host.addSublayer(mirrorLayer)
+            CATransaction.commit()
+        }
         window = mirror
         try updateWindowPosition()
         mirror.orderFrontRegardless()
@@ -230,12 +256,26 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         firstFrame = nil
         streamFilter = nil
         self.stream = stream
+        let streamID = ObjectIdentifier(stream)
+        let expectedW = Int(pointSize.width) * scale
+        let expectedH = Int(pointSize.height) * scale
+        let hasOnFrame = (onFrame != nil)
+        renderState.withLock { state in
+            state.streamID = streamID
+            state.expectedWidth = expectedW
+            state.expectedHeight = expectedH
+            state.firstFrameDelivered = false
+            state.hasOnFrame = hasOnFrame
+            state.pending = nil
+        }
+        measurements.withLock { $0.maxQueueDelay = 0 }
         try await stream.startCapture()
         if tornDown || Task.isCancelled {
             try? await stream.stopCapture()
             throw CancellationError()
         }
         guard self.stream === stream else { throw DemoError(L("%@ 的采集流在启动时中断。", String(describing: name))) }
+        captureStartedAt = .now
         streamFilter = (scDisplay, [])
     }
 
@@ -256,6 +296,11 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
     func recoverCapture() async throws {
         let activeStream = stream
         stream = nil
+        captureStartedAt = nil
+        renderState.withLock { state in
+            state.streamID = nil
+            state.pending = nil
+        }
         if let activeStream { try? await activeStream.stopCapture() }
         let displays = try await Self.waitForDisplays(ids: [virtualID])
         guard !tornDown, let display = displays.first else { throw CancellationError() }
@@ -310,10 +355,20 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         hideWindow()
         let activeStream = stream
         stream = nil
+        captureStartedAt = nil
         streamFilter = nil
+        let isTornDown = tornDown
+        renderState.withLock { state in
+            if isTornDown { state.tornDown = true }
+            state.streamID = nil
+            state.pending = nil
+            state.hasOnFrame = false
+            CATransaction.begin()
+            CATransaction.setDisableActions(true)
+            mirrorLayer.contents = nil
+            CATransaction.commit()
+        }
         activeStream?.stopCapture { _ in }
-        pendingFrame.withLockUnchecked { $0 = nil }
-        mirrorLayer.contents = nil
     }
 
     func teardown() {
@@ -327,6 +382,13 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
         DispatchQueue.main.async { [weak self] in
             guard let self, let stream = self.stream, ObjectIdentifier(stream) == streamID, !self.tornDown else { return }
             self.stream = nil
+            self.captureStartedAt = nil
+            self.renderState.withLock { state in
+                if state.streamID == streamID {
+                    state.streamID = nil
+                    state.pending = nil
+                }
+            }
             self.onFailure?(error)
         }
     }
@@ -334,40 +396,88 @@ final class HalfScreen: NSObject, SCStreamOutput, SCStreamDelegate {
     nonisolated func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .screen, let pixels = sampleBuffer.imageBuffer, Self.isUsefulFrame(sampleBuffer) else { return }
         let frame = Frame(pixels: pixels, streamID: ObjectIdentifier(stream), receivedAt: ProcessInfo.processInfo.systemUptime)
-        // Keep one pending frame, replacing it when the main thread has not displayed it yet.
-        let previous = pendingFrame.withLockUnchecked { pending in
-            let previous = pending
-            pending = frame
-            return previous
+        // Mailbox slot: coalesce intermediate frames on a dedicated interactive presenter queue
+        // so IOSurface swaps flush straight to WindowServer without waiting on MainActor / AppKit UpdateCycle.
+        let (accepted, replaced, shouldSchedule) = renderState.withLock { state -> (Bool, Bool, Bool) in
+            guard !state.tornDown, state.streamID == frame.streamID else { return (false, false, false) }
+            let hadPending = (state.pending != nil)
+            state.pending = frame
+            if state.presenting { return (true, hadPending, false) }
+            state.presenting = true
+            return (true, hadPending, true)
         }
-        measurements.withLock { $0.received += 1; if previous != nil { $0.replaced += 1 } }
-        guard previous == nil else { return }
-        DispatchQueue.main.async { [weak self] in
-            self?.displayPendingFrame()
+        guard accepted else { return }
+        measurements.withLock {
+            $0.received += 1
+            if replaced { $0.replaced += 1 }
+        }
+        guard shouldSchedule else { return }
+        presentQueue.async { [weak self] in
+            self?.presentPendingFrames()
         }
     }
 
-    private func displayPendingFrame() {
-        let frame = pendingFrame.withLockUnchecked { pending in
-            let frame = pending
-            pending = nil
-            return frame
+    nonisolated private func presentPendingFrames() {
+        while true {
+            let next = renderState.withLock { state -> (frame: Frame, width: Int, height: Int)? in
+                guard let frame = state.pending else {
+                    state.presenting = false
+                    return nil
+                }
+                state.pending = nil
+                guard !state.tornDown, state.streamID == frame.streamID else { return nil }
+                return (frame, state.expectedWidth, state.expectedHeight)
+            }
+            guard let next else {
+                let hasMore = renderState.withLock { state -> Bool in
+                    if state.pending == nil {
+                        state.presenting = false
+                        return false
+                    }
+                    return true
+                }
+                if hasMore { continue }
+                return
+            }
+            guard let surface = Self.surface(from: next.frame.pixels) else { continue }
+            let width = IOSurfaceGetWidth(surface)
+            let height = IOSurfaceGetHeight(surface)
+            guard width == next.width, height == next.height else { continue }
+
+            let outcome = renderState.withLock { state -> (committed: Bool, becameFirst: Bool, notifyFrame: Bool) in
+                guard !state.tornDown, state.streamID == next.frame.streamID else { return (false, false, false) }
+                withExtendedLifetime(next.frame.pixels) {
+                    CATransaction.begin()
+                    CATransaction.setDisableActions(true)
+                    mirrorLayer.contents = surface
+                    CATransaction.commit()
+                    CATransaction.flush()
+                }
+                let becameFirst = !state.firstFrameDelivered
+                if becameFirst { state.firstFrameDelivered = true }
+                return (true, becameFirst, state.hasOnFrame)
+            }
+            guard outcome.committed else { continue }
+            let delay = ProcessInfo.processInfo.systemUptime - next.frame.receivedAt
+            measurements.withLock {
+                $0.presented += 1
+                $0.maxQueueDelay = max($0.maxQueueDelay, delay)
+            }
+            if outcome.becameFirst || outcome.notifyFrame {
+                let streamID = next.frame.streamID
+                let firstTime = ProcessInfo.processInfo.systemUptime
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, let current = self.stream, ObjectIdentifier(current) == streamID, !self.tornDown else { return }
+                    if outcome.becameFirst, !self.hasFrame {
+                        self.firstFrame = (streamID, firstTime)
+                        DemoLog.shared.line(L("%@ 已收到 %@×%@ 像素首帧（%@×）。", String(describing: self.name), String(describing: width), String(describing: height), String(describing: self.scale)))
+                    }
+                    if outcome.notifyFrame {
+                        self.onFrame?()
+                    }
+                }
+            }
         }
-        guard let frame, let stream, ObjectIdentifier(stream) == frame.streamID, !tornDown,
-              let surface = Self.surface(from: frame.pixels) else { return }
-        let width = IOSurfaceGetWidth(surface)
-        let height = IOSurfaceGetHeight(surface)
-        guard width == Int(pointSize.width) * scale, height == Int(pointSize.height) * scale else { return }
-        measurements.withLock {
-            $0.presented += 1
-            $0.maxQueueDelay = max($0.maxQueueDelay, ProcessInfo.processInfo.systemUptime - frame.receivedAt)
-        }
-        withExtendedLifetime(frame.pixels) { mirrorLayer.contents = surface }
-        if !hasFrame {
-            firstFrame = (frame.streamID, ProcessInfo.processInfo.systemUptime)
-            DemoLog.shared.line(L("%@ 已收到 %@×%@ 像素首帧（%@×）。", String(describing: name), String(describing: width), String(describing: height), String(describing: scale)))
-        }
-        onFrame?()
     }
 
     private func applyInitialMode(to display: CGVirtualDisplay) throws {
@@ -467,16 +577,19 @@ final class ParkedDisplayChanges: NSObject, SCStreamOutput, SCStreamDelegate {
                 let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
                 try Task.checkCancellation()
                 guard let display = content.displays.first(where: { $0.displayID == self.displayID }) else { return }
+                let mainMenuLayer = Int(CGWindowLevelForKey(.mainMenuWindow))
                 let excluded = content.windows.filter {
-                    $0.windowLayer < 0 || $0.owningApplication?.processID == getpid()
+                    $0.windowLayer < 0 || $0.windowLayer >= mainMenuLayer
+                        || $0.owningApplication?.processID == getpid()
                         || $0.owningApplication?.bundleIdentifier == "com.apple.dock"
+                        || $0.owningApplication?.applicationName == "Window Server"
                 }
                 let filter = SCContentFilter(display: display, excludingWindows: excluded)
                 if #available(macOS 14.2, *) { filter.includeMenuBar = false }
                 let configuration = SCStreamConfiguration()
-                configuration.width = 64
-                configuration.height = 64
-                configuration.minimumFrameInterval = CMTime(value: 1, timescale: 1)
+                configuration.width = 32
+                configuration.height = 32
+                configuration.minimumFrameInterval = CMTime(value: 2, timescale: 1)
                 configuration.queueDepth = 2
                 configuration.showsCursor = false
                 let stream = SCStream(filter: filter, configuration: configuration, delegate: self)

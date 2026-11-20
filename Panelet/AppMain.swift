@@ -135,6 +135,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             self?.appendLog(line)
         }
         splits.onChange = { [weak self] session in self?.sessionChanged(session) }
+        splits.onRecoveryStateChange = { [weak self] in
+            guard let self else { return }
+            self.refresh()
+            if self.restoringAll && !self.splits.busy { self.continueRestoringAll() }
+            if self.closing && !self.splits.busy && !self.confirming { self.finishQuit() }
+            if !self.closing && !self.restoringAll && self.splits.recoveryProblem != nil && !self.splits.autoRetryingRecovery && self.operationsAvailable {
+                self.showAdvanced()
+            }
+        }
         shortcuts.onPress = { [weak self] command in self?.shortcutPressed(command) }
         let unavailableShortcuts = shortcuts.start()
         shortcutMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
@@ -152,7 +161,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             await splits.recoverPreviousSession()
             refresh()
             if !environment.canSplit { showEnvironment() }
-            else if splits.recoveryProblem != nil { showAdvanced() }
+            else if splits.recoveryProblem != nil && !splits.autoRetryingRecovery { showAdvanced() }
             else {
                 let existing = UserDefaults.standard.persistentDomain(forName: "dev.cmkk.panelet") ?? [:]
                 preferences.prepareGuide(permissionsReady: Permissions.splitProblem == nil,
@@ -1130,9 +1139,10 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
             self.closing = true
             self.shouldRelaunch = relaunch
             self.quick.hide()
+            self.splits.resetAutoRecovery()
             self.quitDeadline?.cancel()
             self.quitDeadline = Task { [weak self] in
-                do { try await Task.sleep(for: .seconds(15)) } catch { return }
+                do { try await Task.sleep(for: .seconds(25)) } catch { return }
                 guard let self, self.closing else { return }
                 self.finishQuit(timedOut: true)
             }
@@ -1144,7 +1154,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
     private func finishQuit(timedOut: Bool = false) {
         guard closing, !confirming else { return }
         switch QuitPolicy.action(hasSessions: !splits.sessions.isEmpty, busy: splits.busy,
-                                 needsRecovery: splits.sessions.values.contains(where: \.needsRecovery), timedOut: timedOut) {
+                                 needsRecovery: splits.sessions.values.contains(where: \.needsRecovery),
+                                 autoRetrying: splits.autoRetryingRecovery,
+                                 timedOut: timedOut) {
         case .wait:
             return
         case .offerExit:
@@ -1180,6 +1192,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSWindowDelegate, NS
 
     @objc func retryRecovery() {
         guard operationsAvailable else { return }
+        splits.resetAutoRecovery()
         if splits.recoveryProblem != nil {
             Task { await splits.recoverPreviousSession(); refresh() }
             return
@@ -1273,6 +1286,7 @@ private extension AppController {
             self.quick.hide()
             self.restoringAll = true
             self.restoreAttempts.removeAll()
+            self.splits.resetAutoRecovery()
             self.splits.cancelPreparation()
             self.continueRestoringAll()
         }
@@ -1286,10 +1300,11 @@ private extension AppController {
             splits.join(session.targetID)
             return
         }
+        if splits.autoRetryingRecovery { return }
         if splits.recoveryProblem != nil {
             Task {
                 await splits.recoverPreviousSession()
-                finishRestoringAll()
+                if !splits.autoRetryingRecovery { finishRestoringAll() }
             }
         } else { finishRestoringAll() }
     }

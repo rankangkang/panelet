@@ -530,6 +530,15 @@ final class MouseRouter {
         return CFMachPortIsValid(motionTap) && CGEvent.tapIsEnabled(tap: motionTap)
     }
 
+    static func isPassiveRoutingEvent(_ type: CGEventType) -> Bool {
+        switch type {
+        case .mouseMoved, .scrollWheel, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged:
+            return true
+        default:
+            return false
+        }
+    }
+
     static func mouseMask(observingMotion: Bool) -> CGEventMask {
         let types: [CGEventType] = [
             .leftMouseDragged, .rightMouseDragged, .otherMouseDragged,
@@ -732,12 +741,13 @@ final class MouseRouter {
         }
         let (destination, work) = routing.withLock { route -> (CGPoint?, UInt64?) in
             let moving = type == .mouseMoved
+            let passive = Self.isPassiveRoutingEvent(type)
             if moving, (!route.pressedButtons.isEmpty || route.gesturePanel != nil), !Self.isAnyMouseButtonPressed() {
                 route.resetGesture()
             }
             let delta = moving && !route.capture.pixPinDisplays.isEmpty ? Self.mouseDelta(event) : .zero
             let destination = route.destination(for: event.location, button: button,
-                                                passiveMotion: moving, delta: delta, timestamp: timestamp)
+                                                passiveMotion: passive, delta: delta, timestamp: timestamp)
             let work = moving
                 ? route.scheduleHover(at: route.lastPoint, now: DispatchTime.now().uptimeNanoseconds) : nil
             return (destination, work)
@@ -1015,6 +1025,7 @@ final class CaptureAppMonitor: @unchecked Sendable {
     }
 
     private let state = OSAllocatedUnfairLock(initialState: State())
+    private let monitorQueue = DispatchQueue(label: "dev.cmkk.panelet.capture-app-monitor", qos: .utility)
     private let bundleIDs: Set<String>
 
     init(bundleIDs: Set<String> = Set(CaptureOverlays.toolProfiles.map(\.bundleIdentifier))) {
@@ -1038,16 +1049,17 @@ final class CaptureAppMonitor: @unchecked Sendable {
         let installObserver = { [weak self] in
             guard let self else { return }
             let observation = NSWorkspace.shared.observe(\.runningApplications, options: [.new]) { [weak self] _, _ in
-                self?.refresh(for: generation)
+                self?.scheduleRefresh(for: generation)
             }
-            let latest = self.scanRunningPIDs()
             let staleObservation = self.state.withLock { state -> NSKeyValueObservation? in
                 guard state.generation == generation, state.observation == nil else { return observation }
                 state.observation = observation
-                state.pids = latest
                 return nil
             }
             staleObservation?.invalidate()
+            if staleObservation == nil {
+                self.scheduleRefresh(for: generation)
+            }
         }
 
         if Thread.isMainThread {
@@ -1066,6 +1078,12 @@ final class CaptureAppMonitor: @unchecked Sendable {
             return active
         }
         observation?.invalidate()
+    }
+
+    private func scheduleRefresh(for generation: UInt64) {
+        monitorQueue.async { [weak self] in
+            self?.refresh(for: generation)
+        }
     }
 
     private func refresh(for generation: UInt64) {

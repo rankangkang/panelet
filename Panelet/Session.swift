@@ -48,18 +48,26 @@ final class SplitSessions {
     private var layoutChangedAt: [CGDirectDisplayID: ContinuousClock.Instant] = [:]
     private var failedSessions: [CGDirectDisplayID: Error] = [:]
     private var captureRecovery: [CGDirectDisplayID: Task<Void, Never>] = [:]
+    private var sessionBackoffs: [CGDirectDisplayID: RecoveryBackoff] = [:]
+    private var journalBackoff = RecoveryBackoff()
+    private var journalCanAutoRetry = false
+    private var autoRecoveryTask: Task<Void, Never>?
+    private(set) var autoRetryingRecovery = false
     private var changingDisplays = false
     private var screenObserver: NSObjectProtocol?
     private var powerObservers: [NSObjectProtocol] = []
     private var sleeping = false
     private var screensSleeping = false
     private var sessionInactive = false
+    private var inactiveSince: ContinuousClock.Instant?
+    private var wakeRefreshTask: Task<Void, Never>?
     private var wakeReadyAt = ContinuousClock.now
     fileprivate var monitoringAllowed: Bool { !sleeping && !screensSleeping && !sessionInactive && ContinuousClock.now >= wakeReadyAt }
     private lazy var captureWindowEvents = CaptureWindowEvents { [weak self] needsRescue in
         self?.requestCaptureOverlayUpdate(rescue: needsRescue)
     }
     var onChange: ((Session) -> Void)?
+    var onRecoveryStateChange: (() -> Void)?
 
     var active: [Session] { sessions.values.filter(\.active) }
     private(set) var recovering = false
@@ -158,11 +166,22 @@ final class SplitSessions {
         recovering = true
         defer {
             recovering = false
+            if recoveryProblem == nil {
+                journalCanAutoRetry = false
+                journalBackoff.reset()
+            }
             if let recoveryProblem { DemoLog.shared.line(recoveryProblem) }
+            updateAutoRecoverySchedule()
+            onRecoveryStateChange?()
         }
         do {
-            guard let journal = try RecoveryJournal.load() else { recoveryProblem = nil; return }
+            guard let journal = try RecoveryJournal.load() else {
+                recoveryProblem = nil
+                journalCanAutoRetry = false
+                return
+            }
             guard Permissions.splitProblem == nil else {
+                journalCanAutoRetry = false
                 recoveryProblem = L("上次分屏未正常结束。请完成授权，再点“重试恢复窗口…”。")
                 return
             }
@@ -194,10 +213,20 @@ final class SplitSessions {
             if result.failed > 0 {
                 remaining.append(L("%@ 个窗口尚未恢复，请点“重试恢复窗口…”。", String(result.failed)))
             }
+            journalCanAutoRetry = result.failed > 0
             recoveryProblem = remaining.isEmpty ? nil : remaining.joined(separator: "\n")
         } catch {
+            journalCanAutoRetry = Permissions.splitProblem == nil
             recoveryProblem = L("恢复上次分屏失败：%@", String(describing: error.localizedDescription))
         }
+    }
+
+    func resetAutoRecovery() {
+        autoRecoveryTask?.cancel()
+        autoRecoveryTask = nil
+        autoRetryingRecovery = false
+        sessionBackoffs.removeAll()
+        journalBackoff.reset()
     }
 
     func saveBeforeIncompleteExit() {
@@ -265,6 +294,7 @@ final class SplitSessions {
 
     func split(_ id: CGDirectDisplayID, pair: WindowPlacement.Pair? = nil, configuration: DisplayConfiguration? = nil) {
         guard !busy, recoveryProblem == nil, !sessions.values.contains(where: \.needsRecovery) else { return }
+        cancelPendingAutoRecovery()
         if let problem = EnvironmentCheck.inspect().problem {
             DemoLog.shared.line(problem)
             return
@@ -299,12 +329,16 @@ final class SplitSessions {
 
     func endQuick(_ id: CGDirectDisplayID) {
         guard !busy, let session = sessions[id], session.active || session.needsRecovery, session.hasQuick else { return }
+        autoRecoveryTask?.cancel()
+        autoRecoveryTask = nil
         transition = session
         session.endQuick()
     }
 
     func join(_ id: CGDirectDisplayID) {
         guard !busy, let session = sessions[id], session.active || session.needsRecovery else { return }
+        autoRecoveryTask?.cancel()
+        autoRecoveryTask = nil
         transition = session
         session.join()
     }
@@ -388,7 +422,6 @@ final class SplitSessions {
             return
         }
         guard captureRecovery[half.virtualID] == nil else { return }
-        let interruptedAt = ContinuousClock.now
         captureRecovery[half.virtualID] = Task { [weak self, weak session, weak half] in
             guard let self, let session, let half else { return }
             defer { self.captureRecovery[half.virtualID] = nil }
@@ -397,8 +430,9 @@ final class SplitSessions {
                 do {
                     while self.changingDisplays || !self.monitoringAllowed { try await Task.sleep(for: .milliseconds(100)) }
                     guard session.active, self.sessions[session.targetID] === session else { return }
+                    let recoveryStarted = ContinuousClock.now
                     try await half.recoverCapture()
-                    DemoLog.shared.line(L("%@ 已恢复画面采集（%@）。", String(describing: half.name), String(describing: interruptedAt.duration(to: .now).formatted(.units(allowed: [.seconds, .milliseconds], width: .abbreviated)))))
+                    DemoLog.shared.line(L("%@ 已恢复画面采集（%@）。", String(describing: half.name), String(describing: recoveryStarted.duration(to: .now).formatted(.units(allowed: [.seconds, .milliseconds], width: .abbreviated)))))
                     return
                 } catch {
                     if Task.isCancelled { return }
@@ -413,6 +447,9 @@ final class SplitSessions {
         if session.active {
             let owned = session.managedWindows
             for other in active where other !== session { other.releaseWindows(owned) }
+        }
+        if !session.needsRecovery {
+            sessionBackoffs[session.targetID] = nil
         }
         if session.idle && !session.needsRecovery { sessions[session.targetID] = nil }
         if session.idle || session.active { transition = nil }
@@ -430,9 +467,93 @@ final class SplitSessions {
         }
         updateHealthTimer()
         updateRecoveryCheckpoint()
+        updateAutoRecoverySchedule()
         onChange?(session)
         if !busy, monitoringAllowed, let id = failedSessions.keys.first, let error = failedSessions.removeValue(forKey: id),
            let affected = sessions[id] { fail(affected, error: error) }
+    }
+
+    private func updateAutoRecoverySchedule() {
+        if busy { return }
+        if let session = sessions.values.sorted(by: { $0.targetID < $1.targetID }).first(where: \.needsRecovery) {
+            guard Permissions.splitProblem == nil else {
+                cancelPendingAutoRecovery()
+                return
+            }
+            if autoRecoveryTask != nil { return }
+            var backoff = sessionBackoffs[session.targetID] ?? RecoveryBackoff()
+            guard let delayMs = backoff.nextDelayMilliseconds() else {
+                autoRetryingRecovery = false
+                return
+            }
+            sessionBackoffs[session.targetID] = backoff
+            autoRetryingRecovery = true
+            let secondsText = String(format: "%.1f", Double(delayMs) / 1000.0)
+            DemoLog.shared.line(L("将在 %@ 秒后自动重试恢复窗口（第 %@/%@ 次）…", secondsText, String(backoff.attempt), String(backoff.maxAttempts)))
+            let targetID = session.targetID
+            autoRecoveryTask = Task { [weak self] in
+                do {
+                    try await Task.sleep(for: .milliseconds(delayMs))
+                    while let self, !Task.isCancelled, (self.sleeping || self.screensSleeping || self.sessionInactive) {
+                        try await Task.sleep(for: .milliseconds(250))
+                    }
+                } catch { return }
+                guard !Task.isCancelled, let self else { return }
+                self.autoRecoveryTask = nil
+                guard !self.busy, Permissions.splitProblem == nil,
+                      let pending = self.sessions[targetID], pending.needsRecovery else {
+                    self.updateAutoRecoverySchedule()
+                    self.onRecoveryStateChange?()
+                    return
+                }
+                if pending.active && pending.mode == .desktop && pending.hasQuick {
+                    self.endQuick(targetID)
+                } else {
+                    self.join(targetID)
+                }
+            }
+            return
+        }
+
+        if recoveryProblem != nil && journalCanAutoRetry && sessions.isEmpty {
+            guard Permissions.splitProblem == nil else {
+                cancelPendingAutoRecovery()
+                return
+            }
+            if autoRecoveryTask != nil { return }
+            guard let delayMs = journalBackoff.nextDelayMilliseconds() else {
+                autoRetryingRecovery = false
+                return
+            }
+            autoRetryingRecovery = true
+            let secondsText = String(format: "%.1f", Double(delayMs) / 1000.0)
+            DemoLog.shared.line(L("将在 %@ 秒后自动重试恢复窗口（第 %@/%@ 次）…", secondsText, String(journalBackoff.attempt), String(journalBackoff.maxAttempts)))
+            autoRecoveryTask = Task { [weak self] in
+                do {
+                    try await Task.sleep(for: .milliseconds(delayMs))
+                    while let self, !Task.isCancelled, (self.sleeping || self.screensSleeping || self.sessionInactive) {
+                        try await Task.sleep(for: .milliseconds(250))
+                    }
+                } catch { return }
+                guard !Task.isCancelled, let self else { return }
+                self.autoRecoveryTask = nil
+                guard !self.busy, self.recoveryProblem != nil, self.sessions.isEmpty else {
+                    self.updateAutoRecoverySchedule()
+                    self.onRecoveryStateChange?()
+                    return
+                }
+                await self.recoverPreviousSession()
+            }
+            return
+        }
+
+        cancelPendingAutoRecovery()
+    }
+
+    private func cancelPendingAutoRecovery() {
+        autoRecoveryTask?.cancel()
+        autoRecoveryTask = nil
+        autoRetryingRecovery = false
     }
 
     fileprivate func stopRecovering(_ halves: [HalfScreen]) -> [Task<Void, Never>] {
@@ -591,13 +712,39 @@ final class SplitSessions {
         updateHealthTimer()
         captureOverlayTask?.cancel()
         captureOverlayTask = nil
+        wakeRefreshTask?.cancel()
+        wakeRefreshTask = nil
         if sleeping || screensSleeping || sessionInactive {
+            if inactiveSince == nil { inactiveSince = .now }
+            for session in active { session.pauseParkedObservation() }
             captureUIVisible = false
             setCaptureRouting(.init())
             router?.configureScreenshots(enabled: false)
         } else {
+            let sleptLong = inactiveSince.map { $0.duration(to: .now) >= .seconds(300) } ?? false
+            inactiveSince = nil
             for session in active { session.resumeParkedObservation() }
             requestCaptureOverlayUpdate(rescue: true)
+            if sleptLong {
+                let wokeAt = ContinuousClock.now
+                let deadline = wakeReadyAt
+                wakeRefreshTask = Task { [weak self] in
+                    do { try await ContinuousClock().sleep(until: deadline) } catch { return }
+                    guard !Task.isCancelled, let self, self.monitoringAllowed else { return }
+                    self.refreshStaleCapturesAfterWake(wokeAt: wokeAt)
+                }
+            }
+        }
+    }
+
+    private func refreshStaleCapturesAfterWake(wokeAt: ContinuousClock.Instant) {
+        guard !busy, !changingDisplays, monitoringAllowed else { return }
+        for session in active where !session.needsRecovery {
+            for half in session.halves {
+                guard captureRecovery[half.virtualID] == nil,
+                      let started = half.captureStartedAt, started < wokeAt else { continue }
+                recoverCapture(half, in: session, error: DemoError(L("%@ 休眠唤醒后刷新采集。", String(describing: half.name))))
+            }
         }
     }
 
@@ -753,6 +900,8 @@ final class SplitSessions {
         captureOverlayTimer = nil
         captureOverlayTask?.cancel()
         captureOverlayTask = nil
+        wakeRefreshTask?.cancel()
+        wakeRefreshTask = nil
         captureWindowEvents.stop()
         captureOverlayPending = false
         captureRescuePending = false
@@ -974,6 +1123,7 @@ final class Session {
     fileprivate var checkingHiddenWindows: Bool { tasks.rescue != nil }
     fileprivate var observesParkedDisplay: Bool { parkedDisplayChanges?.isRunning == true }
     fileprivate func resumeParkedObservation() { parkedDisplayChanges?.start() }
+    fileprivate func pauseParkedObservation() { parkedDisplayChanges?.stop() }
     fileprivate var hiddenWindowCheckAvailable: Bool { active && !needsRecovery && placement != nil && !checkingHiddenWindows }
     fileprivate var hiddenWindowCheckDue: Bool { hiddenWindowCheckAvailable && ContinuousClock.now - lastRescue >= .seconds(1) }
 
@@ -1225,18 +1375,20 @@ final class Session {
                     if let id, let existing = NSScreen.screens.first(where: { $0.displayID == id }) { return existing }
                     return coordinator.windowDestination(for: id, joining: nil)
                 }
-                guard await quickPlacement.leaveFullScreen(on: [], includeSelected: true) else {
+                guard await Self.leaveFullScreenWithBackoff(quickPlacement, on: [], includeSelected: true) else {
                     needsRecovery = true
                     publish(L("窗口尚未退出全屏，已保留拆分。请重试恢复窗口。"), phase: .split)
                     return
                 }
-                await quickPlacement.moveToDesktops(destination: destination, ordinary: nil,
-                                                    protecting: coordinator.active.filter { $0 !== self }.flatMap(\.managedWindows))
-                let restored = await quickPlacement.restore(for: .milliseconds(1750), destination: destination)
-                let presentation = await quickPlacement.restorePresentation(destination: destination)
-                guard restored.failed == 0, presentation.failed == 0 else {
+                let protectedOthers = coordinator.active.filter { $0 !== self }.flatMap(\.managedWindows)
+                await quickPlacement.moveToDesktops(destination: destination, ordinary: nil, protecting: protectedOthers)
+                let (_, quickFailed) = await Self.restoreFramesWithBackoff(
+                    quickPlacement, destination: destination, ordinary: nil, protecting: protectedOthers
+                )
+                let presentation = await Self.restorePresentationWithBackoff(quickPlacement, destination: destination)
+                guard quickFailed == 0, presentation.failed == 0 else {
                     needsRecovery = true
-                    publish(L("已保留桌面拆分，仍有 %@ 个窗口的位置或尺寸、%@ 项状态待恢复。", String(describing: restored.failed), String(describing: presentation.failed)), phase: .split)
+                    publish(L("已保留桌面拆分，仍有 %@ 个窗口的位置或尺寸、%@ 项状态待恢复。", String(describing: quickFailed), String(describing: presentation.failed)), phase: .split)
                     return
                 }
                 self.quickPlacement = nil
@@ -1253,7 +1405,7 @@ final class Session {
                     if mode == .desktop { await placement.preserveDesktopChanges(on: halves) }
                     coordinator.updateRecoveryCheckpoint()
                 }
-                guard await placement.leaveFullScreen(on: halves, includeSelected: activeTasks.fullScreen != nil || !halves.isEmpty) else {
+                guard await Self.leaveFullScreenWithBackoff(placement, on: halves, includeSelected: activeTasks.fullScreen != nil || !halves.isEmpty) else {
                     needsRecovery = true
                     publish(L("窗口尚未退出全屏，已保留桌面。请从菜单选择“重试恢复窗口…”。"), phase: halves.isEmpty ? .idle : .split)
                     return
@@ -1327,15 +1479,10 @@ final class Session {
                 let ordinary = joining ? coordinator.remainingWindowDestination(from: screen, joining: self) : nil
                 let protected = coordinator.active.flatMap(\.managedWindows)
                 if joining { await placement.moveToDesktops(destination: destination, ordinary: ordinary, protecting: protected) }
-                let result = await placement.restore(for: .milliseconds(1750), destination: destination, ordinary: ordinary)
-                var restored = result.restored
-                var failed = result.failed
-                if !result.retry.isEmpty, coordinator.active.isEmpty {
-                    let retried = await placement.recoverFrames(result.retry, destination: destination, ordinary: ordinary, protecting: protected)
-                    restored += retried.restored
-                    failed = failed - result.retry.count + retried.failed
-                }
-                let presentation = await placement.restorePresentation(destination: destination)
+                let (restored, failed) = await Self.restoreFramesWithBackoff(
+                    placement, destination: destination, ordinary: ordinary, protecting: protected
+                )
+                let presentation = await Self.restorePresentationWithBackoff(placement, destination: destination)
                 DemoLog.shared.line(L("已还原 %@ 个窗口的位置和尺寸。", String(describing: restored)))
                 if presentation.minimizedToStage > 0 {
                     let detail = L("台前调度将 %@ 个原先在程序坞的窗口收进了侧栏。", String(describing: presentation.minimizedToStage))
@@ -1352,6 +1499,59 @@ final class Session {
             expectedLayout.removeAll()
             publish(finalStatus, phase: .idle)
         }
+    }
+
+    private static func leaveFullScreenWithBackoff(
+        _ placement: WindowPlacement,
+        on halves: [HalfScreen],
+        includeSelected: Bool
+    ) async -> Bool {
+        var backoff = RecoveryBackoff(delaysMilliseconds: [350, 800])
+        while true {
+            if await placement.leaveFullScreen(on: halves, includeSelected: includeSelected) {
+                return true
+            }
+            guard !Task.isCancelled, let delayMs = backoff.nextDelayMilliseconds() else {
+                return false
+            }
+            try? await Task.sleep(for: .milliseconds(delayMs))
+        }
+    }
+
+    private static func restoreFramesWithBackoff(
+        _ placement: WindowPlacement,
+        destination: (CGDirectDisplayID?) -> NSScreen?,
+        ordinary: NSScreen?,
+        protecting: [WindowPlacement.Identity]
+    ) async -> (restored: Int, failed: Int) {
+        let initial = await placement.restore(for: .milliseconds(1750), destination: destination, ordinary: ordinary)
+        var restored = initial.restored
+        var failed = initial.failed
+        var pendingRetry = initial.retry
+        var backoff = RecoveryBackoff(delaysMilliseconds: [0, 500])
+        while !pendingRetry.isEmpty, !Task.isCancelled, let delayMs = backoff.nextDelayMilliseconds() {
+            if delayMs > 0 {
+                try? await Task.sleep(for: .milliseconds(delayMs))
+            }
+            let retried = await placement.recoverFrames(pendingRetry, destination: destination, ordinary: ordinary, protecting: protecting)
+            restored += retried.restored
+            failed = max(0, failed - pendingRetry.count + retried.failed)
+            pendingRetry = retried.retry
+        }
+        return (restored, failed)
+    }
+
+    private static func restorePresentationWithBackoff(
+        _ placement: WindowPlacement,
+        destination: (CGDirectDisplayID?) -> NSScreen?
+    ) async -> (failed: Int, minimizedToStage: Int) {
+        var presentation = await placement.restorePresentation(destination: destination)
+        guard presentation.failed > 0, !Task.isCancelled else { return presentation }
+        try? await Task.sleep(for: .milliseconds(550))
+        let second = await placement.restorePresentation(destination: destination)
+        presentation.failed = second.failed
+        presentation.minimizedToStage += second.minimizedToStage
+        return presentation
     }
 
     private static func layoutMatches(_ layout: [CGDirectDisplayID: CGRect], ignoringParked: Set<CGDirectDisplayID>) -> Bool {

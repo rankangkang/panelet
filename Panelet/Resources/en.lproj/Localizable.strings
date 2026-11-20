@@ -73,6 +73,7 @@
 "鼠标事件监听已停止。" = "Mouse event monitoring stopped.";
 "正在等待显示器排列稳定。%@" = "Waiting for the display arrangement to settle. %@";
 "%@ 已恢复画面采集（%@）。" = "%@ capture recovered (%@).";
+"%@ 休眠唤醒后刷新采集。" = "%@ refreshing capture after wake.";
 "%@ 未能恢复画面采集。%@" = "%@ capture could not be recovered. %@";
 "无法更新恢复记录：%@" = "Could not update recovery information: %@";
 "鼠标事件监听启动失败。请检查辅助功能权限并重新启动。" = "Could not start mouse monitoring. Check Accessibility permission and restart.";
@@ -430,3 +431,5 @@
 "进入全屏" = "Enter full screen";
 "高清高刷" = "Retina 120 Hz";
 "清晰优先保留原生缩放；高清高刷兼顾原生清晰度与 120 Hz；流畅优先降低分辨率" = "Clarity keeps native scaling; Retina 120 Hz pairs native clarity with up to 120 Hz; Smooth lowers resolution";
+"将在 %@ 秒后自动重试恢复窗口（第 %@/%@ 次）…" = "Retrying window recovery automatically in %@s (attempt %@/%@)…";
+
